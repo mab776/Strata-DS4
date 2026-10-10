@@ -1,0 +1,17 @@
+{
+ "messages": [
+  {
+   "role": "user",
+   "content": "Pick a number."
+  },
+  {
+   "role": "assistant",
+   "content": "7.",
+   "reasoning_content": "Any small number works."
+  },
+  {
+   "role": "user",
+   "content": "Double it."
+  }
+ ]
+}

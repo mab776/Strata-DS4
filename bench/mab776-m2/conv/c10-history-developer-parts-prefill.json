@@ -1,0 +1,42 @@
+{
+ "messages": [
+  {
+   "role": "system",
+   "content": "S1"
+  },
+  {
+   "role": "system",
+   "content": "S2"
+  },
+  {
+   "role": "user",
+   "content": [
+    {
+     "type": "text",
+     "text": "part one"
+    },
+    {
+     "type": "text",
+     "text": "part two"
+    }
+   ]
+  },
+  {
+   "role": "assistant",
+   "content": "A1",
+   "reasoning_content": "R1"
+  },
+  {
+   "role": "developer",
+   "content": "Be brief."
+  },
+  {
+   "role": "user",
+   "content": "Q2"
+  },
+  {
+   "role": "assistant",
+   "content": "Partial answer: "
+  }
+ ]
+}

@@ -84,3 +84,20 @@ Keep the DS4 engine on DS4's own v0.1.39 base. Merging DS4 onto v0.1.41: 8 core 
 (7950X uses the AVX-512 path anyway); conflicts grow ~1.5 hunks per DS4 day. TAKE the server instead: `git checkout fb58e0db -- serve`
 (plain v0.1.41, zero conflicts) + hand-merge tools/strata_tokenizer.py (v0.1.41 piece cache + DS4 `_pre_split`, passes both suites).
 Revisit only if DS4 moves base, an upstream kernel is needed for our types, or DS4's pace drops — and ask Marc.
+
+## Session 2026-10-09 night (ultracode handoff: M1 + M3 done, M2 started) - usage limit hit mid-M2
+- Upstream DS4 unchanged at 924516a. CPU tests: geometry 1 expected author-file failure; test_ds4_moe 23/23 after
+  fixing the TEST (per-layer formats + MXFP4's Q8_0 activation - the engine was right); tokenizer golden 3/3.
+- M1 (f9d1dbdf, pushed): byte-sized --slots auto (slot_gib, real 7.19/8.38/9.38 MiB blobs) + margin 2.0 GiB from 64k ctx.
+  GPU-checked: 36.99 GiB budget -> 5,217 experts, no OOM, 1.72 GiB VRAM free at the end @ ctx 262144.
+- M3 (cc281c92, LOCAL, not pushed - adversarial verify workflow was still running): v0.1.41 serve/ + merged tokenizer;
+  parity vs llama-tokenize b11429 = 0 diffs over 1.78M ids (needles 251,198 = stack 73's count). llama-tokenize
+  needs --no-escape (unescapes \n by default). Docker default runtime = nvidia: CPU containers need NVIDIA_VISIBLE_DEVICES=none.
+- Build with CUDA 13 (BUILD_DIR=build-ds4-cu13, nvidia/cuda:13.0.2): upstream warns CUDA 12.8 crashes long prompts on sm_120.
+- M2 so far (bench/mab776-m2/: make_prompts.py, m2run.sh, capture_templates.sh, renders/ = 14 stack-73 renders for M4):
+  probes (--pos-offset, cold, MEM 42g/arena 36): 130k 23.3 tok/s, 255k 23.7 (attention+router 14.7 -> 15.1 ms, flat);
+  experts ~24-25 ms of which ~15-16 ms = file-tier reads (635 experts in neither VRAM nor the 36 GiB arena) -> next:
+  full RAM (MEM = avail-9, arena ~39-40) and maybe --arena-adapt, with the CPU otherwise idle.
+  ppl768 (BOS + p600 + p3000[:167]): llama.cpp 9.9624; DS4 decode-loop 9.8681 (-0.95 %), chunked w/o MMQ 9.8737 (-0.89 %).
+  ⚠️ --chunk-mmq gives NaN ppl on our file (MMQ path, our types) -> run chunked prefill WITHOUT --chunk-mmq (fix later).
+- NEXT: B2-B4 (8k / 127k code prompts, MMQ=0, full RAM) = the go/no-go number; then 250k code + needles x3; then STOP.

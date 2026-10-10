@@ -1,0 +1,9 @@
+{
+ "reasoning_effort": "none",
+ "messages": [
+  {
+   "role": "user",
+   "content": "What is 17*23?"
+  }
+ ]
+}

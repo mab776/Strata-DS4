@@ -1,0 +1,108 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Current weather for a city",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "search_files",
+    "description": "Search files by glob and regex",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "glob": {
+       "type": "string"
+      },
+      "pattern": {
+       "type": "string"
+      },
+      "max_results": {
+       "type": "integer"
+      },
+      "flags": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     },
+     "required": [
+      "glob",
+      "pattern"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "TODOs in *.py and Paris weather?"
+  },
+  {
+   "role": "assistant",
+   "content": "",
+   "reasoning_content": "Two independent calls.",
+   "tool_calls": [
+    {
+     "id": "a",
+     "type": "function",
+     "function": {
+      "name": "search_files",
+      "arguments": "{\"glob\": \"*.py\", \"pattern\": \"TODO\", \"max_results\": 5, \"flags\": [\"-i\"]}"
+     }
+    },
+    {
+     "id": "b",
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    }
+   ]
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "b",
+   "content": "12C cloudy"
+  },
+  {
+   "role": "tool",
+   "tool_call_id": "a",
+   "content": "main.py:3: # TODO"
+  },
+  {
+   "role": "assistant",
+   "content": "One TODO in main.py; Paris 12C, cloudy.",
+   "reasoning_content": "Summarize."
+  },
+  {
+   "role": "user",
+   "content": "Thanks. Now fix it."
+  }
+ ]
+}

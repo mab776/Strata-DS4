@@ -1,0 +1,79 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "get_weather",
+    "description": "Current weather for a city",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "city": {
+       "type": "string"
+      },
+      "unit": {
+       "type": "string",
+       "enum": [
+        "c",
+        "f"
+       ]
+      }
+     },
+     "required": [
+      "city"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "search_files",
+    "description": "Search files by glob and regex",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "glob": {
+       "type": "string"
+      },
+      "pattern": {
+       "type": "string"
+      },
+      "max_results": {
+       "type": "integer"
+      },
+      "flags": {
+       "type": "array",
+       "items": {
+        "type": "string"
+       }
+      }
+     },
+     "required": [
+      "glob",
+      "pattern"
+     ]
+    }
+   }
+  }
+ ],
+ "messages": [
+  {
+   "role": "system",
+   "content": "Be useful."
+  },
+  {
+   "role": "user",
+   "content": "Hi"
+  },
+  {
+   "role": "assistant",
+   "content": "Hello! How can I help?",
+   "reasoning_content": "Greet."
+  },
+  {
+   "role": "user",
+   "content": "Weather in Oslo, in f?"
+  }
+ ]
+}

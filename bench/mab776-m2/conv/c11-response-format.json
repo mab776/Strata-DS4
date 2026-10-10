@@ -1,0 +1,25 @@
+{
+ "response_format": {
+  "type": "json_schema",
+  "json_schema": {
+   "name": "answer",
+   "schema": {
+    "type": "object",
+    "properties": {
+     "n": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "n"
+    ]
+   }
+  }
+ },
+ "messages": [
+  {
+   "role": "user",
+   "content": "What is 17*23?"
+  }
+ ]
+}
