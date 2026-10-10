@@ -33,6 +33,7 @@
 #if defined(DS4_MOE_CUDA)
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -142,6 +143,9 @@ struct Gpu {
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
+    /// mab776 M7a: gpu_run's two launches' metadata (0 = hits, 1 = PCIe share), packed: one pinned block -> one H2D
+    /// copy per launch instead of five pageable ones
+    void *h_meta2 = nullptr, *d_meta2 = nullptr;
 
     /// run_chunk (prompt chunks, MiMo prefill): allocated on first use, for up to `c_tok` tokens.  The streamed
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
@@ -191,6 +195,8 @@ struct Gpu {
         if (h_dummy) cudaFreeHost(h_dummy);
         if (h_x) cudaFreeHost(h_x);
         if (h_parts) cudaFreeHost(h_parts);
+        if (h_meta2) cudaFreeHost(h_meta2);
+        if (d_meta2) cudaFree(d_meta2);
         for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
         for (uint8_t* p : c_bounce)
@@ -208,10 +214,78 @@ struct Gpu {
     }
 };
 
+/// mab776 M7a: switches the calling thread to `dev` for the scope (upstream PeerExperts' guard).  The tier's GPU 0
+/// calls and ggml's dense half assume the engine's device is current, so every GPU-1 call runs inside one of these.
+struct On {
+    int prev = 0;
+    explicit On(int dev) { cudaGetDevice(&prev); if (prev != dev) cudaSetDevice(dev); }
+    ~On() { int cur = 0; cudaGetDevice(&cur); if (cur != prev) cudaSetDevice(prev); }
+};
+
+/// mab776 M7a: GPU 1's static expert tier (Ds4MoeConfig::gpu1_device).  Its own device, stream, cache and buffers;
+/// the host buffers are portable + mapped, so GPU 0's kernels can read the prompt rows in place.
+struct Gpu1 {
+    int dev = -1;
+    std::unique_ptr<strata::core::ExpertCache> cache;
+    cudaStream_t s = nullptr;
+    cudaEvent_t ev = nullptr;          ///< decode / verify: the layer's rows are in h_parts
+    /// decode / verify (<= kMaxEnt entries): x rows, their q8_1, the compact output rows, one metadata block
+    void *d_x = nullptr, *d_xq = nullptr, *d_parts = nullptr, *d_meta = nullptr, *d_scratch = nullptr;
+    void* h_meta = nullptr;
+    float* h_parts = nullptr;
+    /// prompt chunks: `c_tok` tokens, `c_cap` entries per launch, `c_nl` launches' metadata, rows of one layer-chunk
+    int64_t c_tok = 0, c_cap = 0, c_nl = 0, c_rows = 0;
+    void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_meta = nullptr, *c_iota = nullptr;
+    void* c_hmeta = nullptr;
+    float* c_hrows = nullptr;          ///< the compact entry rows of one layer-chunk (pinned, mapped: GPU 0 reads it)
+    cudaEvent_t c_ev = nullptr;        ///< the rows of the layer-chunk in flight are in c_hrows
+    uint64_t budget = 0;               ///< bytes for expert slots (measured at init, after every buffer above)
+    std::vector<std::pair<int32_t, int32_t>> set;   ///< its experts, the walk's GPU-1 share (ranked order)
+    bool seeded = false;
+    double seed_s = 0;
+    int64_t resident = 0;
+
+    void close() {
+        if (dev < 0) return;
+        {
+            On on(dev);
+            if (s) cudaStreamSynchronize(s);
+            cache.reset();
+            for (void* p : {d_x, d_xq, d_parts, d_meta, d_scratch, c_x, c_xq, c_parts, c_scratch, c_meta, c_iota})
+                if (p) cudaFree(p);
+            for (void* p : {h_meta, (void*) h_parts, c_hmeta, (void*) c_hrows})
+                if (p) cudaFreeHost(p);
+            if (ev) cudaEventDestroy(ev);
+            if (c_ev) cudaEventDestroy(c_ev);
+            if (s) cudaStreamDestroy(s);
+        }
+        *this = Gpu1();
+    }
+};
+
+/// The decode / verify launch's metadata, one H2D copy per layer (as upstream's PeerExperts::Meta).
+struct G1Meta {
+    unsigned long long ptr[kMaxEnt];
+    int32_t start[kMaxEnt + 1];
+    int32_t dst[kMaxEnt];
+    int32_t tok[kMaxEnt];
+    int32_t ng[4];
+};
+
+/// One prompt-chunk launch's metadata on GPU 1: groups (<= n_experts + 1: a group may be split between launches)
+/// and the launch's entry tokens.  Laid out [ptr | start | ng | tok] in c_hmeta region i and in c_meta.
+inline size_t g1_cmeta_bytes(int64_t n_experts, int64_t cap) {
+    const size_t g = (size_t) n_experts + 1;
+    return ((g * 8 + (g + 1) * 4 + 16 + (size_t) cap * 4) + 255) & ~(size_t) 255;
+}
+
 #else
 
-/// No CUDA in this flavour; the type exists only so `Ds4MoeImpl` compiles unchanged.
+/// No CUDA in this flavour; the types exist only so `Ds4MoeImpl` compiles unchanged.
 struct Gpu {
+    void close() {}
+};
+struct Gpu1 {
     void close() {}
 };
 
@@ -296,7 +370,33 @@ struct Ds4MoeImpl {
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
+    std::unique_ptr<Gpu1> g1;         ///< mab776 M7a: GPU 1's static tier (null = off)
+    std::vector<std::pair<int32_t, int32_t>> seed_ranked;   ///< mab776 M7a: the elastic seed's ranking (grow_cache)
 };
+
+/// mab776 M7a, phase 0: the profile's ranking plus every routed (layer, expert) it never saw, appended in index
+/// order.  The train half of ds4routes.bin never routes 80 experts (0.58 GiB); without this they had no home in any
+/// tier and were read from NVMe on every use for the whole run (B8: 538 file reads in 472 decode passes at "file
+/// tier 0").  Appending changes nothing for the ranked ones: every walk takes them first, as before.
+std::vector<std::pair<int32_t, int32_t>> complete_ranking(const Ds4MoeGeom& g,
+                                                          const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    std::vector<char> seen((size_t) (g.n_layers * g.n_experts), 0);
+    std::vector<std::pair<int32_t, int32_t>> out;
+    out.reserve((size_t) (g.n_layers * g.n_experts));
+    for (const auto& le : ranked) {
+        if (le.first < 0 || le.first >= g.n_layers || le.second < 0 || le.second >= g.n_experts) continue;
+        char& s = seen[(size_t) (le.first * g.n_experts + le.second)];
+        if (s) continue;
+        s = 1;
+        out.push_back(le);
+    }
+    for (int64_t l = 0; l < g.n_layers; ++l) {
+        if (!g.routed(l)) continue;
+        for (int64_t e = 0; e < g.n_experts; ++e)
+            if (!seen[(size_t) (l * g.n_experts + e)]) out.push_back({(int32_t) l, (int32_t) e});
+    }
+    return out;
+}
 
 
 // ---- the one place a blob's address is decided: the arena first, the blob source second ----------------
@@ -322,6 +422,396 @@ const uint8_t* acquire(Ds4MoeImpl& im, int64_t layer, int64_t expert, int scratc
     im.st.file_ms += now_ms() - t0;
     return dst;
 }
+
+// ---- mab776 M7a: where each expert lives (one walk), and GPU 1's static tier ----------------------------------
+
+/// GPU 0's cache budget in bytes: the prompt budget (`slot_gib`, or `slots` x the largest blob), or with `full` and
+/// an elastic cache the decode budget (`slot_gib_max`).
+double vram0_budget(const Ds4MoeImpl& im, bool full) {
+    if (full && im.mixed_sizes && im.cfg.slot_gib > 0 && im.cfg.slot_gib_max > im.cfg.slot_gib)
+        return im.cfg.slot_gib_max * 1073741824.0;
+    return im.cfg.slot_gib > 0 ? im.cfg.slot_gib * 1073741824.0 : (double) im.cfg.slots * (double) im.blob;
+}
+
+/// The VRAM-0 seed's walk (the one rule every place follows): ranked order, unique routed pairs, until `slots`
+/// experts or the first blob that would pass `budget` bytes.  Marks them in `mark` (n_layers x n_experts), returns
+/// the slot sizes in order.
+std::vector<int64_t> walk_vram0(const Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                                double budget, std::vector<char>& mark) {
+    std::vector<int64_t> sizes;
+    mark.assign((size_t) (im.g.n_layers * im.g.n_experts), 0);
+    if (im.cfg.no_cache || im.cfg.slots <= 0) return sizes;
+    double used = 0;
+    for (const auto& le : ranked) {
+        if ((int64_t) sizes.size() >= im.cfg.slots) break;
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        char& r = mark[(size_t) (le.first * im.g.n_experts + le.second)];
+        if (r) continue;
+        const int64_t b = im.bl[(size_t) le.first];
+        if (used + (double) b > budget) break;
+        r = 1;
+        sizes.push_back(b);
+        used += (double) b;
+    }
+    return sizes;
+}
+
+#if defined(DS4_MOE_CUDA)
+
+/// GPU 1's share of the walk: the ranks right after GPU 0's decode-budget head, until its byte budget (blobs
+/// counted at 256 B granularity, as upstream PeerExperts).  Decided once; later calls keep the first answer.
+void plan_gpu1(Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
+    if (!im.g1 || !im.g1->set.empty() || im.g1->budget == 0) return;
+    std::vector<char> v0;
+    walk_vram0(im, ranked, vram0_budget(im, true), v0);
+    std::vector<char> taken((size_t) (im.g.n_layers * im.g.n_experts), 0);
+    uint64_t used = 0;
+    for (const auto& le : ranked) {
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
+        const size_t i = (size_t) (le.first * im.g.n_experts + le.second);
+        if (v0[i] || taken[i]) continue;
+        const uint64_t b = ((uint64_t) im.bl[(size_t) le.first] + 255) / 256 * 256;
+        if (used + b > im.g1->budget) break;
+        taken[i] = 1;
+        used += b;
+        im.g1->set.push_back(le);
+    }
+}
+
+/// Opens GPU 1's tier at init: device checks, stream, every buffer (decode, and prompt chunks when asked), THEN
+/// its live free VRAM minus the reserve becomes the expert budget - the cache opens at the seed, sized to the walk.
+bool open_gpu1(Ds4MoeImpl& im, std::string& err) {
+    const int dev = im.cfg.gpu1_device;
+    int count = 0, cur = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess || dev < 0 || dev >= count) {
+        err = "gpu1: CUDA device " + std::to_string(dev) + " is not visible (" + std::to_string(count) + " devices)";
+        return false;
+    }
+    cudaGetDevice(&cur);
+    if (dev == cur) {
+        err = "gpu1: device " + std::to_string(dev) + " is the engine's own device";
+        return false;
+    }
+    cudaDeviceProp p0{}, p1{};
+    if (cudaGetDeviceProperties(&p0, cur) != cudaSuccess || cudaGetDeviceProperties(&p1, dev) != cudaSuccess) {
+        err = "gpu1: cudaGetDeviceProperties failed";
+        return false;
+    }
+    if (p0.major != p1.major || p0.minor != p1.minor) {   // one build's kernels, and rows equal to GPU 0's
+        err = "gpu1: device " + std::to_string(dev) + " is sm_" + std::to_string(p1.major * 10 + p1.minor) +
+              ", the engine's is sm_" + std::to_string(p0.major * 10 + p0.minor);
+        return false;
+    }
+    im.g1.reset(new Gpu1());
+    Gpu1& g = *im.g1;
+    g.dev = dev;
+    auto ok = [&](cudaError_t e, const char* what) {
+        if (e == cudaSuccess) return true;
+        err = std::string("gpu1: ") + what + ": " + cudaGetErrorString(e);
+        return false;
+    };
+    const int64_t H = im.g.n_embd, FF = im.g.n_ff;
+    const size_t H4 = (size_t) H * 4;
+    bool good;
+    {
+        On on(dev);
+        good = ok(cudaStreamCreateWithFlags(&g.s, cudaStreamNonBlocking), "stream") &&
+               ok(cudaEventCreateWithFlags(&g.ev, cudaEventDisableTiming), "event") &&
+               ok(cudaEventCreateWithFlags(&g.c_ev, cudaEventDisableTiming), "event") &&
+               ok(cudaMalloc(&g.d_x, (size_t) kMaxTok * H4), "d_x") &&
+               ok(cudaMalloc(&g.d_xq, strata::kernels::native_q8_1_bytes((int) H, kMaxTok)), "d_xq") &&
+               ok(cudaMalloc(&g.d_parts, (size_t) kMaxEnt * H4), "d_parts") &&
+               ok(cudaMalloc(&g.d_meta, sizeof(G1Meta)), "d_meta") &&
+               ok(cudaMalloc(&g.d_scratch, strata::kernels::native_expert_scratch_bytes(kMaxEnt, FF)), "d_scratch") &&
+               ok(cudaHostAlloc(&g.h_meta, sizeof(G1Meta), cudaHostAllocPortable), "h_meta") &&
+               ok(cudaHostAlloc((void**) &g.h_parts, (size_t) kMaxEnt * H4, cudaHostAllocPortable), "h_parts");
+        const int64_t ct = im.cfg.gpu1_chunk_tokens;
+        if (good && ct > 0) {
+            g.c_tok = ct;
+            g.c_cap = ct;                  // entries per launch; a group may be split between two launches
+            g.c_nl = im.g.top_k + 2;       // launches per layer-chunk: its entries <= c_tok * top_k
+            g.c_rows = ct * im.g.top_k;
+            const size_t mb = g1_cmeta_bytes(im.g.n_experts, g.c_cap);
+            good = ok(cudaMalloc(&g.c_x, (size_t) ct * H4), "c_x") &&
+                   ok(cudaMalloc(&g.c_xq, (size_t) ct * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq") &&
+                   ok(cudaMalloc(&g.c_parts, (size_t) g.c_cap * H4), "c_parts") &&
+                   ok(cudaMalloc(&g.c_scratch, strata::kernels::native_expert_scratch_bytes(g.c_cap, FF)), "c_scratch") &&
+                   ok(cudaMalloc(&g.c_meta, mb * (size_t) g.c_nl), "c_meta") &&
+                   ok(cudaMalloc(&g.c_iota, sizeof(int32_t) * (size_t) g.c_cap), "c_iota") &&
+                   ok(cudaHostAlloc(&g.c_hmeta, mb * (size_t) g.c_nl, cudaHostAllocPortable), "c_hmeta") &&
+                   ok(cudaHostAlloc((void**) &g.c_hrows, (size_t) g.c_rows * H4,
+                                    cudaHostAllocPortable | cudaHostAllocMapped), "c_hrows");
+            if (good) {
+                std::vector<int32_t> io((size_t) g.c_cap);
+                for (size_t i = 0; i < io.size(); ++i) io[i] = (int32_t) i;
+                good = ok(cudaMemcpy(g.c_iota, io.data(), io.size() * 4, cudaMemcpyHostToDevice), "c_iota");
+            }
+        }
+        size_t fr = 0, tot = 0;
+        if (good) good = ok(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
+        if (good) {
+            const double reserve = std::max(0.125, im.cfg.gpu1_reserve_gib) * 1073741824.0;
+            double budget = (double) fr > reserve ? (double) fr - reserve : 0.0;
+            if (im.cfg.gpu1_gib > 0) budget = std::min(budget, im.cfg.gpu1_gib * 1073741824.0);
+            g.budget = (uint64_t) budget;
+        }
+    }
+    if (good && g.c_hrows) {   // GPU 0's scatter reads the rows in place: its view of the mapped buffer
+        void* d0 = nullptr;
+        good = ok(cudaHostGetDevicePointer(&d0, g.c_hrows, 0), "c_hrows on the engine's device");
+        if (good && d0 != (void*) g.c_hrows) {
+            err = "gpu1: the mapped row buffer has a different address on the engine's device (no UVA?)";
+            good = false;
+        }
+    }
+    if (!good) {
+        g.close();
+        im.g1.reset();
+        return false;
+    }
+    return true;
+}
+
+/// Fills GPU 1's cache with its walk share.  Its experts have no arena copy, so they come from the file: 8 reader
+/// threads (each bound to GPU 1, its own pinned buffer), the copies serialized (the cache's counters).  Then three
+/// slots are read back against the file.  Once; later calls do nothing.
+bool seed_gpu1(Ds4MoeImpl& im, std::string& err) {
+    if (!im.g1 || im.g1->seeded || im.g1->set.empty()) return true;
+    Gpu1& g = *im.g1;
+    const double t0 = now_ms();
+    std::vector<int64_t> sizes;
+    sizes.reserve(g.set.size());
+    for (const auto& le : g.set) sizes.push_back(im.bl[(size_t) le.first]);
+    std::vector<std::array<int64_t, 3>> jobs;   // slot, layer, expert
+    {
+        On on(g.dev);
+        g.cache.reset(new strata::core::ExpertCache());
+        if (!g.cache->open_sized(sizes, im.g.n_layers, im.g.n_experts, err)) {
+            err = "gpu1: " + err;
+            return false;
+        }
+        // open zeroes the slots on the legacy stream: finished before any fill
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            err = "gpu1: cache zeroing failed";
+            return false;
+        }
+        for (const auto& le : g.set) {
+            const int32_t s = g.cache->admit(le.first, le.second);
+            if (s < 0) {
+                err = "gpu1: admission refused at " + std::to_string(jobs.size()) + " of " + std::to_string(g.set.size());
+                return false;
+            }
+            jobs.push_back({s, le.first, le.second});
+        }
+    }
+    std::atomic<size_t> nx{0};
+    std::atomic<bool> bad{false};
+    std::mutex mu;
+    std::string terr;
+    std::vector<std::thread> th;
+    const int nth = (int) std::min<size_t>(8, jobs.size());
+    for (int k = 0; k < nth; ++k)
+        th.emplace_back([&]() {
+            if (cudaSetDevice(g.dev) != cudaSuccess) { bad = true; return; }
+            uint8_t* buf = nullptr;
+            if (cudaHostAlloc((void**) &buf, (size_t) im.blob, cudaHostAllocPortable) != cudaSuccess) {
+                bad = true;
+                return;
+            }
+            for (size_t q; !bad && (q = nx.fetch_add(1)) < jobs.size();) {
+                const auto& j = jobs[q];
+                im.blobs->read(j[1], j[2], buf);
+                std::lock_guard<std::mutex> lk(mu);
+                std::string e;
+                if (!g.cache->fill_slot_blocking((int32_t) j[0], buf, e, im.bl[(size_t) j[1]])) {
+                    terr = e;
+                    bad = true;
+                }
+            }
+            cudaFreeHost(buf);
+        });
+    for (auto& t : th) t.join();
+    if (bad) {
+        err = "gpu1: seed: " + (terr.empty() ? std::string("pinned buffer allocation failed") : terr);
+        return false;
+    }
+    {   // the bytes, not just the table: first, middle and last slot against a fresh read
+        On on(g.dev);
+        std::vector<uint8_t> ref((size_t) im.blob);
+        for (size_t q : {(size_t) 0, jobs.size() / 2, jobs.size() - 1}) {
+            const auto& j = jobs[q];
+            im.blobs->read(j[1], j[2], ref.data());
+            if (!g.cache->verify_slot((int32_t) j[0], ref.data(), err, im.bl[(size_t) j[1]])) {
+                err = "gpu1: " + err;
+                return false;
+            }
+        }
+    }
+    g.resident = (int64_t) jobs.size();
+    g.seeded = true;
+    g.seed_s = (now_ms() - t0) / 1000.0;
+    return true;
+}
+
+/// vram_lru: the LRU's starting order = the profile's rank over the experts GPU 0 holds: rank 0 -> -2 (the most
+/// recent of the seeds), the last one -> the oldest.  (A function since M7a: grow_cache re-runs it.)
+void lru_seed(Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t n_seeded) {
+    if (!im.cfg.vram_lru || !im.gpu || !im.gpu->cache) return;
+    const int64_t NX = im.g.n_experts;
+    im.vlast.assign((size_t) (im.g.n_layers * NX), -1);
+    int64_t r = 0;
+    for (const auto& le : ranked) {
+        if (r >= n_seeded) break;
+        if (!im.g.routed(le.first) || le.second < 0 || le.second >= NX) continue;
+        int64_t& v = im.vlast[(size_t) (le.first * NX + le.second)];
+        if (v != -1 || im.gpu->cache->slot_of(le.first, le.second) < 0) continue;
+        v = -2 - r++;
+    }
+}
+
+/// Whether GPU 1 holds (layer, expert).
+inline bool g1_has(const Ds4MoeImpl& im, int64_t layer, int64_t expert) {
+    return im.g1 && im.g1->cache && im.g1->cache->slot_of(layer, expert) >= 0;
+}
+
+/// Queues GPU 1's share of a decode / verify pass: `ng` groups (its experts `ge`), group g's entries
+/// [gstart[g], gstart[g+1]) read token etok[r] of the `nt` rows in pinned `h_x` and write compact row r of
+/// g1.h_parts.  The longest path of the layer, so callers queue it first; g1_wait() before reading the rows.
+void g1_launch(Ds4MoeImpl& im, int64_t layer, int nt, const float* h_x, int ng, const int32_t* ge,
+               const int32_t* gstart, const int32_t* etok) {
+    Gpu1& g = *im.g1;
+    G1Meta& m = *(G1Meta*) g.h_meta;
+    const int nr = gstart[ng];
+    for (int i = 0; i < ng; ++i) {
+        m.ptr[i] = (unsigned long long) g.cache->device_slot(g.cache->slot_of(layer, ge[i]));
+        m.start[i] = gstart[i];
+    }
+    m.start[ng] = nr;
+    for (int r = 0; r < nr; ++r) {
+        m.dst[r] = r;
+        m.tok[r] = etok[r];
+    }
+    m.ng[0] = ng;
+    const int64_t H = im.g.n_embd;
+    On on(g.dev);
+    ck(cudaMemcpyAsync(g.d_x, h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, g.s), "gpu1 x");
+    ck(cudaMemcpyAsync(g.d_meta, g.h_meta, sizeof(G1Meta), cudaMemcpyHostToDevice, g.s), "gpu1 meta");
+    strata::kernels::native_quantize_q8_1((const float*) g.d_x, g.d_xq, (int) H, nt, g.s);
+    const G1Meta* dm = (const G1Meta*) g.d_meta;
+    strata::kernels::native_expert_grouped(im.gpu->gll[(size_t) layer], dm->ptr, dm->start, dm->ng, dm->dst, dm->tok,
+                                          ng, nr, g.d_xq, g.d_scratch, (float*) g.d_parts, g.s, ng);
+    ck(cudaMemcpyAsync(g.h_parts, g.d_parts, (size_t) nr * (size_t) H * 4, cudaMemcpyDeviceToHost, g.s), "gpu1 rows");
+    ck(cudaEventRecord(g.ev, g.s), "gpu1 record");
+}
+
+/// DS4_CHECK_G1=1 (diagnostic): GPU-1 rows recomputed on GPU 0 from the file's bytes, compared byte for byte.
+/// [0] decode rows checked, [1] identical, [2] prompt rows checked, [3] identical.  Printed by close().
+int64_t g_g1chk[4] = {};
+bool check_g1() { static const bool on = std::getenv("DS4_CHECK_G1") != nullptr; return on; }
+
+/// The check for one decode / verify expert: blob -> GPU 0 staging slot kMaxParts-1, one grouped launch writing
+/// parts row kMaxParts-1 from token `tok`'s q8_1 (gp.d_xq, already quantized for this layer), compared with `row`.
+/// Runs after the layer's sync (every GPU-0 buffer it borrows is idle then).
+void g1_check_decode(Ds4MoeImpl& im, int64_t layer, int32_t e, int tok, const float* row) {
+    Gpu& gp = *im.gpu;
+    const int64_t H = im.g.n_embd, BL = im.bl[(size_t) layer];
+    std::vector<uint8_t> blob((size_t) im.blob);
+    im.blobs->read(layer, e, blob.data());
+    uint8_t* slot = (uint8_t*) gp.d_stage + (size_t) (kMaxParts - 1) * (size_t) im.blob;
+    ck(cudaMemcpy(slot, blob.data(), (size_t) BL, cudaMemcpyHostToDevice), "g1 chk blob");
+    const unsigned long long p = (unsigned long long) slot;
+    const int32_t st[2] = {0, 1}, one = 1, dst = kMaxParts - 1;
+    ck(cudaMemcpy(gp.d_grp_ptr, &p, sizeof p, cudaMemcpyHostToDevice), "g1 chk");
+    ck(cudaMemcpy(gp.d_grp_start, st, sizeof st, cudaMemcpyHostToDevice), "g1 chk");
+    ck(cudaMemcpy(gp.d_ngroups, &one, 4, cudaMemcpyHostToDevice), "g1 chk");
+    ck(cudaMemcpy(gp.d_ent_dst, &dst, 4, cudaMemcpyHostToDevice), "g1 chk");
+    ck(cudaMemcpy(gp.d_ent_tok, &tok, 4, cudaMemcpyHostToDevice), "g1 chk");
+    strata::kernels::native_expert_grouped(gp.gll[(size_t) layer], (const unsigned long long*) gp.d_grp_ptr,
+                                          (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
+                                          (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok, 1, 1, gp.d_xq,
+                                          gp.d_scratch, (float*) gp.d_parts, gp.s, 1);
+    std::vector<float> ref((size_t) H);
+    ck(cudaMemcpyAsync(ref.data(), (const float*) gp.d_parts + (size_t) dst * (size_t) H, (size_t) H * 4,
+                       cudaMemcpyDeviceToHost, gp.s), "g1 chk row");
+    ck(cudaStreamSynchronize(gp.s), "g1 chk sync");
+    ++g_g1chk[0];
+    if (std::memcmp(ref.data(), row, (size_t) H * 4) == 0) ++g_g1chk[1];
+    else if (g_g1chk[0] - g_g1chk[1] <= 5) {
+        double num = 0, den = 0;
+        for (int64_t i = 0; i < H; ++i) { const double d = (double) row[i] - ref[(size_t) i]; num += d * d; den += (double) ref[(size_t) i] * ref[(size_t) i]; }
+        std::fprintf(stderr, "[g1-chk] L%lld e%d decode row DIFFERS from GPU 0's (rel %.3e)\n", (long long) layer, e,
+                     std::sqrt(num / std::max(den, 1e-30)));
+    }
+}
+
+/// Spins until g1_launch's rows are on the host (a blocking wait would sleep the thread and wake it late).
+void g1_wait(Ds4MoeImpl& im, Ds4MoeStats& st) {
+    const double t0 = now_ms();
+    On on(im.g1->dev);
+    cudaError_t e;
+    while ((e = cudaEventQuery(im.g1->ev)) == cudaErrorNotReady) {
+    }
+    ck(e, "gpu1 wait");
+    st.g1_wait_ms += now_ms() - t0;
+}
+
+/// Queues GPU 1's share of a prompt chunk: the sorted entries [0, n1) belong to its experts `g1e` (ascending ids,
+/// expert e's entries at [first[e], first[e] + cnt[e]), tokens `tok`).  The chunk's `n` rows go over (x_host is the
+/// dense half's pinned buffer), launches of <= c_cap entries compute them, the compact rows land in c_hrows and
+/// c_ev is recorded: GPU 0 waits on it (device side) and scatters the rows into its c_parts before the mix.
+void g1_chunk_launch(Ds4MoeImpl& im, int64_t layer, int n, const float* x_host, const std::vector<int32_t>& g1e,
+                     const std::vector<int32_t>& first, const std::vector<int32_t>& cnt, const std::vector<int32_t>& tok,
+                     int64_t n1) {
+    Gpu1& g = *im.g1;
+    const int64_t H = im.g.n_embd, NX = im.g.n_experts;
+    const size_t mb = g1_cmeta_bytes(NX, g.c_cap), G = (size_t) NX + 1;
+    On on(g.dev);
+    ck(cudaMemcpyAsync(g.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, g.s), "gpu1 c_x");
+    const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
+    for (int c0 = 0; c0 < n; c0 += 8)   // the same quantizer, in the same 8-column steps, as GPU 0's chunk path
+        strata::kernels::native_quantize_q8_1((const float*) g.c_x + (size_t) c0 * (size_t) H,
+                                              (uint8_t*) g.c_xq + (size_t) c0 * col, (int) H, std::min(8, n - c0), g.s);
+    size_t q = 0;
+    int li = 0;
+    for (int64_t r0 = 0, r1 = 0; r0 < n1; r0 = r1, ++li) {
+        r1 = std::min<int64_t>(n1, r0 + g.c_cap);
+        if (li >= g.c_nl) {   // cannot happen: n1 <= n * top_k <= c_tok * top_k and c_nl = top_k + 2
+            std::fprintf(stderr, "ds4_moe: gpu1 chunk: more than %lld launches\n", (long long) g.c_nl);
+            std::abort();
+        }
+        uint8_t* hm = (uint8_t*) g.c_hmeta + (size_t) li * mb;
+        uint8_t* dmt = (uint8_t*) g.c_meta + (size_t) li * mb;
+        auto* ptr = (unsigned long long*) hm;
+        auto* start = (int32_t*) (hm + G * 8);
+        auto* ngp = start + (G + 1);
+        auto* tk = ngp + 4;
+        int ng = 0;
+        for (size_t qq = q; qq < g1e.size(); ++qq) {   // the groups overlapping [r0, r1) (they tile [0, n1) in order)
+            const int64_t gs = first[(size_t) g1e[qq]], gend = gs + cnt[(size_t) g1e[qq]];
+            if (gs >= r1) break;
+            ptr[ng] = (unsigned long long) g.cache->device_slot(g.cache->slot_of(layer, g1e[qq]));
+            start[ng] = (int32_t) (std::max(gs, r0) - r0);
+            ++ng;
+            (void) gend;
+        }
+        start[ng] = (int32_t) (r1 - r0);
+        ngp[0] = ng;
+        std::memcpy(tk, tok.data() + r0, (size_t) (r1 - r0) * 4);
+        while (q < g1e.size() && first[(size_t) g1e[q]] + cnt[(size_t) g1e[q]] <= r1) ++q;
+        ck(cudaMemcpyAsync(dmt, hm, mb, cudaMemcpyHostToDevice, g.s), "gpu1 chunk meta");
+        const auto* dptr = (const unsigned long long*) dmt;
+        const auto* dstart = (const int32_t*) (dmt + G * 8);
+        const int32_t* dng = dstart + (G + 1);
+        const int32_t* dtk = dng + 4;
+        strata::kernels::native_expert_grouped(im.gpu->gll[(size_t) layer], dptr, dstart, dng, (const int32_t*) g.c_iota,
+                                              dtk, ng, r1 - r0, g.c_xq, g.c_scratch, (float*) g.c_parts, g.s, ng);
+        ck(cudaMemcpyAsync(g.c_hrows + (size_t) r0 * (size_t) H, g.c_parts, (size_t) (r1 - r0) * (size_t) H * 4,
+                           cudaMemcpyDeviceToHost, g.s), "gpu1 chunk rows");
+    }
+    ck(cudaEventRecord(g.c_ev, g.s), "gpu1 chunk record");
+}
+
+#endif  // DS4_MOE_CUDA
 
 // ================================ geometry ================================
 
@@ -745,6 +1235,8 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
+    ck(cudaMallocHost(&gp.h_meta2, 2 * sizeof(G1Meta)), "h_meta2");
+    ck(cudaMalloc(&gp.d_meta2, 2 * sizeof(G1Meta)), "d_meta2");
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds4MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -762,6 +1254,8 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     // once in index order here, once from the profile when the caller seeds - would read the file twice and page
     // the second read through the first's cache.  The first build wins (build_arena), and the first build is the
     // seed's; a caller that never seeds gets the file tier for every expert, which is slower but not wrong.
+    // mab776 M7a: GPU 1's buffers now and its budget measured after them; its cache opens at the seed (the walk).
+    if (cfg.gpu1_device >= 0 && !cfg.no_cache && !open_gpu1(*im_, err)) return false;
     im_->inited = true;
     return true;
 #endif
@@ -770,23 +1264,23 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
 
 /// The arena's ranking: with `arena_skip_resident`, minus the head the VRAM seed takes
 /// (the same walk as the cache seed: ranked order, up to `slots` experts or the `slot_gib` bytes).
+/// mab776 M7a: an elastic cache's grow set (its slot_gib..slot_gib_max ranks) STAYS in the arena - the grow copies it
+/// from there after the prompt; GPU 1's experts never take arena room (exclusive tiers).
 std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds4MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& ranked) {
-    if (!(im.cfg.arena_skip_resident && !im.cfg.no_cache && im.cfg.slots > 0)) return ranked;
-    const double budget = im.cfg.slot_gib > 0 ? im.cfg.slot_gib * 1073741824.0 : (double) im.cfg.slots * (double) im.blob;
-    std::vector<char> res((size_t) (im.g.n_layers * im.g.n_experts), 0);
-    double used = 0;
-    int64_t n = 0;
-    for (const auto& le : ranked) {
-        if (n >= im.cfg.slots) break;
-        if (!im.g.routed(le.first) || le.second < 0 || le.second >= im.g.n_experts) continue;
-        char& r = res[(size_t) (le.first * im.g.n_experts + le.second)];
-        if (r) continue;
-        const int64_t b = im.bl[(size_t) le.first];
-        if (used + (double) b > budget) break;
-        r = 1;
-        used += (double) b;
-        ++n;
-    }
+    const bool skip = im.cfg.arena_skip_resident && !im.cfg.no_cache && im.cfg.slots > 0;
+#if defined(DS4_MOE_CUDA)
+    const bool g1 = im.g1 && !im.g1->set.empty();
+#else
+    const bool g1 = false;
+#endif
+    if (!skip && !g1) return ranked;
+    std::vector<char> res;
+    if (skip) walk_vram0(im, ranked, vram0_budget(im, false), res);
+    else res.assign((size_t) (im.g.n_layers * im.g.n_experts), 0);
+#if defined(DS4_MOE_CUDA)
+    if (g1)
+        for (const auto& le : im.g1->set) res[(size_t) (le.first * im.g.n_experts + le.second)] = 1;
+#endif
     std::vector<std::pair<int32_t, int32_t>> rest;
     rest.reserve(ranked.size());
     for (const auto& le : ranked)
@@ -912,40 +1406,40 @@ bool Ds4MoeTier::seed_from_routes(const std::string& routes_bin, int batch_token
         err = e.empty() ? "empty routing profile" : e;
         return false;
     }
-    return seed_from_ranked(ranked, err);
+    return seed_from_ranked(complete_ranking(im_->g, ranked), err);   // mab776 M7a phase 0
 }
 
 bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
+#if defined(DS4_MOE_CUDA)
+    plan_gpu1(*im_, ranked);   // mab776 M7a: GPU 1's share first - the arena leaves it out
+#endif
     if (!build_arena(arena_order(*im_, ranked), err)) return false;
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
     err = "the VRAM cache needs the CUDA tier (compiled without DS4_MOE_CUDA)";
     return false;
 #else
+    if (!seed_gpu1(*im_, err)) return false;
     // A per-layer-sized geometry (MiMo) opens its cache now: one slot per ranked expert, each the size of ITS
     // layer's blob, until `slots` experts or `slot_gib` bytes.  The seed below admits in the same order, so slot i
     // is ranked[i]'s and fits it exactly; the cache never evicts, so a slot never meets another layer's blob.
+    // mab776 M7a, elastic (slot_gib_max): the slots of the whole decode budget, in 64 MiB segments, only the first
+    // slot_gib mapped - the rest is the prompt chunks' VRAM until grow_cache (Strata-GLM's elastic open).
+    const bool elastic = im_->mixed_sizes && im_->cfg.slot_gib > 0 && im_->cfg.slot_gib_max > im_->cfg.slot_gib;
     if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache && im_->cfg.slots > 0) {
-        const double budget = im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
-                                                     : (double) im_->cfg.slots * (double) im_->blob;
-        std::vector<int64_t> sizes;
-        std::vector<char> seen((size_t) (im_->g.n_layers * im_->g.n_experts), 0);
-        double used = 0;
-        for (const auto& le : ranked) {
-            if ((int64_t) sizes.size() >= im_->cfg.slots) break;
-            if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
-            char& sn = seen[(size_t) (le.first * im_->g.n_experts + le.second)];
-            if (sn) continue;
-            const int64_t b = im_->bl[(size_t) le.first];
-            if (used + (double) b > budget) break;
-            sn = 1;
-            sizes.push_back(b);
-            used += (double) b;
-        }
+        std::vector<char> seen;
+        const std::vector<int64_t> sizes = walk_vram0(*im_, ranked, vram0_budget(*im_, true), seen);
         if (!sizes.empty()) {
             im_->gpu->cache.reset(new strata::core::ExpertCache());
+            if (elastic) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
+            if (elastic) {
+                strata::core::ExpertCache& c = *im_->gpu->cache;
+                const int64_t live = c.slots_within((int64_t) (im_->cfg.slot_gib * 1073741824.0));
+                if (!c.shrink(c.bytes_of(live), err)) return false;
+                im_->seed_ranked = ranked;
+            }
         }
     }
     // uniform blobs with defer_cache: the cache opens now (after the prompt chunks gave their VRAM back)
@@ -956,22 +1450,11 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
-    const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
+    // (elastic: the mapped slots only - admit hands out slot indices in order, past the mapped ones too)
+    const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->slots());
     int64_t filled = 0;
     // vram_lru: the LRU's starting order = the profile's rank: the coldest seeded expert goes first
-    auto lru_seed_order = [&](int64_t n_seeded) {
-        if (!im_->cfg.vram_lru) return;
-        const int64_t NX = im_->g.n_experts;
-        im_->vlast.assign((size_t) (im_->g.n_layers * NX), -1);
-        int64_t r = 0;
-        for (const auto& le : ranked) {
-            if (r >= n_seeded) break;
-            if (!im_->g.routed(le.first) || le.second < 0 || le.second >= NX) continue;
-            int64_t& v = im_->vlast[(size_t) (le.first * NX + le.second)];
-            if (v != -1 || im_->gpu->cache->slot_of(le.first, le.second) < 0) continue;
-            v = -2 - r++;   // rank 0 -> -2 (most recent of the seeds), the last seeded -> the oldest
-        }
-    };
+    auto lru_seed_order = [&](int64_t n_seeded) { lru_seed(*im_, ranked, n_seeded); };
     if (im_->mixed_sizes || !std::getenv("DS4_SERIAL_SEED")) {
         // MiMo (and DS4 since 2026-10-08: the serial seed below took 8 s for 2226 slots after chunked prefill): the
         // same admissions in the same order, but the copies overlap - arena blobs queued straight from the
@@ -1072,6 +1555,7 @@ void Ds4MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
         const int32_t e = top16[i];
         if (e < 0 || e >= im_->g.n_experts) continue;
         if (gp.cache->slot_of(layer, e) >= 0) continue;
+        if (g1_has(*im_, layer, e)) continue;   // mab776 M7a: GPU 1 computes it in place (and it has no arena copy)
         bool dup = false;
         for (int j = 0; j < im_->pf_n; ++j) dup = dup || im_->pf_e[j] == e;
         if (dup) continue;
@@ -1165,10 +1649,12 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     const double t0 = now_ms();
     Ds4MoeStats st;
 
-    // ---- split the routed experts: resident, prefetched (also computed on the GPU), CPU, PCIe ----
+    // ---- split the routed experts: resident, prefetched (also computed on the GPU), GPU 1, CPU, PCIe ----
     int32_t hit_i[kMaxParts], cpu_i[kMaxParts], pcie_i[kMaxParts], slot_i[kMaxParts] = {};
     unsigned long long pf_ptr[kMaxParts] = {};
-    int nh = 0, nc = 0, np = 0, npf_hit = 0;
+    int32_t g1_e[kMaxParts], g1_row[kMaxParts] = {}, g1_start[kMaxParts + 1], g1_tok[kMaxParts] = {};
+    bool g1_k[kMaxParts] = {};   ///< mab776 M7a: routing index -> GPU 1 computes it (row g1_row[k] of its readback)
+    int nh = 0, nc = 0, np = 0, npf_hit = 0, n1 = 0;
     for (int64_t k = 0; k < K; ++k) {
         const int32_t e = ids6[k];
         const int32_t s = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
@@ -1182,10 +1668,16 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
             pf_ptr[k] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B;
             hit_i[nh++] = (int32_t) k;
             ++npf_hit;
+        } else if (g1_has(im, layer, e)) {   // GPU 1 is not a miss: no skip_miss, no PCIe budget, no admission
+            g1_k[k] = true;
+            g1_row[k] = n1;
+            g1_start[n1] = n1;
+            g1_e[n1++] = e;
         } else {
             cpu_i[nc++] = (int32_t) k;
         }
     }
+    g1_start[n1] = n1;
     st.prefetched_useful = npf_hit;
     // skip_miss: a miss with a small gate weight is dropped - its 6.75 MB never moves (wloc = the weights the sum uses)
     float wloc[kMaxParts];
@@ -1243,29 +1735,32 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     } else {
         std::memcpy(gp.h_x, x_host, (size_t) H * 4);
     }
-    cpu::native_quant_act(f, gp.h_x, im.nact.data());
+    if (n1 > 0) g1_launch(im, layer, 1, gp.h_x, n1, g1_e, g1_start, g1_tok);   // mab776 M7a: the longest path first
+    if (nk > 0) cpu::native_quant_act(f, gp.h_x, im.nact.data());   // M7a: only when the pool has work (~2 % of lookups)
     ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
     strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, 1, gp.s);
     ck(cudaEventRecord(gp.ev[0], gp.s), "record activation");
     mark(1);
 
     // ---- one group's metadata, then the grouped kernel: w 0 = the GPU's hits, 1 = the PCIe share ----
+    // mab776 M7a: the five arrays packed into region `w` of one pinned block, one H2D copy (five pageable copies
+    // were ~20 us of the ~37 us "gpu launch" per layer).  Region w is rewritten only by the next layer, after its sync.
     auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
                             const std::vector<int32_t>& tok) {
-        const int32_t one = n;
-        ck(cudaMemcpyAsync(gp.d_grp_ptr, ptr.data(), sizeof(unsigned long long) * n, cudaMemcpyHostToDevice, gp.s),
-           "grp_ptr");
-        ck(cudaMemcpyAsync(gp.d_grp_start, start.data(), sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice, gp.s),
-           "grp_start");
-        ck(cudaMemcpyAsync(gp.d_ngroups, &one, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
-        ck(cudaMemcpyAsync(gp.d_ent_dst, dst.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_dst");
-        ck(cudaMemcpyAsync(gp.d_ent_tok, tok.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_tok");
-        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) gp.d_grp_ptr,
-                                              (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
-                                              (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok,
+        G1Meta& m = ((G1Meta*) gp.h_meta2)[w];
+        for (int i = 0; i < n; ++i) {
+            m.ptr[i] = ptr[(size_t) i];
+            m.start[i] = start[(size_t) i];
+            m.dst[i] = dst[(size_t) i];
+            m.tok[i] = tok[(size_t) i];
+        }
+        m.start[n] = start[(size_t) n];
+        m.ng[0] = n;
+        G1Meta* dm = (G1Meta*) gp.d_meta2 + w;
+        ck(cudaMemcpyAsync(dm, &m, sizeof(G1Meta), cudaMemcpyHostToDevice, gp.s), "grp meta");
+        strata::kernels::native_expert_grouped(GL, dm->ptr, dm->start, dm->ng, dm->dst, dm->tok,
                                               kMaxParts, n, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, n);
-        (void) w;
     };
 
     int ev_hit = -1, ev_pcie = -1;
@@ -1489,10 +1984,14 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     }
 
     mark(3);
+    // mab776 M7a: the parts readback is queued BEFORE the layer sync - one sync per layer instead of two (it follows
+    // every kernel and LRU copy of the layer on gp.s, so it reads the finished rows)
+    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
+                       cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "layer sync");
-    if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter
+    if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter (GPU 1's are not misses)
         for (int64_t k = 0; k < K; ++k)
-            if (slot_i[k] < 0) im.vmiss[(size_t) (layer * NXL + ids6[k])] = lc;
+            if (slot_i[k] < 0 && !g1_k[k]) im.vmiss[(size_t) (layer * NXL + ids6[k])] = lc;
     static const bool check_lru = std::getenv("DS4_CHECK_LRU") != nullptr;
     for (int i = 0; i < n_lru; ++i) {   // vram_lru: the copies are done - the slots now hold the new experts
         gp.cache->replace(layer, lru_old[i], lru_new[i]);
@@ -1531,27 +2030,35 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         ck(cudaEventElapsedTime(&ms, gp.ev[ev_hit > 0 ? ev_hit : 0], gp.ev[ev_pcie]), "pcie elapsed");
         st.pcie_ms = ms;
     }
-    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
-                       cudaMemcpyDeviceToHost, gp.s), "d2h parts");
-    ck(cudaStreamSynchronize(gp.s), "parts sync");
     const float* gpu_parts = (const float*) gp.h_parts;
+    if (n1 > 0) g1_wait(im, st);   // mab776 M7a: GPU 1's rows (queued first: normally done by now)
+    const float* g1_parts = n1 > 0 ? (const float*) im.g1->h_parts : nullptr;
+    if (n1 > 0 && check_g1())
+        for (int i = 0; i < n1; ++i) g1_check_decode(im, layer, g1_e[i], 0, g1_parts + (size_t) i * (size_t) H);
     mark(5);
     // DS4_CHECK_GPU=1: every card-computed expert recomputed on the CPU from the arena's bytes (diagnostic, slow)
+    // (mab776 M7a: GPU 1's experts from the file's bytes - they have no arena copy)
     static const bool check_gpu = std::getenv("DS4_CHECK_GPU") != nullptr;
     if (check_gpu) {
         std::vector<float> ref((size_t) H);
+        std::vector<uint8_t> fb;
         for (int64_t k = 0; k < K; ++k) {
-            if (cpu_k[k]) continue;
+            if (cpu_k[k] || wloc[k] == 0.0f) continue;
             const uint8_t* p = gp.arena.ptr(layer, ids6[k]);
+            if (g1_k[k]) {
+                fb.resize((size_t) im.blob);
+                im.blobs->read(layer, ids6[k], fb.data());
+                p = fb.data();
+            }
             if (!p) continue;
             ds4_moe_cpu_expert(f, H, im.g.n_ff, p, gp.h_x, ref.data(), *im.pool);
             double num = 0, den = 0;
-            const float* g = gpu_parts + (size_t) k * (size_t) H;
+            const float* g = g1_k[k] ? g1_parts + (size_t) g1_row[k] * (size_t) H : gpu_parts + (size_t) k * (size_t) H;
             for (int64_t i = 0; i < H; ++i) { const double d = g[i] - ref[(size_t) i]; num += d * d; den += (double) ref[(size_t) i] * ref[(size_t) i]; }
             bool is_pcie = false;
             for (int j = 0; j < np; ++j) is_pcie = is_pcie || pcie_i[j] == k;
-            std::fprintf(stderr, "[chk] L%lld e%d %s rel %.3e\n", (long long) layer, ids6[k], is_pcie ? "pcie" : "hit ",
-                         std::sqrt(num / std::max(den, 1e-30)));
+            std::fprintf(stderr, "[chk] L%lld e%d %s rel %.3e\n", (long long) layer, ids6[k],
+                         g1_k[k] ? "gpu1" : is_pcie ? "pcie" : "hit ", std::sqrt(num / std::max(den, 1e-30)));
         }
     }
 
@@ -1560,14 +2067,23 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     // it cannot be told to leave the pool's indices alone - the index's own source selects which buffer to read.
     // Reading `gpu_parts` for a CPU-computed index would sum uninitialized device memory, which is why this is not
     // a detail (the gate's file-tier arm caught it: the replay is speed-only and never sums a layer).
+    // mab776 M7a: a GPU-1 index reads its compact row of GPU 1's readback; same double sum, same k order.
+    // M7a: the active rows and weights picked once per layer instead of per element (same k order, mul then add -
+    // this TU has no FMA - so the same bits): A/B 7 us/layer vs 23 for the per-element select, 19 for L1-tiled
+    // k-outer and 37 for k-outer over the whole row.
+    const float* src[kMaxParts];
+    double wv[kMaxParts];
+    int na = 0;
+    for (int64_t k = 0; k < K; ++k) {
+        if (wloc[k] == 0.0f) continue;   // a dropped miss: its parts row was never computed (0 * NaN is NaN)
+        src[na] = cpu_k[k] ? im.parts.data() + (size_t) k * (size_t) H
+                : g1_k[k] ? g1_parts + (size_t) g1_row[k] * (size_t) H
+                          : gpu_parts + (size_t) k * (size_t) H;
+        wv[na++] = (double) wloc[k];
+    }
     for (int64_t i = 0; i < H; ++i) {
         double s = 0;
-        for (int64_t k = 0; k < K; ++k) {
-            if (wloc[k] == 0.0f) continue;   // a dropped miss: its parts row was never computed (0 * NaN is NaN)
-            const float* p = cpu_k[k] ? im.parts.data() + (size_t) k * (size_t) H
-                                      : gpu_parts + (size_t) k * (size_t) H;
-            s += (double) wloc[k] * (double) p[(size_t) i];
-        }
+        for (int j = 0; j < na; ++j) s += wv[j] * (double) src[j][(size_t) i];
         out[i] = (float) s;
     }
 
@@ -1593,6 +2109,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     mark(7);
     if (prof) ++g_prof_n;
     st.hits = nh;
+    st.hits1 = n1;
     st.pcie = np;
     st.cpu = nk;
     st.wall_ms = now_ms() - t0;
@@ -1629,8 +2146,8 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         if (u < 0) { u = nu; ue[nu++] = ids[j]; }
         ent_u[j] = u;
     }
-    // ---- classify: resident slot / prefetch staging / miss ----
-    enum { HIT = 0, PCIE = 1, CPU = 2 };
+    // ---- classify: resident slot / prefetch staging / GPU 1 (mab776 M7a) / miss ----
+    enum { HIT = 0, PCIE = 1, CPU = 2, G1 = 3 };
     int cls[kMaxEnt];
     unsigned long long dptr[kMaxEnt] = {};
     int32_t miss[kMaxEnt];
@@ -1648,6 +2165,8 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
             cls[u] = HIT;
             dptr[u] = (unsigned long long) gp.d_pf + (size_t) pf_at * (size_t) B;
             ++npf;
+        } else if (g1_has(im, layer, e)) {
+            cls[u] = G1;
         } else {
             cls[u] = CPU;
             miss[nmiss++] = u;
@@ -1676,6 +2195,21 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
 
     // ---- activations: Q8_K per token for the pool, q8_1 rows for the card ----
     std::memcpy(gp.h_x, x_host, (size_t) nt * (size_t) H * 4);
+    // mab776 M7a: GPU 1's distinct experts, each a group of the entries that routed to it (compact rows), first
+    int32_t g1_e[kMaxEnt], g1_start[kMaxEnt + 1], g1_tok[kMaxEnt], g1_row[kMaxEnt];
+    int n1g = 0, n1r = 0;
+    for (int u = 0; u < nu; ++u) {
+        if (cls[u] != G1) continue;
+        g1_e[n1g] = ue[u];
+        g1_start[n1g++] = n1r;
+        for (int j = 0; j < NE; ++j)
+            if (ent_u[j] == u) {
+                g1_row[j] = n1r;
+                g1_tok[n1r++] = j / (int) K;
+            }
+    }
+    g1_start[n1g] = n1r;
+    if (n1g > 0) g1_launch(im, layer, nt, gp.h_x, n1g, g1_e, g1_start, g1_tok);
     for (int t = 0; t < nt; ++t)
         cpu::native_quant_act(f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * im.f.act_bytes);
     ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
@@ -1743,6 +2277,12 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "layer sync");
     const float* gpu_parts = (const float*) gp.h_parts;
+    if (n1g > 0) g1_wait(im, st);
+    const float* g1_parts = n1g > 0 ? (const float*) im.g1->h_parts : nullptr;
+    if (n1g > 0 && check_g1())
+        for (int gi = 0; gi < n1g; ++gi)
+            for (int r = g1_start[gi]; r < g1_start[gi + 1]; ++r)
+                g1_check_decode(im, layer, g1_e[gi], g1_tok[r], g1_parts + (size_t) r * (size_t) H);
 
     // ---- per-token weighted sums, k in order ----
     for (int t = 0; t < nt; ++t)
@@ -1750,7 +2290,10 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
             double acc = 0;
             for (int64_t k = 0; k < K; ++k) {
                 const int j = t * (int) K + (int) k;
-                const float* p = cls[ent_u[j]] == CPU ? im.parts_n.data() + (size_t) j * H : gpu_parts + (size_t) j * H;
+                const int c = cls[ent_u[j]];
+                const float* p = c == CPU ? im.parts_n.data() + (size_t) j * H
+                               : c == G1  ? g1_parts + (size_t) g1_row[j] * H
+                                          : gpu_parts + (size_t) j * H;
                 acc += (double) w[j] * (double) p[(size_t) i];
             }
             out[(size_t) t * H + i] = (float) acc;
@@ -1759,7 +2302,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     // ---- admission of the distinct misses (as gpu_run) ----
     if (gp.cache && !im.cfg.no_cache && !im.mixed_sizes) {
         for (int u = 0; u < nu; ++u) {
-            if (cls[u] == HIT) continue;
+            if (cls[u] == HIT || cls[u] == G1) continue;
             const uint8_t* p = gp.arena.ptr(layer, ue[u]);
             if (!p) continue;
             const int32_t sl = gp.cache->admit(layer, ue[u]);
@@ -1775,7 +2318,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     // stats per (token, expert) lookup, so hit rates stay comparable with single-token runs
     for (int j = 0; j < NE; ++j) {
         const int c = cls[ent_u[j]];
-        if (c == HIT) ++st.hits; else if (c == PCIE) ++st.pcie; else ++st.cpu;
+        if (c == HIT) ++st.hits; else if (c == PCIE) ++st.pcie; else if (c == G1) ++st.hits1; else ++st.cpu;
     }
     st.prefetched_useful = npf;
     st.wall_ms = now_ms() - t0;
@@ -1880,9 +2423,24 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         gp.c_half = (int64_t) (mib ? std::atoll(mib) : 1024) * 1048576;
         gp.c_half = std::max<int64_t>(gp.c_half, im.blob);
         gp.c_bhalf = gp.c_half;   // the pinned bounce halves keep this size
-        // prestage: one device half holds a whole layer (every expert at the MMQ stride, <= blob + 1 MiB each)
-        if (im.cfg.chunk_prestage)
-            gp.c_half = std::max<int64_t>(gp.c_half, im.g.n_experts * (im.blob + 1048576));
+        // prestage: one device half holds a whole layer's prestaged set.  mab776 M7a: that set is the layer's arena
+        // experts NOT in VRAM (chunk_prestage's own rule; GPU 1's have no arena copy), at the layer's stride - not all
+        // 256 at blob + 1 MiB: with GPU 0's cache and GPU 1 holding ~65 % of the experts that cut the two halves from
+        // 5.3 GiB to what the busiest layer needs (an LRU swap trades within a layer, so the count holds).
+        if (im.cfg.chunk_prestage) {
+            int64_t need = 0, most = 0;
+            for (int64_t l = 0; l < im.g.n_layers; ++l) {
+                if (!im.g.routed(l)) continue;
+                int64_t c = 0;
+                for (int64_t e = 0; e < im.g.n_experts; ++e)
+                    if (gp.arena.ptr(l, e) && !(gp.cache && !im.cfg.no_cache && gp.cache->slot_of(l, e) >= 0)) ++c;
+                need = std::max<int64_t>(need, c * chunk_stride(im, l));
+                most = std::max(most, c);
+            }
+            gp.c_half = std::max<int64_t>(gp.c_half, need);
+            std::fprintf(stderr, "ds4_moe: run_chunk: prestage halves of %.2f GiB (busiest layer: %lld arena experts)\n",
+                         gp.c_half / 1073741824.0, (long long) most);
+        }
         const int64_t ng = im.g.n_experts;
         ck(cudaMalloc(&gp.c_ptr, sizeof(unsigned long long) * (size_t) ng), "c_ptr");
         ck(cudaMalloc(&gp.c_start, sizeof(int32_t) * (size_t) (ng + 1)), "c_start");
@@ -1957,17 +2515,37 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     // processing order: VRAM-resident experts, then arena (DMA straight away), then file tier (read in the background
     // from the start of the call, so the arena DMAs and the reads overlap); entries are laid out in this order, so
     // consecutive experts of one class are adjacent in the sorted entry arrays (one launch per run)
-    std::vector<int32_t> order[3];
+    // mab776 M7a: GPU 1's experts go FIRST - their entries are the sorted range [0, n1), which GPU 0's launches never
+    // touch; GPU 1 computes them in place and GPU 0 scatters the rows into c_parts before the mix
+    const bool g1_ok = im.g1 && im.g1->cache && im.g1->c_tok >= n;
+    if (im.g1 && im.g1->cache && !g1_ok) {
+        static bool warned = false;
+        if (!warned) std::fprintf(stderr, "ds4_moe: run_chunk: GPU 1's chunk buffers hold %lld tokens, this chunk has %d - "
+                                          "its experts are read from the file instead (set gpu1_chunk_tokens)\n",
+                                  (long long) im.g1->c_tok, n);
+        warned = true;
+    }
+    std::vector<int32_t> order[3], g1e;
     std::vector<int32_t> slot_e((size_t) NX, -1);
     for (int64_t e = 0; e < NX; ++e) {
         if (!cnt[(size_t) e]) continue;
         const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
         slot_e[(size_t) e] = sl;
+        if (sl < 0 && g1_ok && g1_has(im, layer, e)) {
+            g1e.push_back((int32_t) e);
+            continue;
+        }
         order[sl >= 0 ? 0 : gp.arena.ptr(layer, e) ? 1 : 2].push_back((int32_t) e);
     }
     std::vector<int32_t> first((size_t) NX + 1, 0);
+    int64_t n1 = 0;
     {
         int32_t at = 0;
+        for (int32_t e : g1e) {
+            first[(size_t) e] = at;
+            at += cnt[(size_t) e];
+        }
+        n1 = at;
         for (const auto& o : order)
             for (int32_t e : o) {
                 first[(size_t) e] = at;
@@ -1980,6 +2558,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         dst[(size_t) p] = (int32_t) j;
         tok[(size_t) p] = (int32_t) (j / K);
     }
+    if (n1 > 0) g1_chunk_launch(im, layer, n, x_host, g1e, first, cnt, tok, n1);   // queued first: the slow link
     // entry arrays sorted by expert: uploaded once; each launch passes its groups' slices via grp_start offsets
     ck(cudaMemcpyAsync(gp.c_dst, dst.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_dst");
     ck(cudaMemcpyAsync(gp.c_tokv, tok.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_tok");
@@ -2257,6 +2836,12 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         chunk_prestage(im, nl, h_last >= 0 ? 1 - h_last : 0);
     }
 
+    // ---- mab776 M7a: GPU 1's entry rows into their c_parts rows (read in place from mapped host memory, after its
+    // event - a device-side wait, the host does not block) ----
+    if (n1 > 0) {
+        ck(cudaStreamWaitEvent(gp.s, im.g1->c_ev, 0), "wait gpu1 rows");
+        strata::kernels::scatter_rows_f32(im.g1->c_hrows, (float*) gp.c_parts, (const int32_t*) gp.c_dst, n1, H, gp.s);
+    }
     // ---- outputs: the top-k mix on the card, n rows back ----
     ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
@@ -2268,6 +2853,34 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     const double ts = now_ms();
     ck(cudaStreamSynchronize(gp.s), "chunk sync");
     if (!out_dev) std::memcpy(out, gp.c_hparts, (size_t) n * (size_t) H * 4);
+    if (n1 > 0 && check_g1()) {   // mab776 M7a, DS4_CHECK_G1: GPU 1's first expert of this call recomputed on GPU 0
+        const int32_t e0 = g1e[0];
+        const int64_t c0 = cnt[(size_t) e0];   // its entries are the sorted [0, c0)
+        std::vector<uint8_t> blob((size_t) im.blob);
+        im.blobs->read(layer, e0, blob.data());
+        ck(cudaMemcpy(gp.c_stage[0], blob.data(), (size_t) BL, cudaMemcpyHostToDevice), "g1 chk blob");
+        const unsigned long long p = (unsigned long long) gp.c_stage[0];
+        const int32_t stv[2] = {0, (int32_t) c0}, one = 1;
+        ck(cudaMemcpy(gp.c_ptr, &p, sizeof p, cudaMemcpyHostToDevice), "g1 chk");
+        ck(cudaMemcpy(gp.c_start, stv, sizeof stv, cudaMemcpyHostToDevice), "g1 chk");
+        ck(cudaMemcpy(gp.c_ng, &one, 4, cudaMemcpyHostToDevice), "g1 chk");
+        strata::kernels::native_expert_grouped(GL, (const unsigned long long*) gp.c_ptr, (const int32_t*) gp.c_start,
+                                              (const int32_t*) gp.c_ng, (const int32_t*) gp.c_dst,
+                                              (const int32_t*) gp.c_tokv, 1, NE, gp.c_xq, gp.c_scratch,
+                                              (float*) gp.c_parts, gp.s, 1);
+        std::vector<float> ref((size_t) H);
+        int64_t bad = 0;
+        for (int64_t q = 0; q < c0; ++q) {
+            ck(cudaMemcpyAsync(ref.data(), (const float*) gp.c_parts + (size_t) dst[(size_t) q] * (size_t) H,
+                               (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "g1 chk row");
+            ck(cudaStreamSynchronize(gp.s), "g1 chk sync");
+            bad += std::memcmp(ref.data(), im.g1->c_hrows + (size_t) q * (size_t) H, (size_t) H * 4) != 0;
+        }
+        g_g1chk[2] += c0;
+        g_g1chk[3] += c0 - bad;
+        if (bad) std::fprintf(stderr, "[g1-chk] L%lld e%d: %lld of %lld prompt rows DIFFER from GPU 0's\n",
+                              (long long) layer, e0, (long long) bad, (long long) c0);
+    }
     if (prof) {
         g_cprof.sync += now_ms() - ts;
         for (size_t i = 0; i < kev.size(); ++i) {
@@ -2284,6 +2897,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         g_cprof.wall += now_ms() - t0;
     }
     st.hits = ent_hit;
+    st.hits1 = n1;
     st.pcie = ent_str;
     st.file_tier = n_file;
     st.file_ms = t_file;
@@ -2325,13 +2939,20 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
 bool Ds4MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
     if (im_->cfg.cpu_only) return true;
     std::string e;
-    const std::vector<std::pair<int32_t, int32_t>> ranked =
+    const std::vector<std::pair<int32_t, int32_t>> raw =
         rank_routes(routes_bin, im_->g.n_routed(), im_->g.top_k, e, batch_tokens);
-    if (ranked.empty()) {
+    if (raw.empty()) {
         err = e.empty() ? "empty routing profile" : e;
         return false;
     }
+    const std::vector<std::pair<int32_t, int32_t>> ranked = complete_ranking(im_->g, raw);   // mab776 M7a phase 0
+#if defined(DS4_MOE_CUDA)
+    plan_gpu1(*im_, ranked);   // mab776 M7a: GPU 1 is seeded now - it never competes with the chunks' VRAM
+    if (!build_arena(arena_order(*im_, ranked), err)) return false;
+    return seed_gpu1(*im_, err);
+#else
     return build_arena(arena_order(*im_, ranked), err);
+#endif
 }
 
 void Ds4MoeTier::release_chunk() {
@@ -2372,6 +2993,56 @@ void Ds4MoeTier::release_chunk() {
     gp.c_pre_layer = gp.c_pre_half = -1;
     gp.c_pre_e.clear();
     gp.free_mmq();
+#endif
+}
+
+int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
+    strata::core::ExpertCache& c = *im_->gpu->cache;
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { err = "grow_cache: cudaMemGetInfo failed"; return -1; }
+    const int64_t room = (int64_t) fr - (int64_t) (keep_free_gib * 1073741824.0);
+    if (room <= 0) return 0;
+    const int64_t before = c.slots();
+    std::string e;
+    c.grow(std::min<int64_t>(c.full_bytes(), c.bytes() + room), e);   // a short grow keeps what it mapped
+    const double t0 = now_ms();
+    int64_t added = 0, nfile = 0;
+    const uint64_t* off = c.slot_offsets();   // sized slots: slot i was sized for the walk's i-th expert
+    for (const auto& le : im_->seed_ranked) {   // the seed's order: slot i is ranked[i]'s size
+        if (c.resident() >= c.slots()) break;
+        if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
+        if (c.slot_of(le.first, le.second) >= 0) continue;
+        if (g1_has(*im_, le.first, le.second)) continue;   // GPU 1's tier is exclusive
+        // the next slot must hold this blob: right after the prompt the admissions are exactly the walk's, but once
+        // decode's LRU has traded experts (a server regrowing per request) the order can shift - never overflow a slot
+        const int64_t nx = c.resident();
+        if (off && (int64_t) (off[nx + 1] - off[nx]) < im_->bl[(size_t) le.first]) continue;
+        const int32_t s = c.admit(le.first, le.second);
+        if (s < 0) break;
+        const int64_t BL = im_->bl[(size_t) le.first];
+        if (const uint8_t* p = im_->gpu->arena.ptr(le.first, le.second)) {
+            if (!c.fill_slot_queued(s, p, err, BL)) return -1;
+        } else {
+            bool from_file = false;
+            const uint8_t* q = acquire(*im_, le.first, le.second, 0, &from_file);
+            if (!c.fill_slot_blocking(s, q, err, BL)) return -1;
+            ++nfile;
+        }
+        ++added;
+    }
+    if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess) { err = "grow_cache: queued fills failed"; return -1; }
+    im_->admitted += added;
+    lru_seed(*im_, im_->seed_ranked, c.resident());   // the grown experts join the LRU after the seed's, in rank order
+    std::fprintf(stderr, "grow_cache: %lld -> %lld slots (+%lld, %lld from the file tier) in %.0f ms%s%s\n",
+                 (long long) before, (long long) c.slots(), (long long) added, (long long) nfile, now_ms() - t0,
+                 e.empty() ? "" : "; grow stopped: ", e.c_str());
+    return added;
+#else
+    (void) keep_free_gib;
+    (void) err;
+    return 0;
 #endif
 }
 
@@ -2431,6 +3102,11 @@ bool ds4_moe_cpu_expert(const cpu::NativeFmt& f, int64_t n_embd, int64_t n_ff, c
 
 void Ds4MoeTier::close() {
 #if defined(DS4_MOE_CUDA)
+    if (g_g1chk[0] || g_g1chk[2])
+        std::fprintf(stderr, "[g1-chk] GPU 1 rows vs GPU 0 recomputation: decode %lld/%lld identical, prompt %lld/%lld "
+                             "identical\n", (long long) g_g1chk[1], (long long) g_g1chk[0], (long long) g_g1chk[3],
+                     (long long) g_g1chk[2]);
+    for (auto& v : g_g1chk) v = 0;   // close() runs again from the destructor
     if (g_prof_n > 0) {
         double tot = 0;
         for (double v : g_prof) tot += v;
@@ -2440,6 +3116,8 @@ void Ds4MoeTier::close() {
     }
 #endif
     if (!im_) return;
+    if (im_->g1) im_->g1->close();   // mab776 M7a
+    im_->g1.reset();
     if (im_->gpu) im_->gpu->close();
     im_->gpu.reset();
     im_->pool.reset();
@@ -2506,6 +3184,48 @@ double Ds4MoeTier::arena_gib() const {
 #endif
 }
 
+int64_t Ds4MoeTier::resident1() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->g1 ? im_->g1->resident : 0;
+#else
+    return 0;
+#endif
+}
+
+double Ds4MoeTier::gpu1_gib() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->g1 && im_->g1->cache ? (double) im_->g1->cache->full_bytes() / 1073741824.0 : 0.0;
+#else
+    return 0.0;
+#endif
+}
+
+int Ds4MoeTier::gpu1_device() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->g1 ? im_->g1->dev : -1;
+#else
+    return -1;
+#endif
+}
+
+bool Ds4MoeTier::in_gpu1(int64_t layer, int64_t expert) const {
+#if defined(DS4_MOE_CUDA)
+    return g1_has(*im_, layer, expert);
+#else
+    (void) layer;
+    (void) expert;
+    return false;
+#endif
+}
+
+double Ds4MoeTier::gpu1_seed_s() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->g1 ? im_->g1->seed_s : 0.0;
+#else
+    return 0.0;
+#endif
+}
+
 void Ds4MoeStats::add(const Ds4MoeStats& o) {
     hits += o.hits;
     prefetched_useful += o.prefetched_useful;
@@ -2519,6 +3239,8 @@ void Ds4MoeStats::add(const Ds4MoeStats& o) {
     vram_swaps += o.vram_swaps;
     vram_demotes += o.vram_demotes;
     skipped += o.skipped;
+    hits1 += o.hits1;
+    g1_wait_ms += o.g1_wait_ms;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
     pcie_ms += o.pcie_ms;

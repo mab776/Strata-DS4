@@ -88,6 +88,11 @@ struct Args {
     int pos_offset = 0;          // --pos-offset N: decode as if at position N+i over EMPTY caches - a timing probe for
                                  // long-context decode without the prefill (output is meaningless; graphs/cap are real)
     std::string dense_requant;   // q4_k | q5_k | q6_k: requantize the big Q8_0 dense matrices at load   // cache-aware routing: + this to the selection score of VRAM-resident experts   // score every prompt position: mean NLL / perplexity of the prompt (quality check)
+    // mab776 M7a: --gpu1 N (a second CUDA device as a static expert tier), --gpu1-gib / --gpu1-reserve (its budget),
+    // --vram-grow G (elastic cache: seeded at load at the --vram-margin budget, grown after the prompt to leave G GiB)
+    int gpu1 = -1;
+    double gpu1_gib = 0.0, gpu1_reserve = 0.6;
+    double vram_grow = -1.0;
 };
 
 std::vector<int> parse_csv(const std::string& s) {
@@ -154,6 +159,10 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--icomp-q8") a.icomp_q8 = true;
         else if (k == "--comp-host") a.comp_host = true;
         else if (k == "--pos-offset") a.pos_offset = std::atoi(next().c_str());
+        else if (k == "--gpu1") a.gpu1 = std::atoi(next().c_str());
+        else if (k == "--gpu1-gib") a.gpu1_gib = std::atof(next().c_str());
+        else if (k == "--gpu1-reserve") a.gpu1_reserve = std::atof(next().c_str());
+        else if (k == "--vram-grow") a.vram_grow = std::atof(next().c_str());
         else { std::fprintf(stderr, "ds4_generate: unknown argument %s\n", k.c_str()); return false; }
     }
     return !a.model.empty() && (!a.ids_csv.empty() || !a.ids_file.empty());
@@ -250,6 +259,7 @@ int main(int argc, char** argv) {
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
     if (!dense.reserve_graphs(a.verify ? 2 : 1)) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
     double slot_gib_auto = 0.0;   // mab776: the auto cache budget in GiB when blob sizes differ per layer
+    double slot_gib_max_auto = 0.0;   // mab776 M7a: --vram-grow's decode budget
     if (a.slots <= 0) {
         // mab776: long contexts get more headroom after the dense half (2.0 GiB from 65,536 tokens; the M2 depth runs
         // at 262,144 calibrate it); an explicit --vram-margin wins
@@ -295,6 +305,21 @@ int main(int argc, char** argv) {
                      a.vram_margin_gib, bmin / 1048576.0, bmax / 1048576.0, (long long) (budget / (double) bmax),
                      (long long) (budget / (double) bmin));
         if (budget <= 0) a.slots = 0;
+        // mab776 M7a: --vram-grow G - the prompt runs on the --vram-margin budget above (its chunk buffers need that
+        // room), then the cache grows to leave G GiB free (the decode budget); mixed blob sizes only (the elastic open)
+        if (a.vram_grow >= 0) {
+            if (bmin == bmax || a.vram_grow >= a.vram_margin_gib) {
+                std::fprintf(stderr, "ds4_generate: --vram-grow needs mixed expert sizes and G < --vram-margin\n");
+                return 2;
+            }
+            slot_gib_max_auto = std::max(0.0, (double) fr - a.vram_grow * 1073741824.0) / 1073741824.0;
+            std::fprintf(stderr, "vram grow: the prompt on %.2f GiB of slots, then up to %.2f GiB (leaving %.2f GiB)\n",
+                         slot_gib_auto, slot_gib_max_auto, a.vram_grow);
+        }
+    }
+    if (a.vram_grow >= 0 && slot_gib_max_auto <= 0) {
+        std::fprintf(stderr, "ds4_generate: --vram-grow needs --slots auto\n");
+        return 2;
     }
 
     // ---- routed-expert tier
@@ -315,11 +340,22 @@ int main(int argc, char** argv) {
     // chunked prefill: the arena now, the VRAM cache after the prompt (the chunks use that VRAM first)
     // mab776: DS4_SEED_FIRST=1 seeds the VRAM cache at load even with --prefill-chunk, the way a resident server
     // prefills (chunks compute the cached experts in place; their buffers must then fit in --vram-margin)
-    const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty() && !std::getenv("DS4_SEED_FIRST");
+    // mab776 M7a: --vram-grow seeds first too (at the prompt budget) and grows the cache after the prompt
+    const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty() && !std::getenv("DS4_SEED_FIRST") &&
+                            a.vram_grow < 0;
     mc.defer_cache = defer_seed;
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prestage = a.chunk_prestage;
     mc.skip_miss = a.skip_miss;
+    mc.slot_gib_max = slot_gib_max_auto;
+    mc.gpu1_device = a.gpu1;
+    mc.gpu1_gib = a.gpu1_gib;
+    mc.gpu1_reserve_gib = a.gpu1_reserve;
+    mc.gpu1_chunk_tokens = a.prefill_chunk;
+    if (a.gpu1 >= 0 && (mc.cpu_only || a.profile.empty())) {
+        std::fprintf(stderr, "ds4_generate: --gpu1 needs --experts gpu and a --profile (its experts come from the ranking)\n");
+        return 2;
+    }
     if (!tier.init(a.model, mc, err)) { std::fprintf(stderr, "ds4_generate: tier init: %s\n", err.c_str()); return 1; }
     if (!a.profile.empty() && !mc.cpu_only &&
         !(defer_seed ? tier.build_arena_from_routes(a.profile, 512, err) : tier.seed_from_routes(a.profile, err))) {
@@ -329,6 +365,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "tier: %s, %lld resident slots, arena %.1f GiB (%lld experts), file tier %lld; load %.1f s\n",
                  tier.mode(), (long long) tier.resident(), tier.arena_gib(), (long long) tier.arena_experts(),
                  (long long) tier.file_tier(), (now_ms() - t_load0) / 1000.0);
+    if (tier.gpu1_device() >= 0)
+        std::fprintf(stderr, "gpu1: device %d holds %lld experts (%.2f GiB, filled in %.1f s; no arena copies)\n",
+                     tier.gpu1_device(), (long long) tier.resident1(), tier.gpu1_gib(), tier.gpu1_seed_s());
 
     const int n_layer = (int) dense.n_layer();
     // ---- MTP head (draft + acceptance stats)
@@ -483,8 +522,11 @@ int main(int argc, char** argv) {
         const int LR = 16;   // logits rows per head call (ppl)
         std::vector<float> lrows;
         double t_dense = 0, t_exp = 0, t_attn = 0, t_head = 0;
+        static const bool vtrace_pf = std::getenv("DS4_VRAM_TRACE") != nullptr;   // mab776: free VRAM per chunk
+        auto vfree_pf = [&]() { size_t fr = 0, tot = 0; ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot); return fr / 1048576.0; };
         for (size_t c0 = 0; c0 < prompt.size(); c0 += (size_t) NP) {
             const int n = (int) std::min<size_t>((size_t) NP, prompt.size() - c0);
+            if (vtrace_pf) std::fprintf(stderr, "[vram] chunk at %zu: %.0f MiB free before prefill_begin\n", c0, vfree_pf());
             if (!dense.prefill_begin(prompt.data() + c0, n, (int) c0)) {
                 std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
                 return 1;
@@ -493,9 +535,11 @@ int main(int argc, char** argv) {
                 double t0 = now_ms();
                 const float* fn = nullptr;
                 if (!dense.prefill_attn(l, cids.data(), cw.data(), &fn)) {
-                    std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
+                    std::fprintf(stderr, "ds4_generate: %s (layer %d, chunk at %zu)\n", dense.last_error().c_str(), l, c0);
                     return 1;
                 }
+                if (vtrace_pf && l < 3)
+                    std::fprintf(stderr, "[vram] chunk at %zu layer %d: %.0f MiB free after attention\n", c0, l, vfree_pf());
                 double t1 = now_ms(); t_dense += t1 - t0; t_attn += t1 - t0; t0 = t1;
                 for (int k = 0; k < n * top_k; ++k) cids32[(size_t) k] = cids[(size_t) k];
                 if (!(croute_dev ? tier.run_chunk_dev(l, n, cids32.data(), cw.data(), fn, croute_dev)
@@ -504,6 +548,8 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 t1 = now_ms(); t_exp += t1 - t0; t0 = t1;
+                if (vtrace_pf && l < 3)
+                    std::fprintf(stderr, "[vram] chunk at %zu layer %d: %.0f MiB free after experts\n", c0, l, vfree_pf());
                 if (!dense.prefill_finish(l, croute_dev ? nullptr : crouted)) {
                     std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
                     return 1;
@@ -546,6 +592,10 @@ int main(int argc, char** argv) {
         const double t_seed = now_ms();
         if (defer_seed && !tier.seed_from_routes(a.profile, err)) {
             std::fprintf(stderr, "ds4_generate: profile: %s\n", err.c_str());
+            return 1;
+        }
+        if (a.vram_grow >= 0 && tier.grow_cache(a.vram_grow, err) < 0) {   // mab776 M7a
+            std::fprintf(stderr, "ds4_generate: %s\n", err.c_str());
             return 1;
         }
         std::fprintf(stderr, "prefill chunks of %d: dense %.0f ms (attention+router %.0f, finish %.0f), experts %.0f ms, "
@@ -727,6 +777,11 @@ int main(int argc, char** argv) {
                  100.0 * (double) st.hits / look, (double) st.prefetched_useful / dec_steps,
                  (double) st.prefetch_issued / dec_steps, 100.0 * (double) st.cpu / look,
                  100.0 * (double) st.pcie / look, (long long) st.file_tier);
+    if (tier.gpu1_device() >= 0)   // mab776 M7a
+        std::fprintf(stderr, "gpu1: %.1f%% of lookups (%.2f/pass), host wait %.3f ms/pass; prefill: %.1f%% of entries\n",
+                     100.0 * (double) st.hits1 / look, (double) st.hits1 / dec_steps, st.g1_wait_ms / dec_steps,
+                     100.0 * (double) pf_stats.hits1 / (double) std::max<int64_t>(1, pf_stats.hits + pf_stats.hits1 +
+                                                                                     pf_stats.pcie + pf_stats.cpu));
     if (a.skip_miss > 0)
         std::fprintf(stderr, "skip-miss %.3f: %.2f experts/pass dropped (%.1f%% of lookups)\n", a.skip_miss,
                      (double) st.skipped / dec_steps, 100.0 * (double) st.skipped / look);

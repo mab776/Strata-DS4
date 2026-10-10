@@ -1,0 +1,23 @@
+== M7a-dbg-vram: 2026-10-10 08:19:49 MEM 42g ARENA 36 SKIP 1 CHUNK 2048 PCIE 0.55 G1 1 GROW 2.0 MARGIN 9.0 build-ds4-cu13 
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 64244 MiB):
+  Device 0: NVIDIA RTX PRO 5000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 48403 MiB
+  Device 1: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, VMM: yes, VRAM: 15841 MiB
+dense backend: CUDA0
+context cap 262144 tokens
+dense compute buffers: one shared arena 48.8 MiB for every decode graph
+slots auto: 38.99 GiB free after the dense half -> 29.99 GiB of expert slots (margin 9.00 GiB; expert 7.19-9.38 MiB -> 3275-4272 experts)
+vram grow: the prompt on 29.99 GiB of slots, then up to 36.99 GiB (leaving 2.00 GiB)
+tier: gpu, 4228 resident slots, arena 33.6 GiB (4737 experts), file tier 0; load 49.7 s
+gpu1: device 1 holds 2045 experts (14.50 GiB, filled in 5.8 s; no arena copies)
+[vram] chunk at 0: 8606 MiB free before prefill_begin
+[vram] chunk at 0 layer 0: 7558 MiB free after attention
+[vram] chunk at 0 layer 0: 1082 MiB free after experts
+[vram] chunk at 0 layer 1: 1082 MiB free after attention
+[vram] chunk at 0 layer 1: 1074 MiB free after experts
+[vram] chunk at 0 layer 2: 1070 MiB free after attention
+[vram] chunk at 0 layer 2: 1070 MiB free after experts
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 2176.57 MiB on device 0: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 2282299520
+ds4_generate: prefill_attn: chunk graph failed (layer 3, chunk at 0)
+exit=1 oom=false wall=53s
+peak VmHWM 43.1 GiB, cgroup peak 36.9 GiB, min host avail 15.7 GiB, peak VRAM 40407 MiB (GPU 1 15291 MiB)

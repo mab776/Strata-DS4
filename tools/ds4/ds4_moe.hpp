@@ -229,6 +229,19 @@ struct Ds4MoeConfig {
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
     /// expert; only where the blob sits changes.  Off = the static seed, as before.
     bool vram_lru = false;
+    /// mab776 M7a: a second CUDA device as a STATIC expert tier.  The ranks right after GPU 0's cache live in its
+    /// VRAM and are computed there (decode: the activation goes over, the routed rows come back through pinned
+    /// memory; prompt chunks: the chunk's rows go over, its experts' entry rows come back) - no P2P needed, same
+    /// kernels and q8_1 bytes as GPU 0, so every row is bit-identical to computing it on GPU 0.  Its experts get no
+    /// arena copy (exclusive tiers: the RAM goes to the ranks after it).  -1 = off.
+    int gpu1_device = -1;
+    double gpu1_gib = 0.0;          ///< cap on GPU 1's expert bytes; 0 = its free VRAM minus gpu1_reserve_gib
+    double gpu1_reserve_gib = 0.6;  ///< VRAM left free on GPU 1 (lazy module loads, fragmentation)
+    int gpu1_chunk_tokens = 0;      ///< largest prompt chunk GPU 1 must take (its chunk buffers); 0 = decode only
+    /// mab776 M7a: elastic GPU 0 cache (Strata-GLM's): opened in 64 MiB segments for `slot_gib_max` bytes in ranked
+    /// order, seeded and mapped only up to `slot_gib` (the prompt chunks' VRAM stays free), and `grow_cache` maps +
+    /// fills the rest after the prompt from the arena, which keeps that grow set.  0 = off.  Mixed blob sizes only.
+    double slot_gib_max = 0.0;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -251,9 +264,11 @@ struct Ds4MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
+    int64_t hits1 = 0;              ///< mab776 M7a: served from GPU 1's tier (counted apart from `hits`)
+    double g1_wait_ms = 0;          ///< time the host waited for GPU 1's rows after its own work was done
 
     void add(const Ds4MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie + skipped; }
+    int64_t lookups() const { return hits + hits1 + cpu + pcie + skipped; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
@@ -341,6 +356,16 @@ public:
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
     void release_chunk();
+    /// mab776 M7a, elastic cache (cfg.slot_gib_max): after the prompt (release_chunk), map more of GPU 0's cache - up
+    /// to its full size, leaving `keep_free_gib` of VRAM free - and fill the new slots with the next experts of the
+    /// seed's ranking (arena copies, else file reads).  Returns the slots added (0 when not elastic), -1 on error.
+    int64_t grow_cache(double keep_free_gib, std::string& err);
+    /// mab776 M7a: GPU 1's tier - experts it holds, their GiB, the device (-1 = off), and whether it holds one.
+    int64_t resident1() const;
+    double gpu1_gib() const;
+    int gpu1_device() const;
+    bool in_gpu1(int64_t layer, int64_t expert) const;
+    double gpu1_seed_s() const;        ///< seconds GPU 1's fill took (file reads; its experts have no arena copy)
     cpu::ExpertPool& pool();           ///< the CPU tier's worker pool (the gate's single-expert check uses it)
 
 private:
