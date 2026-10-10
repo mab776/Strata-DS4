@@ -1,7 +1,7 @@
 #!/bin/sh
 # mab776: build Strata-DS4's ds4_generate (+ header-only geometry test) for sm_120 in a throwaway CUDA 12.8 container,
 # WITHOUT a GPU, RAM/CPU-capped so nvcc can't squeeze whatever is serving. Same flags as the README's build-ds4-gpu,
-# arch 89 -> 120a (plain 120 can't assemble the MXFP4 block-scale MMA). BUILD_TARGETS overrides the target list, BUILD_DIR the build dir (CUDA 13: BUILD_DIR=build-ds4-cu13 CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04). ggml = full llama.cpp checkout of the pinned commit (third_party/ggml/VERSION.txt) in third_party/llama.cpp.  Log: build-mab776.log
+# arch 89 -> 120a (plain 120 can't assemble the MXFP4 block-scale MMA). BUILD_TARGETS overrides the target list, BUILD_DIR the build dir (CUDA 13: BUILD_DIR=build-ds4-cu13 CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04). ggml = full llama.cpp checkout of the pinned commit (third_party/ggml/VERSION.txt) in third_party/llama.cpp, plus our patches in tools/ds4/patches (applied once, idempotent).  Log: build-mab776.log
 cd "$(dirname "$0")" || exit 1
 docker run --rm --name ds4-build -e NVIDIA_VISIBLE_DEVICES=none --memory ${BUILD_MEM:-12g} --memory-swap ${BUILD_MEM:-12g} --cpus ${BUILD_CPUS:-8} \
   -v "$PWD":/src -w /src ${CUDA_IMAGE:-nvidia/cuda:12.8.1-devel-ubuntu24.04} bash -euc "
@@ -15,6 +15,12 @@ docker run --rm --name ds4-build -e NVIDIA_VISIBLE_DEVICES=none --memory ${BUILD
       curl -sL https://github.com/ggml-org/llama.cpp/archive/\$COMMIT.tar.gz | tar -xz -C third_party
       mv third_party/llama.cpp-\$COMMIT third_party/llama.cpp
     fi
+    # mab776: our ggml patches (tools/ds4/patches, e.g. the M10 tensor-core lightning indexer), applied once
+    for p in tools/ds4/patches/*.patch; do
+      [ -f \"\$p\" ] || continue
+      if (cd third_party/llama.cpp && git apply --check -R /src/\$p 2>/dev/null); then echo \"ggml patch already in: \$p\";
+      else (cd third_party/llama.cpp && git apply /src/\$p) && echo \"ggml patch applied: \$p\"; fi
+    done
     cmake -S . -B ${BUILD_DIR:-build-ds4-gpu} -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DSTRATA_GGML_DIR=/src/third_party/llama.cpp \
       -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc

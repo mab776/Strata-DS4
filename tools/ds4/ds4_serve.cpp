@@ -1386,15 +1386,21 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         std::snprintf(read_txt, sizeof read_txt, "%d", n - R);
     int nck = 0;
     for (int s = 0; s < slots_ck; ++s) nck += ck[s].pos > 0;
+    char htxt[128] = "";   // the decode's expert lookups by tier (the slot effect, apart from draft acceptance)
+    if (st.lookups() > 0) {
+        const double L = (double) st.lookups();
+        std::snprintf(htxt, sizeof htxt, "; experts GPU0 %.1f%% GPU1 %.1f%% CPU %.1f%% PCIe %.1f%%", 100.0 * st.hits / L,
+                      100.0 * st.hits1 / L, 100.0 * st.cpu / L, 100.0 * st.pcie / L);
+    }
     char dtxt[128] = "";
     if (il_mtp >= 0)
         std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted, MTP window %.0f ms, %.2f ms/draft", (long long) accepted,
                       (long long) drafts, t_mtp_win, drafts > 0 ? (t_mtp_all - t_mtp_win) / (double) drafts : 0.0);
     std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s; cache shrink %.0f + "
-                         "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s; live %zu, %d checkpoints [last %d, "
+                         "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s%s; live %zu, %d checkpoints [last %d, "
                          "turn %d, user %d]\n",
                  n, R, read_txt, prompt_ms, prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, t_shrink, t_grow, gen,
-                 dec_ms, dec_ms > 0 ? 1000.0 * gen / dec_ms : 0.0, finish, dtxt, live.size(), nck, ck[kLast].pos,
+                 dec_ms, dec_ms > 0 ? 1000.0 * gen / dec_ms : 0.0, finish, dtxt, htxt, live.size(), nck, ck[kLast].pos,
                  ck[kTurn].pos, ck[kUser].pos);
     t_shrink = t_grow = 0;
 }
