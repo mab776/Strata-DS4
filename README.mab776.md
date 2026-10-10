@@ -60,3 +60,17 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
 - GPUs: ask Marc before taking them (mode page :8500 must be "all off"/DeepSeek); never touch Strata/AuK while he works.
 - Never `pkill -f` (kills your own shell) — kill by PID. Cap every big container's RAM. Clean up temp files.
 - Parked side idea: our own mixed quant — `deepseek-v4/CUSTOM-QUANT-IDEA.md`.
+
+## Fork survey 2026-10-09 (all 1,733 forks of Niko1221/Strata scanned; 488 with own code fetched, ~9.3k unique commits)
+No fork is a better ENGINE base for our box than Strata-DS4. Worth borrowing (fetch-only remotes on this clone, MIT):
+- `jackwwg83` (github.com/Jackwwg83/Strata-DS, DeepSeek **V4.1**, Linux+NVIDIA, 279 commits, serve on upstream 0.1.40.2):
+  the most complete DeepSeek SERVER integration — `serve/deepseek.py`, `serve/fake_ds41_engine.py`,
+  `serve/test_deepseek_protocol.py`, snapshots (parking), `--batch`, release-acceptance scripts. Branches feature/ds41-*.
+- `aleksche` branch `dev` (github.com/Aleks-Che/Strata, Windows, RTX 5090 + 128 GB, GPU-only expert streaming ~18 tok/s):
+  compact `serve/deepseek.py` (115 lines: DeepSeek chat template with thinking + reasoning_effort mapping, strict DSML
+  tool-call parser incl. streaming, malformed DSML -> text) + `serve/test_deepseek.py`; docs/deepseek-v4-flash-0731/ (DSpark tuning).
+- `mobile2machan` branch `dsv4`: DS4 inside the Strata core, abandoned (~1 tok/s, "does not pay off on a 24 GB card");
+  only design notes (docs/DSV4.md: unsloth per-layer type mix, DSpark serve controller).
+- Upstream DS4 author's newer Strata-GLM repo has a byte-sized `--slots auto` (our gap #1).
+- Not useful for us: Yasei-no-otoko / perronemirko `dsv4_ext` (AMD/Windows HIP), cklxx deepMoE (Vulkan, rejected upstream).
+Upstream Strata refused DeepSeek 3x (#310, #479, #943: "out of scope ... external plugin") — no DeepSeek coming from upstream.
