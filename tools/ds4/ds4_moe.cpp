@@ -2680,6 +2680,12 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         // the host vectors above are pageable: cudaMemcpyAsync has staged them before returning
     };
     // ---- resident experts: adjacent in the entry order -> one launch
+    // mab776 M7a: on a layer that runs MMQ, GPU 0's resident experts take the stage halves too (a device-to-device copy
+    // to the MMQ stride, ~1.4 ms a layer-chunk) instead of the grouped MMVQ kernel from their slots (~21 ms a
+    // layer-chunk at 127k: 59 of the prompt's 263 s).  They lead the streamed list below.  DS4_RESIDENT_MMVQ=1: the
+    // slots and MMVQ, as before (A/B).
+    static const bool res_mmvq = std::getenv("DS4_RESIDENT_MMVQ") != nullptr;
+    const bool res_mmq = use_mmq && !res_mmvq;
     std::vector<int32_t> run_e;
     std::vector<unsigned long long> run_p;
     int64_t ent_hit = 0, ent_str = 0;
@@ -2688,7 +2694,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         run_p.push_back((unsigned long long) gp.cache->device_slot(slot_e[(size_t) e]));
         ent_hit += cnt[(size_t) e];
     }
-    launch(run_e, run_p);
+    if (!res_mmq) launch(run_e, run_p);
     in_resident = false;
 
     // ---- streamed experts: arena ones, then the file tier, in batches that fit one device half.  File-tier blobs
@@ -2732,9 +2738,12 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         h0 = 1 - gp.c_pre_half;
     }
     gp.c_pre_layer = -1;
-    std::vector<int32_t> stream_e(arena_e);
+    std::vector<int32_t> stream_e;
+    if (res_mmq) stream_e = order[0];   // [0, nR): resident (device-to-device), then arena, then file tier
+    const size_t nR = stream_e.size();
+    stream_e.insert(stream_e.end(), arena_e.begin(), arena_e.end());
     stream_e.insert(stream_e.end(), order[2].begin(), order[2].end());
-    for (int32_t e : stream_e) ent_str += cnt[(size_t) e];
+    for (size_t i = nR; i < stream_e.size(); ++i) ent_str += cnt[(size_t) stream_e[i]];
     const size_t nA = arena_e.size(), nF = order[2].size();
     const int64_t per_half = std::max<int64_t>(1, gp.c_half / SL);
     const size_t slots_half = (size_t) std::max<int64_t>(1, gp.c_bhalf / BL), cap = 2 * slots_half;
@@ -2776,12 +2785,41 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         ck(cudaStreamWaitEvent(gp.s_cp, gp.c_used[h], 0), "wait used");
         std::vector<int32_t> es;
         std::vector<unsigned long long> ps;
-        for (size_t i = b0; i < b1; ++i) {
+        // mab776 M7a: the batch's resident experts [b0, r_end) - copied by SM kernels on gp.s, 16 slots a launch (a
+        // copy-engine D2D ran at ~40 GB/s, PCIe speed: 840 MB a layer-chunk); the blob layout is kept (gate | up at
+        // up_off | down at down_off), so the MMQ products below read them exactly as a streamed blob
+        const size_t r_end = std::min(b1, nR);
+        size_t i_from = b0;
+#if defined(DS4_MOE_MMQ)
+        {
+            namespace mq = strata::prefill::mmq;
+            const bool same_halves = (GL.up_type < 0 || GL.up_type == GL.gu_type) && GL.down_off == 2 * GL.up_off;
+            for (size_t q0 = b0; same_halves && q0 < r_end; q0 += mq::kGatherGroupMax) {
+                const size_t q1 = std::min(r_end, q0 + (size_t) mq::kGatherGroupMax);
+                mq::GatherGroup g;
+                g.first = 0;
+                g.n = (int) (q1 - q0);
+                for (size_t q = q0; q < q1; ++q) g.blob[q - q0] = gp.cache->device_slot(slot_e[(size_t) stream_e[q]]);
+                uint8_t* base = (uint8_t*) gp.c_stage[h] + (q0 - b0) * (size_t) SL;
+                if (!mq::gather_native_group(g, GL.up_off, GL.up_off, GL.down_off, (size_t) BL - GL.down_off, base,
+                                             (size_t) SL, base + GL.down_off, (size_t) SL, gp.s))
+                    break;   // not 16-byte aligned: the rest of the batch takes the copy engine below
+                for (size_t q = q0; q < q1; ++q) {
+                    es.push_back(stream_e[q]);
+                    ps.push_back((unsigned long long) ((uint8_t*) gp.c_stage[h] + (q - b0) * (size_t) SL));
+                }
+                i_from = q1;
+            }
+        }
+#endif
+        for (size_t i = i_from; i < b1; ++i) {
             const uint8_t* src;
-            if (i < nA) {
+            if (i < nR) {
+                src = gp.cache->device_slot(slot_e[(size_t) stream_e[i]]);   // resident: a device-to-device copy
+            } else if (i < nR + nA) {
                 src = gp.arena.ptr(layer, stream_e[i]);   // (arena_e: not prestaged)
             } else {
-                const size_t k = i - nA;
+                const size_t k = i - nR - nA;
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first
                     const double tw = now_ms();
                     ck(cudaStreamSynchronize(gp.s_cp), "wave");
@@ -2796,7 +2834,8 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
                 src = slot_ptr(k);
             }
             uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
-            ck(cudaMemcpyAsync(d, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s_cp), "stream dma");
+            ck(cudaMemcpyAsync(d, src, (size_t) BL, i < nR ? cudaMemcpyDeviceToDevice : cudaMemcpyHostToDevice, gp.s_cp),
+               "stream dma");
             es.push_back(stream_e[i]);
             ps.push_back((unsigned long long) d);
         }
