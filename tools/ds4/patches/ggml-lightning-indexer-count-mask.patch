@@ -1,0 +1,16 @@
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6429,9 +6429,11 @@
+ 
+     GGML_ASSERT(       q->type == GGML_TYPE_F32);
+     GGML_ASSERT( weights->type == GGML_TYPE_F32);
+-    GGML_ASSERT(    mask->type == GGML_TYPE_F16);
++    // mab776 (Strata-DS4): or an F32 [1, n_batch] mask of per-query counts - query i sees keys j < mask[i] (backends
++    // that support it say so in supports_op; ggml-cuda's li_mma path)
++    GGML_ASSERT(    mask->type == GGML_TYPE_F16 || (mask->type == GGML_TYPE_F32 && mask->ne[0] == 1));
+     GGML_ASSERT(      q->ne[0] == k->ne[0]);
+-    GGML_ASSERT(   mask->ne[0] == k->ne[2]);
++    GGML_ASSERT(   mask->ne[0] == k->ne[2] || (mask->type == GGML_TYPE_F32 && mask->ne[0] == 1));
+     GGML_ASSERT(      q->ne[1] == weights->ne[0]);
+     GGML_ASSERT(      k->ne[1] == 1);
+     GGML_ASSERT(   mask->ne[1] == q->ne[2]);

@@ -700,6 +700,10 @@ static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool sparse_n_off();   // mab776 DS4_SPARSE_N=0: multi-token decode passes back on the masked path
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static bool pf_argsort_on();   // mab776 M10 DS4_PF_ARGSORT=1: prompt chunks back on the full-row argsort for the top-k
+static bool pf_lean_mask_on(); // mab776 M10 DS4_PF_LEAN_MASK=0: prompt chunks back on the dense visibility masks
+static bool pf_hca1_on();      // mab776 M10 DS4_PF_HCA1=1: HCA chunk attention in one call (opt-in, see below)
+static bool pf_lean_idx_on();  // ... DS4_PF_LEAN_IDX=0 / DS4_PF_LEAN_FA=0: one half of the lean masks off (diagnostics)
+static bool pf_lean_fa_on();
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
 static bool pf_sparse_on();   // mab776 DS4_PF_SPARSE, ditto
@@ -789,6 +793,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         ggml_tensor * comp_pos  = first(L.i_comp_pos, n);
         ggml_tensor * slot_st   = im.pf ? nullptr : first(L.i_slot_state, n);   // chunk: tail_into uses its own
         ggml_tensor * idx_st    = first(L.i_idx_state, L.ring * n);   // [ring] per token, flat (get_rows takes 1-D)
+        ggml_tensor * vis_cnt   = nullptr;   // [1, n] F32 = i_nvis[t] (DS4_VIS_DEV): the lean masks' counts
         if (vis_dev_on()) {
             // DS4_VIS_DEV (default on): build the compressed-row visibility on the device from the per-layer count
             // `i_nvis` (the blocks each query may see) instead of a host mask.  The decode host mask carried
@@ -801,6 +806,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // nv - i as one broadcast add of the F32 count onto the persistent -i ramp (was cast + arange + 2 repeats
             // + sub: 7 kernels per compressed layer per token -> 3); small integers, so the same exact floats
             ggml_tensor * nvs = ggml_reshape_2d(gc, first(L.i_nvis, n), 1, n);                 // [1, n] = i_nvis[t]
+            vis_cnt = nvs;
             ggml_tensor * ivN = ggml_view_2d(gc, im.neg_ramp, cap, 1, (size_t) cap * sizeof(float), 0);   // -i
             if (n > 1) ivN = ggml_repeat(gc, ivN, ggml_new_tensor_2d(gc, GGML_TYPE_F32, cap, n));
             var.vis = ggml_log(gc, ggml_step(gc, ggml_add(gc, ivN, nvs)));                      // i < i_nvis -> 0
@@ -912,7 +918,10 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             const bool fidx = fused_idx_on(ggml_backend_is_cpu(im.backend)) &&
                 ggml_backend_supports_op(im.backend, ggml_lightning_indexer(gc, iq, lid_src, iw,
                                                                             ggml_cast(gc, var.vis, GGML_TYPE_F16)));
-            ggml_tensor * vis16 = fidx ? ggml_cast(gc, var.vis, GGML_TYPE_F16) : nullptr;
+            // mab776 M10 (DS4_PF_LEAN_MASK): a chunk hands the fused indexer the per-query counts instead of the mask
+            const bool cidx = fidx && im.pf && vis_cnt && pf_lean_idx_on() &&
+                ggml_backend_supports_op(im.backend, ggml_lightning_indexer(gc, iq, lid_src, iw, vis_cnt));
+            ggml_tensor * vis16 = fidx ? (cidx ? vis_cnt : ggml_cast(gc, var.vis, GGML_TYPE_F16)) : nullptr;
             // mab776: the fused kernel's output is just [cap, n] (no [cap, n, 64] intermediate to bound), so it takes
             // every query in one call unless DS4_IDX_BLOCK is set: the blocks were joined by sc = concat(sc, scb),
             // which re-copied all scores so far per block - ~8 GB a CSA layer-chunk at 250k (cap 65536, 32 blocks)
@@ -925,7 +934,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                     ggml_tensor * iwb = nb == n ? iw
                         : ggml_view_2d(gc, iw, im.IDXH, nb, iw->nb[1], (size_t) t0 * iw->nb[1]);
                     ggml_tensor * mb = nb == n ? vis16
-                        : ggml_view_2d(gc, vis16, cap, nb, vis16->nb[1], (size_t) t0 * vis16->nb[1]);
+                        : ggml_view_2d(gc, vis16, vis16->ne[0], nb, vis16->nb[1], (size_t) t0 * vis16->nb[1]);
                     ggml_tensor * scb = ggml_lightning_indexer(gc, iqb, lid_src, iwb, mb);   // [cap, nb]
                     sc = sc ? ggml_concat(gc, sc, scb, 1) : scb;
                     continue;
@@ -997,13 +1006,17 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 }
                 cmask = ggml_cast(gc, mk, GGML_TYPE_F16);
             } else {
-                ggml_tensor * a = ggml_fill(gc, var.vis, NEG_INF);
+                // mab776 M10 (DS4_PF_LEAN_MASK): every query of the chunk sees >= ntk blocks -> the top-k picked
+                // visible rows only, so -inf everywhere + 0 at the picks IS the mask: built in F16, no add, no cast
+                const bool lean = im.pf && !ggml_backend_is_cpu(im.backend) && pf_lean_fa_on() &&
+                                  ((int64_t) im.pf_pos0 + 1) / L.ratio >= ntk;
+                ggml_tensor * a = lean ? ggml_fill_inplace(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F16, cap, n), NEG_INF)
+                                       : ggml_fill(gc, var.vis, NEG_INF);
                 a = ggml_view_4d(gc, a, 1, cap, n, 1, a->nb[0], a->nb[1], a->nb[2], 0);
                 ggml_tensor * zv = b.fill_f32({ 1, ntk, n }, 0.0f);
                 ggml_tensor * m = ggml_set_rows(gc, a, zv, tk);                     // query j's indices into slice j
                 m = ggml_view_4d(gc, m, m->ne[1], m->ne[2], 1, 1, m->nb[2], m->nb[3], m->nb[3], 0);
-                m = ggml_add(gc, m, var.vis);
-                cmask = ggml_cast(gc, m, GGML_TYPE_F16);
+                cmask = lean ? m : ggml_cast(gc, ggml_add(gc, m, var.vis), GGML_TYPE_F16);
             }
         } else {
             // HCA: one block == `ratio` consecutive tokens, no overlap (ds4_ref attention():603-622)
@@ -1121,6 +1134,11 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         // DS4_PF_DENSE1=0: the blocked path for these (A/B).
         static const bool d1 = [] { const char * e = std::getenv("DS4_PF_DENSE1"); return !e || std::atoi(e) != 0; }();
         if (nqb == 0 && d1) { nqb = n; dense1 = true; }
+    }
+    // mab776 M10 (DS4_PF_HCA1): an HCA chunk in the same one dense call (its compressed rows are few: <= 2,048 at 262k)
+    if (nqb == 0 && im.pf && !csa && k_cmp && m_cmp && RB < n && !ggml_backend_is_cpu(im.backend) && pf_hca1_on()) {
+        nqb = n;
+        dense1 = true;
     }
     if (nqb > 0) {
         const int64_t nk = cap + n_raw, T = (nk + 255) / 256 * 256;
@@ -1767,6 +1785,38 @@ static bool sparse_on() {
 // replaced (one batched cub sort of [cap, n] plus that whole index buffer), for an A/B.
 static bool pf_argsort_on() {
     static const bool on = [] { const char * e = std::getenv("DS4_PF_ARGSORT"); return e && std::atoi(e) != 0; }();
+    return on;
+}
+
+// mab776 M10, DS4_PF_LEAN_MASK (default on): a prompt chunk's CSA layers stop materialising the [cap, n] visibility
+// mask (4 full F32 passes - repeat, add, step, log - plus an F16 cast for the indexer and an add + cast for the
+// attention mask: ~6.6 GB of traffic per layer-chunk at 250K).  The fused indexer takes the per-query counts
+// (ggml-cuda li_mma: key kv visible iff kv < i_nvis[t], the same 0 / -inf), and once every query of the chunk sees
+// >= top-k blocks the top-k only picks visible rows, so the attention mask is the F16 -inf fill with zeros at the
+// selected rows - no visibility add, no cast.  Same values, so the same bits.  =0: the dense masks (A/B).
+static bool pf_lean_mask_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_LEAN_MASK"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+// its two halves apart (diagnostics): DS4_PF_LEAN_IDX=0 keeps the dense indexer mask, DS4_PF_LEAN_FA=0 the attention one
+static bool pf_lean_idx_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_LEAN_IDX"); return !e || std::atoi(e) != 0; }();
+    return on && pf_lean_mask_on();
+}
+static bool pf_lean_fa_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_LEAN_FA"); return !e || std::atoi(e) != 0; }();
+    return on && pf_lean_mask_on();
+}
+
+// mab776 M10, DS4_PF_HCA1 (default OFF): an HCA layer's prompt chunk takes the CSA chunks' one-call layout (K =
+// [compressed rows | raw union window | pad] cast to F16 once, ONE flash-attn over every query, ggml-cuda's tile skip
+// ending each query tile at its window) instead of 32 query blocks that each re-concatenate, cast and pad the
+// compressed K and the mask (nsys @250k: ~60 concats + 32 casts + 32 pads + 32 small flash-attns per layer-chunk).  Same
+// keys and mask, only the softmax's summation order differs - yet ppl768 (real text, one chunk, deterministic) moves
+// 9.9034 -> 9.9512 (+0.48 %) and the 8k filler prompt's NLL +0.0005 consistently, so it stays opt-in (=1) until the
+// cause is known (a precision difference of the long masked flash-attn?).  Prefill +~3 % at 250k with it.
+static bool pf_hca1_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_HCA1"); return e && std::atoi(e) != 0; }();
     return on;
 }
 

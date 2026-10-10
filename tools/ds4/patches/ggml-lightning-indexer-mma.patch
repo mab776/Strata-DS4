@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
-@@ -382,6 +382,181 @@
+@@ -382,6 +382,186 @@
      }
  }
  
@@ -42,10 +42,12 @@
 +}
 +
 +// grid (ceil(n_kv / TK), ceil(n_batch / 8), n_stream), block 256 (8 warps = 8 queries)
-+template <int TK, bool K_Q8>
++// MC (mab776, Strata-DS4 prefill): M is not a [n_kv, n_batch] F16 mask but F32 [1, n_batch] counts - query q sees
++// keys kv < count[q] (+0), the rest get -inf: the same values the dense causal-block mask holds, without building it
++template <int TK, bool K_Q8, bool MC = false>
 +__global__ void __launch_bounds__(256) kernel(
 +        const float * __restrict__ Q, const char * __restrict__ K, const float * __restrict__ W,
-+        const half * __restrict__ M, float * __restrict__ dst,
++        const void * __restrict__ M, float * __restrict__ dst,
 +        int n_batch, int n_kv,
 +        size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
 +        size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3) {
@@ -154,25 +156,28 @@
 +    for (int i = tid; i < 8 * TK; i += 256) {
 +        const int ql = i / TK, k = i % TK, qq = q0 + ql, kv = kv0 + k;
 +        if (qq < n_batch && kv < n_kv) {
-+            const half * m = reinterpret_cast<const half *>(reinterpret_cast<const char *>(M) +
-+                                                            (size_t) qq * nbm1 + (size_t) (stream % nem3) * nbm3);
++            const char * mrow = reinterpret_cast<const char *>(M) + (size_t) qq * nbm1 + (size_t) (stream % nem3) * nbm3;
 +            float * d = reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + (size_t) qq * nb1 + (size_t) stream * nb3);
-+            d[kv] = S.out[ql][k] + __half2float(m[kv]);
++            if constexpr (MC) {
++                d[kv] = S.out[ql][k] + ((float) kv < *reinterpret_cast<const float *>(mrow) ? 0.0f : -INFINITY);
++            } else {
++                d[kv] = S.out[ql][k] + __half2float(reinterpret_cast<const half *>(mrow)[kv]);
++            }
 +        }
 +    }
 +#endif
 +}
 +
-+template <int TK, bool K_Q8>
-+inline cudaError_t launch(const float * Q, const char * K, const float * W, const half * M, float * dst,
++template <int TK, bool K_Q8, bool MC = false>
++inline cudaError_t launch(const float * Q, const char * K, const float * W, const void * M, float * dst,
 +                          int n_stream, int n_batch, int n_kv,
 +                          size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
 +                          size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3, cudaStream_t s) {
 +    const size_t smem = sizeof(Smem<TK>);
-+    cudaFuncSetAttribute(kernel<TK, K_Q8>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
++    cudaFuncSetAttribute(kernel<TK, K_Q8, MC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
 +    dim3 grid((n_kv + TK - 1) / TK, (n_batch + 7) / 8, n_stream);
-+    kernel<TK, K_Q8><<<grid, 256, smem, s>>>(Q, K, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
-+                                             nbw1, nbw3, nbm1, nbm3, nem3);
++    kernel<TK, K_Q8, MC><<<grid, 256, smem, s>>>(Q, K, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
++                                                 nbw1, nbw3, nbm1, nbm3, nem3);
 +    return cudaGetLastError();
 +}
 +
@@ -182,7 +187,26 @@
  #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
      if (K->type == (type_K)) {                                                              \
          lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
-@@ -448,6 +623,20 @@
+@@ -406,7 +586,9 @@
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+     GGML_ASSERT(  q->type == GGML_TYPE_F32);
+     GGML_ASSERT(  w->type == GGML_TYPE_F32);
+-    GGML_ASSERT(  m->type == GGML_TYPE_F16);
++    // mab776 (Strata-DS4): F32 [1, n_batch] = per-query visible-key counts (li_mma only, see its MC flag)
++    const bool m_counts = m->type == GGML_TYPE_F32 && m->ne[0] == 1;
++    GGML_ASSERT(  m->type == GGML_TYPE_F16 || m_counts);
+ 
+     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
+     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
+@@ -436,6 +618,7 @@
+     const int n_batch  = q->ne[2];
+     const int n_stream = q->ne[3];
+     const int n_kv     = k->ne[2];
++    GGML_ASSERT(!m_counts || (n_embd == 128 && n_head == 64));
+ 
+     const float *   q_d = (const float *)   q->data;
+     const char  *   k_d = (const char  *)   k->data;
+@@ -448,6 +631,28 @@
  
      if (n_embd == 128 && n_head == 64) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -191,15 +215,50 @@
 +        static const bool li_mma_on = [] { const char * e = getenv("GGML_LI_MMA"); return !e || atoi(e) != 0; }();
 +        if (li_mma_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
 +            (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_F16)) {
++            const void * mv = m->data;
 +            if (k->type == GGML_TYPE_Q8_0) {
-+                CUDA_CHECK((li_mma::launch<128, true>(q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
-+                                                     nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())));
++                CUDA_CHECK((m_counts
++                    ? li_mma::launch<128, true, true>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                                      nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())
++                    : li_mma::launch<128, true>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                                nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())));
 +            } else {
-+                CUDA_CHECK((li_mma::launch<128, false>(q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
-+                                                      nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())));
++                CUDA_CHECK((m_counts
++                    ? li_mma::launch<128, false, true>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                                       nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())
++                    : li_mma::launch<128, false>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                                 nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())));
 +            }
 +            return;
 +        }
++        GGML_ASSERT(!m_counts && "lightning indexer: count masks need the li_mma path (NVIDIA >= Ampere, q8_0/f16 keys)");
          if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
+@@ -534,7 +739,6 @@
+ }
+ 
+ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
+-    GGML_UNUSED(device);
+ 
+     const ggml_tensor * q = dst->src[0];
+     const ggml_tensor * k = dst->src[1];
+@@ -560,6 +764,18 @@
+         return false;
+     }
+ 
++    // mab776 (Strata-DS4): an F32 [1, n_batch] count mask runs on li_mma only (64 heads, q8_0/f16 keys, NVIDIA >= Ampere)
++    if (m->type == GGML_TYPE_F32) {
++        static const bool li_mma_on = [] { const char * e = getenv("GGML_LI_MMA"); return !e || atoi(e) != 0; }();
++        const int cc = ggml_cuda_info().devices[device].cc;
++        if (!li_mma_on || nem0 != 1 || neq1 != 64 || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE ||
++            (k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_F16)) {
++            return false;
++        }
++    } else if (m->type != GGML_TYPE_F16) {
++        return false;
++    }
++
+     // alignment checks
+     for (const ggml_tensor * t : {q, k}) {
+         if (ggml_is_quantized(t->type)) {
