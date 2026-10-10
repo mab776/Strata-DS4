@@ -459,7 +459,27 @@ struct Ds4Dense::Impl {
     ggml_gallocr_t allo_init[kNtMax + 1] = {};
     ggml_gallocr_t allo_head[kNtMax + 1] = {};
 
+    // ---- ring snapshots (mab776 M5, Ds4Dense::snapshot): per slot, a copy of every tensor rings() lists
+    ggml_context *        snapctx = nullptr;
+    ggml_backend_buffer_t snapbuf = nullptr;
+    std::vector<std::vector<ggml_tensor *>> snaps;   // [slot][i] = the copy of rings()[i]
+    std::vector<int>      snap_pos;                  // [slot]: the positions it holds, -1 = empty
+    size_t                snap_bytes = 0;            // one slot
+    // the position-indexed rings, in a fixed order (every layer, the MTP block included): raw, st_kv, st_sc, ist_kv,
+    // ist_sc where the layer has them.  Everything else in the state is either rewritten by every pass (x_state, the
+    // hand-offs) or indexed by position and read only once complete (comp / icomp rows).
+    std::vector<ggml_tensor *> rings() const {
+        std::vector<ggml_tensor *> r;
+        for (const Layer & L : ly)
+            for (ggml_tensor * t : { L.raw, L.st_kv, L.st_sc, L.ist_kv, L.ist_sc })
+                if (t) r.push_back(t);
+        return r;
+    }
+    bool snap_alloc(int slots);   // init(), after the state; defined with Ds4Dense::snapshot
+
     ~Impl() {
+        if (snapbuf) ggml_backend_buffer_free(snapbuf);
+        if (snapctx) ggml_free(snapctx);
         pf_free();
         for (Var & v : all_vars()) free_allo(v.allo);
         for (Layer & L : ly) {
@@ -1540,6 +1560,10 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
                     }
             ggml_backend_tensor_set(im.rot, rd.data(), 0, rd.size() * 4);
         }
+        // mab776 (M5): the ring snapshots, here with the state rather than at the first snapshot(): a caller sizing its
+        // expert cache from the free VRAM after init() has then paid for them (strata-glm allocated its snapshot lazily
+        // and it failed under VRAM pressure once the cache had the card, FINDINGS s18)
+        if (cfg.snapshot_slots > 0 && !im.snap_alloc(cfg.snapshot_slots)) { err = im.err; return false; }
     }
 
     // ---- graph scaffolding -------------------------------------------------------------
@@ -2331,3 +2355,89 @@ const float * Ds4Dense::tap_l_last(int il) const {
     const Impl::Layer & L = im.ly[(size_t) il];
     return L.have_finish ? L.host_llast.data() + (size_t) (L.tap_n - 1) * im.D * im.HC : nullptr;
 }
+
+// ================================================================== sequence state (mab776 M5: tools/ds4/ds4_serve.cpp)
+
+bool Ds4Dense::Impl::snap_alloc(int slots) {
+    const std::vector<ggml_tensor *> src = rings();
+    ggml_init_params ip = { /*mem_size*/ ((size_t) slots * src.size() + 8) * ggml_tensor_overhead(), /*mem_buffer*/ nullptr,
+                            /*no_alloc*/ true };
+    snapctx = ggml_init(ip);
+    if (!snapctx) { err = "ggml_init(snapshots) failed"; return false; }
+    snap_bytes = 0;
+    for (ggml_tensor * t : src) snap_bytes += ggml_nbytes(t);
+    snaps.assign((size_t) slots, {});
+    for (int s = 0; s < slots; ++s)
+        for (ggml_tensor * t : src) snaps[(size_t) s].push_back(ggml_dup_tensor(snapctx, t));   // same layout
+    snapbuf = ggml_backend_alloc_ctx_tensors_from_buft(snapctx, ggml_backend_get_default_buffer_type(backend));
+    if (!snapbuf) {
+        err = "cannot allocate " + std::to_string(slots) + " ring snapshots (" +
+              std::to_string(snap_bytes >> 10) + " KiB each)";
+        return false;
+    }
+    ggml_backend_buffer_clear(snapbuf, 0);
+    snap_pos.assign((size_t) slots, -1);
+    return true;
+}
+
+void Ds4Dense::reset() {
+    Impl & im = *p_;
+    ggml_backend_synchronize(im.backend);
+    // exactly what init leaves: the state buffer cleared (raw window, value rings), then SENTINEL into the score rings.
+    // NOT ggml_backend_buffer_clear(sbuf): rot (the indexer's Hadamard matrix), neg_ramp and i_idx_all are constants in
+    // the same buffer.  Without the SENTINEL, a new sequence's first CSA block would pool the previous sequence's
+    // states as its missing previous half (the compressor softmax has no position mask over its 2 * ratio rows).
+    std::vector<float> sent;
+    for (Impl::Layer & L : im.ly) {
+        for (ggml_tensor * t : { L.raw, L.st_kv, L.ist_kv })
+            if (t) ggml_backend_tensor_memset(t, 0, 0, ggml_nbytes(t));
+        for (ggml_tensor * t : { L.st_sc, L.ist_sc }) {
+            if (!t) continue;
+            sent.assign((size_t) ggml_nelements(t), SENTINEL);
+            ggml_backend_tensor_set(t, sent.data(), 0, sent.size() * 4);
+        }
+    }
+    ggml_backend_synchronize(im.backend);
+    im.in_pos = -1;
+    im.cur_tid = -1;
+    std::fill(im.snap_pos.begin(), im.snap_pos.end(), -1);
+}
+
+bool Ds4Dense::snapshot(int pos, int slot) {
+    Impl & im = *p_;
+    if (slot < 0 || slot >= (int) im.snaps.size()) {
+        im.err = "snapshot: no slot " + std::to_string(slot) + " (Ds4DenseConfig::snapshot_slots = " +
+                 std::to_string(im.snaps.size()) + ")";
+        return false;
+    }
+    if (pos < 0) { im.err = "snapshot: negative position"; return false; }
+    ggml_backend_synchronize(im.backend);
+    const std::vector<ggml_tensor *> src = im.rings();
+    for (size_t i = 0; i < src.size(); ++i) ggml_backend_tensor_copy(src[i], im.snaps[(size_t) slot][i]);
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos[(size_t) slot] = pos;
+    return true;
+}
+
+bool Ds4Dense::restore(int slot) {
+    Impl & im = *p_;
+    if (slot < 0 || slot >= (int) im.snaps.size() || im.snap_pos[(size_t) slot] < 0) {
+        im.err = "restore: slot " + std::to_string(slot) + " holds no snapshot";
+        return false;
+    }
+    ggml_backend_synchronize(im.backend);
+    const std::vector<ggml_tensor *> dst = im.rings();
+    for (size_t i = 0; i < dst.size(); ++i) ggml_backend_tensor_copy(im.snaps[(size_t) slot][i], dst[i]);
+    ggml_backend_synchronize(im.backend);
+    im.in_pos = -1;      // the decode inputs are uploaded again by the next attn_router
+    im.cur_tid = -1;
+    return true;
+}
+
+int Ds4Dense::snapshot_pos(int slot) const {
+    const Impl & im = *p_;
+    return slot >= 0 && slot < (int) im.snap_pos.size() ? im.snap_pos[(size_t) slot] : -1;
+}
+
+size_t Ds4Dense::snapshot_bytes() const { return p_->snap_bytes; }
+int    Ds4Dense::snapshot_slots() const { return (int) p_->snaps.size(); }
