@@ -4,6 +4,30 @@ Fork of https://github.com/Indras-Mirror/Strata-DS4 (one developer, no releases,
 https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster than our llama.cpp stack (stack 73
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
+## STATUS 2026-10-10 evening - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+- **Runs**: container `strata-ds4`, image `strata-ds4:cu13` (portainer/deepseek-strata/Dockerfile: Ubuntu 24.04 +
+  Python + libnccl; nothing of the engine baked in), serve/server.py + `ds4_serve` from the DEPLOY SNAPSHOT
+  `models/strata-ds4/run` (bind-mounted read-only at /app; the previous one is `run.prev`). A DROP-IN for llama.cpp
+  stack 73: host :8330, network alias `ds4-lcpp`, model id `deepseek-v4-flash` (+ alias `deepseek-v4-flash-strata`).
+  Mode page :8500 DeepSeek tile: **llama.cpp | Strata** picks the engine (they share the port: never both).
+- **Update the engine**: build here (mab776-build.sh, BUILD_DIR=build-ds4-cu13, CUDA 13 image) ->
+  `portainer/deepseek-strata/snapshot.sh` (copies ds4_serve, serve/, the tokenizer files, the profile and
+  ds4-server.json into run/) -> restart the container (mode page Restart, or `docker restart strata-ds4`).
+  Rollback: stop it, swap run/ and run.prev/, start it. Config edits: portainer/deepseek-strata/ds4-server.json, then
+  snapshot. Stack edits: portainer/deepseek-strata/docker-compose.yml + deploy.sh (native stack via the API).
+- **Engine config** (ds4-server.json): `--gpu1 1` (GPU 1 tier) `--vram-margin 9 --vram-grow 2` (elastic GPU 0 cache,
+  shrunk per prompt) `--prefill-chunk 2048 --chunk-mmq --chunk-prestage` + env `STRATA_MMQ_FP4=1` (Marc: keep it)
+  `--mtp ... --mtp-device 1` (speculative decoding, the MTP head's experts on GPU 1) `--park-mib 4096` (conversation
+  parking) `--arena-gib 41`. ~42 GiB container RAM, mem_limit 50g.
+- **Measured through the server**: prefill 1,104-1,362 / 1,007 / 749 tok/s at 8k / 127k / 250k (stack 73: 1011 / 843
+  / 693); decode 55.8-59.0 / 49.7 / ~43 tok/s (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k;
+  parked chat back in 1.3-1.4 s; agent turns read only what they appended.
+- **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
+  WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
+- **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 prefill;
+  verify pass at 250k still 1.8x a step; serve/ fixes of Strata 0.1.42 worth taking (#984 thinking budget, #1620,
+  #1624 tool order, #1601 cgroup RAM) = a rebase-picture change, ask Marc.
+
 ## Repo layout / git
 - Local clone: `~/Documents/portainer/strata-ds4`. Branch `mab776-main` = our work; `main` on the fork = upstream mirror.
 - `origin` (Indras-Mirror) push URL is DISABLED on purpose. `mab776` remote = the fork. `core.sshCommand` is set
@@ -60,7 +84,9 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
 6. Q3_K_M once the RAM is in. 7. Mode-page tile + NATIVE Portainer stack, then SWE Verified-mini vs stack 73.
 
 ## House rules
-- GPUs: ask Marc before taking them (mode page :8500 must be "all off"/DeepSeek); never touch Strata/AuK while he works.
+- GPUs: Marc 10-10: "you are the priority to use the GPU until your task is completed" (the old per-window ask was a
+  mistake). Use the mode page (:8500) to free them (DeepSeek/All off); never touch Strata/AuK/GLM while Marc works on
+  them; leave DeepSeek on Strata when done so he can test.
 - Never `pkill -f` (kills your own shell) — kill by PID. Cap every big container's RAM. Clean up temp files.
 - Parked side idea: our own mixed quant — `deepseek-v4/CUSTOM-QUANT-IDEA.md`.
 
@@ -181,3 +207,38 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   tier shrinks ~380 experts for 3.2 GB MXFP4) + Marc's sweep (peer msg 10-10): quant BF16/Q8_0/Q4_K/Q2_K x placement (a)
   head on GPU 1 / (b) experts in pinned RAM / (c) GPU 0, net tok/s vs 45/42/41 at 8k/127k/250k; then the 2-token dense
   pass (attention+router 18.6 vs 13.3 ms for one token - profile it with work/prof.sh).
+
+## Session 2026-10-10 evening - M6 + M8 done, M7b MTP on GPU 1, llm-router for Open WebUI (upstream still 924516a0)
+- **Strata 0.1.42 check** (released 10-10): engine speedups target top-10 routing on miss-heavy cards (TAIL_SKIP = skip
+  low-rank missed experts in verify windows; CPU-measured PCIe share) - nothing to port: DS4 routes top-6 and after M7a
+  misses are ~4 % of lookups. serve/ fixes worth taking later (rebase picture -> ask Marc): #984 thinking budget at
+  max_tokens, #1620 cancel keeps the restore, #1624 reordered tool set keeps the prompt cache, #1601 cgroup-aware
+  parking RAM, #1603 orphaned slots. Stack 67 (Qwen coder) could gain a few % from TAIL_SKIP: separate test.
+- **M6 = the live GPU server (7403e309)**: ds4_serve engine 0.2 - M7a flags; the elastic cache shrinks before a prompt's
+  chunks (Ds4MoeTier::shrink_cache + ExpertCache::evict_from, ~20 ms) and regrows after (~120 ms, LRU recency kept);
+  pinned bounce buffers kept across prompts. Gates through serve/server.py: stream / tools / reasoning / tool round
+  trip (cached 299/388) / client hang-up -> cancel / depth 1,227 / 977 / 752 prefill and 46.3 / 43.8 / 43.2 decode
+  (plain) / needles 3/3 at 239.8k.
+- **Conversation parking** (Marc via peer: A-B-A + agent loop tests): `--park-mib` - Ds4Dense::park/unpark = rings +
+  snapshot slots + compressed/indexer rows below the position (~2.9 KB/token: 94 MiB @10k, 273 MiB @93k, ~0.73 GiB
+  @262k), LRU under the budget, RAM guard reads the cgroup minus its reclaimable file cache (memory.current alone
+  counts the model's page cache and refused every park). A-B-A: A2 reused 92,808 of 92,928, TTFT 1.41 s (vs 88 s
+  re-read). Agent loop (bench: work/ tmp scripts agent_loop.py/aba.py): 14 turns 55.7k -> 89.3k, each turn read only
+  what it appended. Caveat: an EMPTY assistant message (a turn cut by max_tokens inside its thinking) makes the GGUF
+  template drop it and merge the two user messages -> the prompt diverges inside earlier text -> full re-read.
+- **M7b in serve**: `--mtp FILE` = verify loop with exact speculative sampling (ds4_sampler.hpp verify_row; chi-square
+  tested, 3 mutants killed); CPU gate T8Verify (oracle-driven accept/reject, bit-exact vs plain greedy). Found and fixed:
+  2-token passes ran a DENSE masked flash-attn over every compressed row (verify LOST to plain at depth: 33 vs 44 tok/s
+  @93k) -> each query gathers its own top-k (DS4_SPARSE_N, bit-identical on CPU). **MTP experts on GPU (d8d626cf)**:
+  `--mtp-device N`; sweep (arena 41 - at 38 the tier's giveback fell to NVMe and faked a loss): CPU 4.63 ms/draft,
+  51-53 / 46.6 tok/s; GPU 1 1.3-1.5 ms, 55.8-59.0 / 49.7; GPU 0 1.3-1.4 ms, 56.0-57.3 / 51.2 (8k / 127k). GPU 1
+  deployed (keeps prefill). Quant sweep of the head's dense part skipped on purpose: it is ~330 MB bf16 per draft
+  token (~0.25 ms of a 1.3 ms launch-bound pass) - Q8/Q4 could save <=0.2 ms and cost acceptance.
+- **M8 (stack 74)**: native stack via the API (portainer/deepseek-strata: compose, deploy.sh, snapshot.sh, Dockerfile,
+  ds4-server.json, vscode-copilot.txt); mode page `ds_variant` (llama.cpp | Strata, app.py backup
+  app.py.bak-20261010-dsvariant); off -> DeepSeek (Strata) -> off x3 clean (ready 50-55 s). OpenHands host profile
+  `DeepSeek` (a 4-action coding task in 36 s; seed-settings.sh updated - profile names cannot contain "/").
+- **llm-router** (Marc 10-10: "DS4 in Open WebUI without breaking it"): portainer/llm-router (stdlib, read-only,
+  stack `llm-router`, :8340). OWUI's only OpenAI connection (`http://llm-router:8000/v1`; backup of the old two
+  connections: llm-router/owui-openai-config.bak-20261010.json). Lists every coder model (stopped ones "· not
+  running"), routes by model id, stopped stack = 503 "start it on the mode page", resolves stack names per request.
