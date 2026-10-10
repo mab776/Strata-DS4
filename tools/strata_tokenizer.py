@@ -17,14 +17,25 @@ mab776 merge (Strata v0.1.41 fb58e0db + Strata-DS4 85c3eab3): v0.1.41's file (pi
 `control_tokens`) with DS4's `joyai-llm` pre-tokenizer (`JOYAI_LLM_PATTERNS`, `PRE_PATTERNS`, `_pre_split`) for
 DeepSeek-V4-Flash; plus `from_dir()` (the pack's own `pre`, as Project Maya #27 does for GLM), special tokens
 decoding to their own text (llama.cpp's token_to_piece), and `extract()` writing the patterns of the actual `pre`.
+
+mab776: the patterns' \\p{..} and \\s are resolved with llama.cpp's own Unicode tables (llama_unicode_classes.py),
+not the `regex` module's, on a collapsed copy of the text as llama.cpp does - see `_llama_classes`, `_compile_pre`.
 """
 from __future__ import annotations
 
+import functools
+import itertools
 import json
 import pathlib
 import sys
 
 import regex
+
+try:
+    import llama_unicode_classes as _LUC
+except ImportError:                                     # imported as tools.strata_tokenizer, or from elsewhere
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import llama_unicode_classes as _LUC
 
 # ------------------------------------------------------------------ byte <-> unicode (GPT-2 byte-level BPE)
 def bytes_to_unicode() -> dict[int, str]:
@@ -98,6 +109,201 @@ PRE_PATTERNS = {
     "hy_v4": JOYAI_LLM_PATTERNS,
 }
 
+# ------------------------------------------------------------------ llama.cpp's character classes
+# mab776: WHY THE PATTERNS ARE NOT COMPILED AS WRITTEN.  To the `regex` module `\p{L}` means "a letter in the Unicode
+# version this `regex` release ships" (17.0 in 2026.9.x).  llama.cpp never asks a regex engine: it reads its own
+# tables, generated once into src/unicode-data.cpp from Unicode 15.0.  Every code point assigned since - new emoji
+# (U+1FAE9), Latin additions (U+A7CB, U+1C89), legacy-computing symbols (U+1CC00..), marks (U+1ACF, U+0897), the
+# riyal sign (U+20C1), new digits - is \p{L}/\p{S}/... to `regex` and UNDEFINED to llama.cpp, so the pre-split moved
+# and the ids with it (4 of 6 probe texts differed).  joyai-llm reads L/M, P/S, N and whitespace apart, so every new
+# code point counts; qwen35 only tells L/M, N and whitespace from the rest, so its new letters, marks and digits do.
+# So every \p{..} and \s is resolved with llama.cpp's tables instead: tools/llama_unicode_classes.py, generated from
+# the vendored unicode-data.cpp, whose tables are byte-identical to those compiled into the b11429 oracle.  The split
+# then matches the oracle on every code point (tools/ds4/test_tokenizer_unicode.py has the frozen ids).
+#
+# llama.cpp resolves the classes in TWO ways, picked by the pattern string itself (unicode.cpp unicode_regex_split):
+#   * unicode_regex_split_custom(): a few exact pattern strings - qwen35's among them - never reach a regex engine;
+#     a hand-written splitter reads unicode_cpt_flags_from_cpt() for every code point, ASCII included.  Our regex,
+#     with each class taken straight from the table, splits exactly as unicode_regex_split_custom_qwen35 does: every
+#     in-range code point has a non-zero flag, and no non-ASCII code point lowercases to a contraction letter (the
+#     generator checks both and fingerprints the splitter, so a change upstream stops it).
+#   * every other pattern with a \p{..} runs std::regex over a COLLAPSED copy of the text: ASCII stays itself, any
+#     other code point becomes one byte - 0x0B if it is whitespace, else its category's byte for N/L/P/M/S, else
+#     0xD0 - and \p{X} becomes [<X's byte><X's ASCII members, k_ucat_map>].  So there, a non-ASCII whitespace is in
+#     no \p{..}, an ASCII character is in \p{X} only if k_ucat_map says so, and `\s` is std::regex's own (the
+#     C-locale isspace on ASCII) plus the collapsed whitespace.  A pattern with no \p{..} (joyai's `[一-龥...]+`)
+#     runs std::wregex on the code points themselves, non-ASCII whitespace turned into 0x0B: the same `\s`.
+# With today's tables both views give the same sets; they stay separate because they are separate code upstream.
+#
+# HOW: llama.cpp's own collapse.  Spelled out as code point ranges (\p{L} alone is 660 of them) the classes made the
+# `regex` module 7-9x slower.  Instead a custom-splitter or \p{..} pattern (ASCII literals only) runs on a collapsed
+# copy of the text, where every non-ASCII code point is one representative per (category, whitespace) signature -
+# _REP + 2 * category + whitespace, one str.translate through a 1.1 MB table - and each class is its ASCII members
+# plus the representatives of the signatures it holds on that path.  A code point stays one code point, so the spans
+# index the original text.  A pattern with neither (the Han/kana one) runs on the original text, as llama.cpp's
+# std::wregex does.
+LLAMA_CUSTOM_SPLIT = frozenset([QWEN35_PATTERN])         # unicode.cpp unicode_regex_split_custom(), the ones we use
+_STD_REGEX_ASCII_SPACE = [(0x09, 0x0D), (0x20, 0x20)]   # std::regex `\s` on char: isspace() in the "C" locale
+_CATEGORIES = "NLPSM"                                   # what a \p{..} names; any other code point is "other"
+_REP = 0x80                                             # collapsed text: _REP + 2 * category index + whitespace
+
+
+def _ranges(spec: str) -> list[tuple[int, int]]:
+    out = []
+    for tok in spec.split():
+        a, _, b = tok.partition("-")
+        out.append((int(a, 16), int(b or a, 16)))
+    return out
+
+
+def _to_ranges(cps) -> list[tuple[int, int]]:
+    out: list[tuple[int, int]] = []
+    for c in sorted(cps):
+        if out and out[-1][1] == c - 1:
+            out[-1] = (out[-1][0], c)
+        else:
+            out.append((c, c))
+    return out
+
+
+def _clip(ranges, lo: int, holes=()) -> list[tuple[int, int]]:
+    """`ranges` from code point `lo` up, minus the code points in `holes`."""
+    out = []
+    for a, b in ranges:
+        a = max(a, lo)
+        for h in sorted(h for h in holes if a <= h <= b):
+            if h > a:
+                out.append((a, h - 1))
+            a = h + 1
+        if a <= b:
+            out.append((a, b))
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _llama_classes(collapsed: bool) -> dict[str, tuple[tuple[int, int], ...]]:
+    """{'L','N','P','S','M','s': code point ranges} as llama.cpp resolves \\p{L} ... \\p{M} and \\s - on its std::regex
+    path (`collapsed`) or in its custom splitters (the flags of every code point, ASCII included)."""
+    ws = _ranges(_LUC.WHITESPACE)
+    if not collapsed:
+        out = {k: _ranges(v) for k, v in _LUC.RANGES.items()}
+        out["s"] = ws
+    else:
+        holes = {c for a, b in ws for c in range(a, b + 1)}
+        out = {k: _ranges(_LUC.ASCII_UCAT[k]) + _clip(_ranges(v), 0x80, holes) for k, v in _LUC.RANGES.items()}
+        out["s"] = _STD_REGEX_ASCII_SPACE + _clip(ws, 0x80)
+    return {k: tuple(v) for k, v in out.items()}
+
+
+@functools.lru_cache(maxsize=None)
+def _collapse_table() -> bytearray:
+    """The str.translate table of the collapsed text: an ASCII code point stays itself, any other becomes
+    _REP + 2 * (its category's index in _CATEGORIES, len(_CATEGORIES) for none) + (1 if it is whitespace)."""
+    t = bytearray(range(0x80)) + bytes([_REP + 2 * len(_CATEGORIES)]) * (0x110000 - 0x80)
+    for ci, k in enumerate(_CATEGORIES):
+        for a, b in _clip(_ranges(_LUC.RANGES[k]), 0x80):
+            t[a:b + 1] = bytes([_REP + 2 * ci]) * (b - a + 1)
+    for a, b in _clip(_ranges(_LUC.WHITESPACE), 0x80):
+        for c in range(a, b + 1):
+            t[c] |= 1
+    return t
+
+
+def _collapse(text: str) -> str:
+    return text if text.isascii() else text.translate(_collapse_table())
+
+
+@functools.lru_cache(maxsize=None)
+def _collapsed_classes(collapsed: bool) -> dict[str, tuple[int, ...]]:
+    """{class: the characters of the COLLAPSED text it matches}: its ASCII members, then the representative of every
+    (category, whitespace) signature whose code points _llama_classes puts in it on that path."""
+    out = {}
+    for name, ranges in _llama_classes(collapsed).items():
+        members = [c for a, b in ranges for c in range(a, min(b, 0x7F) + 1)]
+        for ci in range(len(_CATEGORIES) + 1):
+            for ws in (0, 1):
+                if name == "s":
+                    hit = ws == 1
+                else:
+                    hit = ci < len(_CATEGORIES) and _CATEGORIES[ci] == name and not (collapsed and ws)
+                if hit:
+                    members.append(_REP + 2 * ci + ws)
+        out[name] = tuple(members)
+    return out
+
+
+def _esc(cp: int) -> str:
+    return "\\x%02x" % cp if cp < 0x100 else "\\u%04x" % cp if cp < 0x10000 else "\\U%08x" % cp
+
+
+def _body(ranges) -> str:
+    return "".join(_esc(a) if a == b else _esc(a) + "-" + _esc(b) for a, b in ranges)
+
+
+def _expand_classes(pattern: str, classes: dict[str, str]) -> str:
+    """`pattern` with every \\p{X}, \\s and \\S replaced by the class body classes[X] / classes['s'].
+
+    Refuses every other construct whose meaning comes from a Unicode table (\\d, \\w, \\b, other \\p{..}, inline
+    flags such as case folding, an unescaped '.'), so nothing in a pre-tokenizer pattern can fall back silently to
+    the Unicode version of the `regex` module."""
+    out, i, n = [], 0, len(pattern)
+    inside = first = False                              # inside [...]; just past '[' or '[^' (a ']' is literal there)
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            e = pattern[i + 1]
+            if e == "p" and pattern.startswith("{", i + 2):
+                j = pattern.index("}", i)
+                cls = classes.get(pattern[i + 3:j])
+                if cls is None:
+                    raise ValueError("pre-tokenizer pattern: no llama.cpp class for %s here" % pattern[i:j + 1])
+                out.append(cls if inside else "[" + cls + "]")
+                i = j + 1
+            elif e == "s":
+                out.append(classes["s"] if inside else "[" + classes["s"] + "]")
+                i += 2
+            elif e == "S" and not inside:
+                out.append("[^" + classes["s"] + "]")
+                i += 2
+            elif e in "rnt" or not e.isalnum():
+                out.append(pattern[i:i + 2])
+                i += 2
+            else:       # \d \w \b ... read Unicode tables; \x \u \U could name a code point the collapse replaced
+                raise ValueError("pre-tokenizer pattern: escape \\%s is not supported" % e)
+            first = False
+            continue
+        if not inside:
+            if c == "." or (c == "(" and pattern.startswith("(?", i)
+                            and not pattern.startswith(("(?:", "(?=", "(?!", "(?<=", "(?<!"), i)):
+                raise ValueError("pre-tokenizer pattern: %r at %d depends on Unicode tables" % (pattern[i:i + 3], i))
+            if c == "[":
+                inside = first = True
+                if pattern.startswith("[^", i):
+                    out.append("[^")
+                    i += 2
+                    continue
+        elif c == "]" and not first:
+            inside = False
+        else:
+            first = False
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=None)
+def _compile_pre(pattern: str):
+    """(compiled, runs on the collapsed text?) for one pre-tokenizer pattern, dispatched as unicode_regex_split does:
+    a custom splitter (the flags view) or a \\p{..} (the collapsed std::regex view) - both on the collapsed text - or
+    neither: std::wregex on the code points, i.e. the original text with only \\s to resolve."""
+    custom = pattern in LLAMA_CUSTOM_SPLIT
+    if custom or "\\p{" in pattern:
+        if not pattern.isascii():                       # llama.cpp throws on this mix too
+            raise ValueError("pre-tokenizer pattern: \\p{..} together with non-ASCII characters")
+        cls = _collapsed_classes(not custom)
+        return regex.compile(_expand_classes(pattern, {k: _body(_to_ranges(v)) for k, v in cls.items()})), True
+    return regex.compile(_expand_classes(pattern, {"s": _body(_llama_classes(True)["s"])})), False
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -124,7 +330,7 @@ class Tokenizer:
         if pre not in PRE_PATTERNS:
             raise ValueError("unknown pre-tokenizer %r (known: %s)"
                              % (pre, ", ".join(sorted(PRE_PATTERNS))))
-        self._pre_res = [regex.compile(p) for p in PRE_PATTERNS[pre]]
+        self._pre_res = [_compile_pre(p) for p in PRE_PATTERNS[pre]]
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -169,7 +375,12 @@ class Tokenizer:
         for s, i in vocab.items():
             tokens[i] = s
         meta = json.loads((t / "tokenizer.json").read_text(encoding="utf-8")) if (t / "tokenizer.json").exists() else {}
-        types = json.loads((t / "token_type.json").read_text()) if (t / "token_type.json").exists() else None
+        # token_type.json is required, as the v0.1.41 server required it: without it a half-written pack would start
+        # with no special tokens (control tokens spelled out as text, stop ids from ordinary pieces).  A JSON null
+        # (extract() on a GGUF without token types) still means "no types".
+        if not (t / "token_type.json").exists():
+            raise FileNotFoundError("%s is missing from the tokenizer directory; run setup again" % (t / "token_type.json"))
+        types = json.loads((t / "token_type.json").read_text())
         return cls(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"), types,
                    meta.get("pre", "qwen35"), meta.get("special_ids") or None)
 
@@ -264,21 +475,39 @@ class Tokenizer:
 
     def _pre_split(self, text: str) -> list[str]:
         """The pre-tokenizer pieces of `text`: each pattern in `_pre_res` splits the pieces the patterns before
-        it left, exactly as llama.cpp's `unicode_regex_split` refines `bpe_offsets` one regex at a time."""
+        it left, exactly as llama.cpp's `unicode_regex_split` refines `bpe_offsets` one regex at a time.
+
+        mab776: a pattern runs on the collapsed copy of `text` or on `text` itself (_compile_pre), the same length
+        either way; pos/endpos bound each piece as slicing did (a lookahead does not see past endpos)."""
+        if len(self._pre_res) == 1 and self._pre_res[0][0].groups == 0:
+            # mab776 fast path (one pattern = qwen35): C-level findall instead of the span loop when the matches tile
+            # the whole text - then gap-keeping and findall give the same pieces; collapsing keeps lengths, so the
+            # pieces are cut from `text` at the same offsets.  Anything else falls through to the general loop.
+            pat, on_collapsed = self._pre_res[0]
+            src = _collapse(text) if on_collapsed else text
+            pieces = [p for p in pat.findall(src) if p]
+            ends = list(itertools.accumulate(map(len, pieces)))
+            if (ends[-1] if ends else 0) == len(text):
+                if src is text or src == text:
+                    return pieces
+                return [text[a:b] for a, b in zip([0] + ends[:-1], ends)]
         spans = [(0, len(text))]
-        for pat in self._pre_res:
+        collapsed = None
+        for pat, on_collapsed in self._pre_res:
+            if on_collapsed and collapsed is None:
+                collapsed = _collapse(text)
+            src = collapsed if on_collapsed else text
             nxt: list[tuple[int, int]] = []
             for a, b in spans:
-                sub = text[a:b]
-                last = 0
-                for m in pat.finditer(sub):
+                last = a
+                for m in pat.finditer(src, a, b):
                     if m.start() > last:
-                        nxt.append((a + last, a + m.start()))
+                        nxt.append((last, m.start()))
                     if m.end() > m.start():
-                        nxt.append((a + m.start(), a + m.end()))
+                        nxt.append((m.start(), m.end()))
                     last = m.end()
-                if last < len(sub):
-                    nxt.append((a + last, b))
+                if last < b:
+                    nxt.append((last, b))
             spans = nxt
         return [text[a:b] for a, b in spans]
 
