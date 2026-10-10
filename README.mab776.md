@@ -149,3 +149,22 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   DSML opening; whole tool calls only (SSE keep-alive every 10 s while one is held).
 - DeepSeek serving pieces adapted from Jackwwg83/Strata-DS (MIT) and Aleks-Che/Strata (MIT); tool-result ordering,
   prefill continuation and part joining from ggml-org/llama.cpp (MIT).
+
+## Session 2026-10-10 day - M7a done, M4 merged, M5 running (upstream still 924516a0, nothing to merge)
+- **M7a (8d24f746)** = GPU 1 static expert tier (`--gpu1 1`, 2,045 experts / 14.5 GiB, no arena copies) + complete
+  ranking (the 80 never-profiled experts) + elastic GPU 0 cache (`--vram-grow 2.0` with `--vram-margin 9.0`: seeded
+  at the prompt budget, grown from the arena after the prompt) + prestage halves sized to the busiest layer + a leaner
+  decode host path. **NVMe during the prompt: 0.0 GB; decode file reads 0.** GPU-1 rows byte-identical to GPU 0's
+  (DS4_CHECK_G1: 24,518/24,518 decode, 671/671 prompt). Run with m2run.sh `G1=1 GROW=2.0 MARGIN=9.0`.
+  | depth | prefill tok/s (M2 one-shot / stack 73) | decode tok/s (M2 / stack 73 no draft / w/ drafter) |
+  |---|---|---|
+  | 8k | **683** (153 / 1011) | **44.4** (35.7 / 28.0 / 40.8) |
+  | 127k | **495** (210 / 843) | **42.0** (33.9 / 25.0 / 39.0) |
+  | 250k | **347** (191 / 693) | **40.6** (29.5 / 22.3 / ~36) |
+  Prefill at depth is now the O(cap x n) prompt attention (67 % at 127k, 77 % at 250k), then GPU 0's resident experts
+  on MMVQ. Report: bench/mab776-m2/M7a-REPORT.md.
+- **M4 merged (5944ac4d)**, worktree removed. M5 (ds4_serve) still in its worktree strata-ds4-m5 (branch m5-serve).
+- **M7b (drafter) needs a decision from Marc** - see the report: DS4's verify loop drafts with the single MTP head
+  (DeepSeek-V4-Flash-MTP GGUF, ~5 GB, NOT on disk); stack 73's DSpark file on disk is a different, 3-block "dflash"
+  drafter (block of 5, target layers 41-43) the engine does not implement. Decode already beats stack 73 WITH its
+  drafter; the user-visible gap is prefill, so prefill attention / resident MMQ may deserve to go first.
