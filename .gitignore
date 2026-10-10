@@ -64,3 +64,6 @@ build-vision-cuda12.bat
 
 /.ccache/
 /.rocm-win/
+
+# mab776: M2 prompt ids / scratch (regenerable with make_prompts.py)
+bench/mab776-m2/work/

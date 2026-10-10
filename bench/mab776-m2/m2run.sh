@@ -4,7 +4,8 @@
 # env: OUT (results dir, default bench/mab776-m2/out), MEM (container cap GiB, default MemAvailable - 9),
 #      ARENA (GiB, default MEM - 6), SKIP=1|0 (--arena-skip-resident), CHUNK=4096|...|0 (0 = decode-loop prefill),
 #      PCIE (default 0.55), BUILD (default build-ds4-cu13), IMAGE (default nvidia/cuda:13.0.2-devel-ubuntu24.04),
-#      MARGIN (default 2.0), MMQ=1|0 (--chunk-mmq), PRESTAGE=1|0 (--chunk-prestage)
+#      MARGIN (default 2.0), MMQ=1|0 (--chunk-mmq), PRESTAGE=1|0 (--chunk-prestage), SEED_FIRST=1 (cache seeded at load),
+#      MMQ_FP4=1 (STRATA_MMQ_FP4=1: MXFP4 experts on MMQ with FP4 activations instead of MMVQ)
 # Refuses to start when the GPUs are not idle (another engine / mode page). Never touches any other container.
 set -u
 L=$1; IDS=$2; N=$3; shift 3
@@ -23,7 +24,7 @@ BUILD=${BUILD:-build-ds4-cu13}; IMAGE=${IMAGE:-nvidia/cuda:13.0.2-devel-ubuntu24
 IDSD=$(cd "$(dirname "$IDS")" && pwd); IDSF=$(basename "$IDS")
 docker rm -f ds4-m2 >/dev/null 2>&1
 echo "== $L: $(date '+%F %T') MEM ${MEM}g ARENA ${ARENA} SKIP ${SKIP:-1} CHUNK $CH PCIE ${PCIE:-0.55} $BUILD $*" | tee "$OUT/$L.log"
-docker run -d --name ds4-m2 --gpus '"device=0"' -e NVIDIA_VISIBLE_DEVICES=0 -e MIMO_CHUNK_PROF=1 -e GGML_NO_BACKTRACE=1 \
+docker run -d --name ds4-m2 --gpus '"device=0"' -e NVIDIA_VISIBLE_DEVICES=0 -e MIMO_CHUNK_PROF=1 -e GGML_NO_BACKTRACE=1 ${SEED_FIRST:+-e DS4_SEED_FIRST=1} ${MMQ_FP4:+-e STRATA_MMQ_FP4=$MMQ_FP4} \
   --ipc host --memory "${MEM}g" --memory-swap "${MEM}g" --ulimit memlock=-1 \
   -v "$R":/src:ro -v "$BLOBDIR":/m:ro -v "$IDSD":/w:ro -w /src "$IMAGE" \
   "$BUILD/ds4_generate" -m "/m/$BLOBF" --ids-file "/w/$IDSF" -n "$N" --temp 0 --stop 1 \

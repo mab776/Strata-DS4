@@ -313,7 +313,9 @@ int main(int argc, char** argv) {
     mc.arena_adapt = a.arena_adapt;
     mc.arena_skip_resident = a.arena_skip;
     // chunked prefill: the arena now, the VRAM cache after the prompt (the chunks use that VRAM first)
-    const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty();
+    // mab776: DS4_SEED_FIRST=1 seeds the VRAM cache at load even with --prefill-chunk, the way a resident server
+    // prefills (chunks compute the cached experts in place; their buffers must then fit in --vram-margin)
+    const bool defer_seed = a.prefill_chunk > 0 && !mc.cpu_only && !a.profile.empty() && !std::getenv("DS4_SEED_FIRST");
     mc.defer_cache = defer_seed;
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prestage = a.chunk_prestage;

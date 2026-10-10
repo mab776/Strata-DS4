@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -34,7 +35,22 @@ struct Dev {
     Dev& operator=(const Dev&) = delete;
 };
 
+// The i-quants of unsloth's DeepSeek-V4 UD-IQ2_M: ggml quantizes them only with an imatrix / grid init, and slowly at
+// these sizes, so they get random valid blocks (every code byte decodes; the fp16 d is each block's first two bytes).
+bool random_blocks(ggml_type t) { return t == GGML_TYPE_IQ2_XXS || t == GGML_TYPE_IQ2_S || t == GGML_TYPE_IQ3_XXS; }
+
 std::vector<uint8_t> make_matrix(ggml_type t, int64_t rows, int64_t cols, int expert, int trial) {
+    if (random_blocks(t)) {
+        std::vector<uint8_t> out((size_t) rows * ggml_row_size(t, cols));
+        uint64_t st = 0x9E3779B97F4A7C15ull * (uint64_t) (expert * 131 + trial * 7 + 1);
+        for (auto& b : out) {
+            st = st * 6364136223846793005ull + 1442695040888963407ull;
+            b = (uint8_t) (st >> 56);
+        }
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.0005f);
+        for (size_t o = 0; o < out.size(); o += ggml_type_size(t)) std::memcpy(out.data() + o, &d, sizeof d);
+        return out;
+    }
     const auto* tr = ggml_get_type_traits(t);
     if (tr == nullptr || tr->from_float_ref == nullptr) throw std::runtime_error("no reference quantizer");
     const size_t rb = ggml_row_size(t, cols);
@@ -132,10 +148,23 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
             for (int64_t o = 0; o < out_rows; ++o)
                 zero_max = std::max(zero_max, (double) std::fabs(got[(size_t) dst[(size_t) r] * (size_t) out_rows + (size_t) o]));
     const double rms = std::sqrt(ref2 / (double) ref.size()), rel = std::sqrt(err2 / (double) ref.size()) / rms;
-    std::printf("%-22s rows %2d experts %d  ref_rms %.4g  rel_l2 %.5f  max/rms %.4f  zero row %.3g\n", name, rows, n, rms,
-                rel, max_abs / rms, zero_max);
-    if (rel > 0.04 || max_abs / rms > 0.35 || zero_max > std::max(1e-5, 1e-4 * rms))
+    // FP4 activations (MXFP4 on Blackwell, mmq::native_fp4) round to E2M1: rel_l2 ~0.06-0.08, max/rms ~0.25 here
+    const bool fp4 = mmq::native_fp4((int) t);
+    std::printf("%-22s rows %2d experts %d  ref_rms %.4g  rel_l2 %.5f  max/rms %.4f  zero row %.3g%s\n", name, rows, n, rms,
+                rel, max_abs / rms, zero_max, fp4 ? "  (FP4 activations)" : "");
+    if (rel > (fp4 ? 0.12 : 0.04) || max_abs / rms > (fp4 ? 0.5 : 0.35) || zero_max > std::max(1e-5, 1e-4 * rms))
         throw std::runtime_error(std::string(name) + ": outside the screen");
+}
+// every product runs and reports (a failure no longer hides the products after it)
+int g_failed = 0;
+void run(mmq::Context& ctx, cudaStream_t s, const std::string& name, ggml_type t, int64_t out_rows, int64_t cols,
+         const std::vector<int>& counts, int trial) {
+    try {
+        product(ctx, s, name.c_str(), t, out_rows, cols, counts, trial);
+    } catch (const std::exception& e) {
+        std::printf("FAILED %s\n", e.what());
+        ++g_failed;
+    }
 }
 }  // namespace
 
@@ -151,19 +180,27 @@ int main() {
             int trial = 0;
             for (const auto& counts : batches) {
                 const std::string tag = "-" + std::to_string(trial);
-                product(ctx, s, ("Q4_K gate/up" + tag).c_str(), GGML_TYPE_Q4_K, 1280, 2560, counts, trial);
-                product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
-                product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
-                product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
+                run(ctx, s, "Q4_K gate/up" + tag, GGML_TYPE_Q4_K, 1280, 2560, counts, trial);
+                run(ctx, s, "Q5_K gate/up" + tag, GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
+                run(ctx, s, "Q5_1 down" + tag, GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
+                run(ctx, s, "Q8_0 down" + tag, GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
                 // MiMo-V2.6-Flash RL GSQ-RCO: gate/up at n_ff_exp 2048 x n_embd 4096, down the other way, in
                 // Q2_K / Q3_K / MXFP4 (that pack's expert formats)
-                product(ctx, s, ("Q2_K gate/up" + tag).c_str(), GGML_TYPE_Q2_K,  2048, 4096, counts, trial + 17);
-                product(ctx, s, ("Q3_K gate/up" + tag).c_str(), GGML_TYPE_Q3_K,  2048, 4096, counts, trial + 21);
-                product(ctx, s, ("MXFP4 down" + tag).c_str(),   GGML_TYPE_MXFP4, 4096, 2048, counts, trial + 25);
+                run(ctx, s, "Q2_K gate/up" + tag, GGML_TYPE_Q2_K,  2048, 4096, counts, trial + 17);
+                run(ctx, s, "Q3_K gate/up" + tag, GGML_TYPE_Q3_K,  2048, 4096, counts, trial + 21);
+                run(ctx, s, "MXFP4 down" + tag,   GGML_TYPE_MXFP4, 4096, 2048, counts, trial + 25);
+                // unsloth DeepSeek-V4-Flash UD-IQ2_M: gate/up IQ2_XXS (layer 26: IQ2_S), down IQ3_XXS (26 and 42: MXFP4)
+                run(ctx, s, "IQ2_XXS gate/up" + tag, GGML_TYPE_IQ2_XXS, 2048, 4096, counts, trial + 29);
+                run(ctx, s, "IQ2_S gate/up" + tag,   GGML_TYPE_IQ2_S,   2048, 4096, counts, trial + 33);
+                run(ctx, s, "IQ3_XXS down" + tag,    GGML_TYPE_IQ3_XXS, 4096, 2048, counts, trial + 37);
                 ++trial;
             }
         }
         ck(cudaStreamDestroy(s), "destroy");
+        if (g_failed) {
+            std::fprintf(stderr, "prefill MMQ K-quant screen failed: %d product(s)\n", g_failed);
+            return 1;
+        }
         std::printf("prefill MMQ K-quant screen passed\n");
         return 0;
     } catch (const std::exception& e) {

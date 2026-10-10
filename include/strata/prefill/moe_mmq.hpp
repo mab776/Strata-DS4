@@ -19,13 +19,17 @@ bool supported(int ggml_type);
 /// `w_rows` rows that fits the card's shared memory - the same test its tile choice makes, which aborts the process
 /// ("J_best=0") when nothing fits.  false (said once per type) keeps that product on the non-MMQ path.
 bool fits(int ggml_type, int64_t w_rows);
+/// This build's MMQ multiplies `ggml_type` FP4 x FP4 on the current GPU (MXFP4 on Blackwell, sm_120a): `quantize`
+/// then writes FP4 activations, which round far more than q8_1 - `fits` keeps such a product off MMQ unless
+/// STRATA_MMQ_FP4=1.
+bool native_fp4(int ggml_type);
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
 
-/// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
-/// ids is null); `x` has `ld` floats per row.
+/// q8_1 activations for MMQ against weights of `ggml_type` (FP4 ones when `native_fp4`): row i of the output is row
+/// ids[i] of x (or row i when ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
 

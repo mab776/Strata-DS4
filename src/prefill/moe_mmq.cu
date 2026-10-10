@@ -137,8 +137,32 @@ bool supported(int t) {
     }
 }
 
+// llama.cpp's MMQ multiplies MXFP4 FP4 x FP4 on Blackwell (BLACKWELL_MMA_AVAILABLE, i.e. an sm_120a build; SASS
+// OMMA.SF.16864.F32.E2M1.E2M1.E8): its activations must be block_fp4_mmq from quantize_mmq_fp4_cuda, as
+// ggml_cuda_mul_mat_q's use_native_fp4 does.  q8_1 bytes read as E2M1 codes + E8M0 scales are garbage (a float
+// scale's low byte taken as an exponent: 2^-127..2^127, 0xFF = NaN) - the --chunk-mmq NaN on unsloth's DeepSeek-V4
+// UD-IQ2_M (MXFP4 down in layers 26 and 42).  Other cards (the DS4 author's sm_89) run MXFP4 MMQ on q8_1.
+bool native_fp4(int t) {
+    return t == GGML_TYPE_MXFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
+}
+
 bool fits(int t, int64_t w_rows) {
     if (!supported(t)) return false;
+    // native FP4: FP4 activations cost ~7% relative L2 per product against ~0.1% for q8_1 (prefill_mmq_kquant_test's
+    // data), so by default that product keeps the q8_1 non-MMQ path (MMVQ = the decode math; for UD-IQ2_M's 2 MXFP4
+    // layers ~0.1-1% of the prefill wall: 17 vs 4.6 ms per layer on 768 tokens, 69 vs 11 ms on 3K).
+    // STRATA_MMQ_FP4=1 runs it on MMQ with FP4 activations (what llama.cpp does: BLACKWELL_NATIVE_FP4 = 1).
+    if (native_fp4(t)) {
+        static const bool on = [] { const char* e = std::getenv("STRATA_MMQ_FP4"); return e != nullptr && e[0] == '1'; }();
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "strata: prompt kernels: %s is FP4 x FP4 in llama.cpp's MMQ on this GPU: %s\n",
+                         ggml_type_name((ggml_type) t),
+                         on ? "MMQ with FP4 activations (STRATA_MMQ_FP4=1)" : "non-MMQ path (q8_1); STRATA_MMQ_FP4=1 for MMQ");
+        }
+        if (!on) return false;
+    }
     // mul_mat_q_case's choice: the "fallback" configs when the rows are not a multiple of 128; then
     // mul_mat_q_switch_J's loop - a tile size whose config exists for this card and fits its shared memory
     const bool fallback = w_rows % 128 != 0;
@@ -175,8 +199,12 @@ size_t q8_bytes(int64_t rows, int64_t cols) {
 
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream) {
     if (rows <= 0) return;
-    quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
-                           (cudaStream_t) stream);
+    if (native_fp4(t))   // block_fp4_mmq: same 144-byte block for 256 values (q8_1: 128), so q8_bytes() covers it
+        quantize_mmq_fp4_cuda(x, ids, xq, nullptr, (ggml_type) t, false, cols, ld, rows * ld, rows * ld, pad512(cols),
+                              rows, 1, 1, (cudaStream_t) stream);
+    else
+        quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
+                               (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
 }
 
