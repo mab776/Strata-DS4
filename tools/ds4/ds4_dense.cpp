@@ -690,6 +690,7 @@ static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
+static bool pf_sparse_on();   // mab776 DS4_PF_SPARSE, ditto
 static bool fused_idx_on(bool cpu);     // DS4_FUSED_IDX, ditto
 static bool ovl_gather_on();            // DS4_OVL_GATHER, ditto
 
@@ -1058,11 +1059,65 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     };
     const int64_t RB = raw_block_n(n);
     ggml_tensor * out = nullptr;
-    if (RB >= n) {
+    // mab776 (prefill at depth): a CSA chunk's queries each see SWA raw keys + their top-k compressed rows, yet the
+    // blocked path below ran a DENSE masked flash-attn over every compressed row (cap: 32k at 127k, 64k at 250k) -
+    // ~98 % of its work on -inf keys - and re-concatenated, re-cast and re-padded the whole compressed K for every
+    // block of RB queries (nsys @85k: flash-attn 29 %, those copies ~17 % of the GPU).  Here: K = [compressed rows |
+    // raw union window | zero keys to a multiple of 256] is cast to F16 ONCE; every block of nqb queries is one
+    // sequence (ne[3]) of ONE flash-attn call over it (K broadcast, nb[3] = 0) with its rows of the [T, n] mask, and
+    // n_kv_max = SWA + top-k (the finite entries of every mask row) lets ggml-cuda gather just those keys per query
+    // (its sparse path: DKQ = DV = 512, one query x 8 heads a CTA).  nqb is the largest block for which that path
+    // qualifies (keys >= max(4096, 2 x nqb x n_kv_max)); shallower chunks keep the blocked path.  Same keys, same
+    // masked set: only the summation order of the softmax differs.  DS4_PF_SPARSE=0: the blocked path everywhere.
+    int64_t nqb = 0;
+    const int64_t nkv_q = SWA + (csa ? std::min<int64_t>(cap, im.IDXTOPK) : 0);
+    if (im.pf && csa && k_cmp && m_cmp && RB < n && !ggml_backend_is_cpu(im.backend) && pf_sparse_on())   // (chunk mode never gathers: `sel` is one-token decode)
+        for (int64_t c : { (int64_t) 64, (int64_t) 32, (int64_t) 16, (int64_t) 8 })
+            if (cap >= std::max<int64_t>(4096, 2 * c * nkv_q)) { nqb = c; break; }
+    if (nqb > 0) {
+        const int64_t nk = cap + n_raw, T = (nk + 255) / 256 * 256;
+        ggml_tensor * kall = ggml_concat(gc, k_cmp, k_raw, 2);                      // [DH, 1, nk]
+        if (T > nk) {
+            if (T > 65535) {   // ggml-cuda's pad kernel puts ne2 in gridDim.z (<= 65535): pad the flat buffer
+                ggml_tensor * k1 = ggml_reshape_1d(gc, kall, ggml_nelements(kall));
+                k1 = ggml_pad(gc, k1, (int) ((T - nk) * DH), 0, 0, 0);
+                kall = ggml_reshape_3d(gc, k1, DH, 1, T);
+            } else {
+                kall = ggml_pad(gc, kall, 0, 0, (int) (T - nk), 0);
+            }
+        }
+        ggml_tensor * kf = ggml_cast(gc, ggml_permute(gc, kall, 0, 2, 1, 3), GGML_TYPE_F16);   // [DH, T, 1]
+        ggml_tensor * mr = m_raw;                                                   // [n_raw, n] F16
+        if (T > nk) mr = ggml_concat(gc, m_raw, ggml_cast(gc, b.fill_f32({ T - nk, n }, NEG_INF), GGML_TYPE_F16), 0);
+        ggml_tensor * mall = ggml_concat(gc, m_cmp, mr, 0);                         // [T, n] F16, rows = queries
+        const float scale = 1.0f / std::sqrt((float) DH);
+        ggml_tensor * sinks = b.BL(il, "attn_sinks.weight");
+        auto batch = [&](int64_t t0, int64_t nq, int64_t nblk) {   // queries [t0, t0 + nq * nblk) as nblk sequences
+            ggml_tensor * q4 = ggml_view_4d(gc, q, DH, NH, nq, nblk, q->nb[1], q->nb[2], (size_t) nq * q->nb[2],
+                                            (size_t) t0 * q->nb[2]);
+            ggml_tensor * qp = ggml_permute(gc, q4, 0, 2, 1, 3);                   // [DH, nq, NH, nblk]
+            // one K for all sequences: ggml_view sizes a view as if contiguous (nblk copies would not fit in kf), so
+            // the broadcast stride is set after - ggml-cuda reads an F16 K through its strides, nb[3] = 0 included
+            ggml_tensor * k4 = ggml_view_4d(gc, kf, DH, T, 1, 1, kf->nb[1], kf->nb[2], kf->nb[2], 0);
+            k4->ne[3] = nblk;
+            k4->nb[3] = 0;
+            const size_t row = mall->nb[1];
+            ggml_tensor * m4 = ggml_view_4d(gc, mall, T, nq, 1, nblk, row, (size_t) nq * row, (size_t) nq * row,
+                                            (size_t) t0 * row);                     // contiguous rows of the mask
+            ggml_tensor * o = ggml_flash_attn_ext(gc, qp, k4, k4, m4, scale, 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(o, sinks);
+            ggml_flash_attn_ext_set_n_kv_max(o, (int32_t) nkv_q);
+            return ggml_reshape_3d(gc, o, DH, NH, nq * nblk);                       // [DH, NH, nq * nblk]
+        };
+        const int64_t nblk = n / nqb, rem = n - nblk * nqb;
+        out = batch(0, nqb, nblk);
+        if (rem) out = ggml_concat(gc, out, batch(nblk * nqb, rem, 1), 2);
+    } else if (RB >= n) {
         ggml_tensor * k_all = k_cmp ? ggml_concat(gc, k_raw, k_cmp, 2) : k_raw;
         ggml_tensor * mask  = m_cmp ? ggml_concat(gc, m_raw, m_cmp, 0) : m_raw;   // [n_raw + cap, n]
         out = attend(q, k_all, mask, n);
     } else {
+        std::vector<ggml_tensor *> outs;
         for (int64_t t0 = 0; t0 < n; t0 += RB) {
             const int64_t nb = std::min<int64_t>(RB, n - t0), nw = SWA + nb - 1;
             ggml_tensor * kb = ggml_cont(gc, ggml_view_3d(gc, k_raw, DH, 1, nw, k_raw->nb[1], k_raw->nb[2],
@@ -1075,9 +1130,17 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                                                                     (size_t) t0 * m_cmp->nb[1])), 0);
             }
             ggml_tensor * qb = ggml_view_3d(gc, q, DH, NH, nb, q->nb[1], q->nb[2], (size_t) t0 * q->nb[2]);
-            ggml_tensor * ob = attend(qb, kb, mb, nb);
-            out = out ? ggml_concat(gc, out, ob, 2) : ob;
+            outs.push_back(attend(qb, kb, mb, nb));
         }
+        // mab776: the blocks' outputs joined pairwise (a balanced tree, in order): `out = concat(out, ob)` per block
+        // copied everything so far each time - 32 blocks of a 2048 chunk moved ~4 GB a layer (nsys: concat 9 %)
+        while (outs.size() > 1) {
+            std::vector<ggml_tensor *> nx;
+            for (size_t i = 0; i + 1 < outs.size(); i += 2) nx.push_back(ggml_concat(gc, outs[i], outs[i + 1], 2));
+            if (outs.size() % 2) nx.push_back(outs.back());
+            outs.swap(nx);
+        }
+        out = outs[0];
     }
 
     // the gate's attn_raw tap: ds4_ref dumps the raw flash-attn output *before* the de-RoPE
@@ -1666,6 +1729,12 @@ static bool ovl_gather_on() {
 static int64_t raw_block_n(int64_t n) {
     static const int64_t blk = [] { const char * e = std::getenv("DS4_RAW_BLOCK"); return e ? (int64_t) std::atoi(e) : (int64_t) 64; }();
     return blk > 0 ? blk : n;
+}
+
+// mab776 DS4_PF_SPARSE (default on): prefill CSA attention at depth as one batched sparse flash-attn (build_attn)
+static bool pf_sparse_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_SPARSE"); return !e || std::atoi(e) != 0; }();
+    return on;
 }
 
 static int64_t idx_block_n(int64_t n) {
