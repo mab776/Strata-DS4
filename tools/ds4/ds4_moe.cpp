@@ -2525,6 +2525,15 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         for (int gi = 0; gi < n1g; ++gi)
             for (int r = g1_start[gi]; r < g1_start[gi + 1]; ++r)
                 g1_check_decode(im, layer, g1_e[gi], g1_tok[r], g1_parts + (size_t) r * (size_t) H);
+    // mab776 M7c, DS4_CHECK_MULTI=<layer> (diagnostic): that layer's GPU 0 rows of a multi-token pass (VRAM hits and
+    // PCIe-staged experts, several tokens per group) recomputed one entry at a time from the file's bytes and compared
+    // byte for byte (counted with DS4_CHECK_G1's decode rows, printed by close())
+    static const int check_multi = std::getenv("DS4_CHECK_MULTI") ? std::atoi(std::getenv("DS4_CHECK_MULTI")) : -1;
+    if (check_multi == (int) layer && nt > 1)
+        for (int j = 0; j < NE; ++j) {
+            const int c = cls[ent_u[j]];
+            if (c == HIT || c == PCIE) g1_check_decode(im, layer, ue[ent_u[j]], j / (int) K, gpu_parts + (size_t) j * H);
+        }
 
     // ---- per-token weighted sums, k in order (each token's rows picked once, as gpu_run) ----
     for (int t = 0; t < nt; ++t) {
@@ -3243,6 +3252,14 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
         return true;
     }
 #if defined(DS4_MOE_CUDA)
+    // mab776 M7c, DS4_MULTI_SERIAL=1 (diagnostic): a multi-token pass's experts token by token through gpu_run
+    static const bool serial = std::getenv("DS4_MULTI_SERIAL") != nullptr;
+    if (serial && nt > 1) {
+        const int64_t K = im_->g.top_k, H = im_->g.n_embd;
+        for (int t = 0; t < nt; ++t)
+            if (!gpu_run(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr, out + (size_t) t * H)) return false;
+        return true;
+    }
     return gpu_run_n(*im_, layer, nt, ids, w, x, out);
 #else
     return false;

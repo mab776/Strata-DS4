@@ -576,6 +576,10 @@ struct Server {
     // draft right, so without this only the reject path would run (= ds4_generate's DS4_VERIFY_ORACLE)
     std::vector<int> oracle;
     int corrupt_every = 0, n_fixed = 0;
+    // DS4_SERVE_TEST_FORCE=1 (with the oracle, mab776 M7c diagnostics): teacher forcing - every emitted token is the
+    // oracle's (plain and verify loops), so runs with different K follow the SAME tokens and every logits row
+    // (DS4_DUMP_TOKLOGITS) can be compared; drafts are accepted iff they equal it
+    bool force = false;
     double t_mtp_win = 0;               // ms: the MTP window over this request's prompt
     double t_mtp_all = 0;               // ms in mtp_draft_n since the request began (window + decode drafts)
     int64_t n_mtp_calls = 0;
@@ -1318,17 +1322,19 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             if (gen >= g.max_new) { finish = "length"; return true; }
             return false;
         };
-        if (il_mtp >= 0 && a.verify && g.mtp_k != 0) {
-            oracle.clear();
-            n_fixed = 0;
-            if (const char * f = std::getenv("DS4_SERVE_TEST_ORACLE")) {
-                if (std::FILE * fp = std::fopen(f, "r")) {
-                    int v = 0;
-                    while (std::fscanf(fp, "%d", &v) == 1) oracle.push_back(v);
-                    std::fclose(fp);
-                }
-                corrupt_every = std::getenv("DS4_SERVE_TEST_CORRUPT") ? std::atoi(std::getenv("DS4_SERVE_TEST_CORRUPT")) : 0;
+        oracle.clear();
+        n_fixed = 0;
+        if (const char * f = std::getenv("DS4_SERVE_TEST_ORACLE")) {
+            if (std::FILE * fp = std::fopen(f, "r")) {
+                int v = 0;
+                while (std::fscanf(fp, "%d", &v) == 1) oracle.push_back(v);
+                std::fclose(fp);
             }
+            corrupt_every = std::getenv("DS4_SERVE_TEST_CORRUPT") ? std::atoi(std::getenv("DS4_SERVE_TEST_CORRUPT")) : 0;
+        }
+        force = std::getenv("DS4_SERVE_TEST_FORCE") != nullptr && !oracle.empty();
+        auto forced = [&](int tok) { return force && gen < (int) oracle.size() ? oracle[(size_t) gen] : tok; };
+        if (il_mtp >= 0 && a.verify && g.mtp_k != 0) {
             // mab776 M7b/M7c, speculative decoding (= ds4_generate's --verify loop, with the sampler): `cur` = the newest
             // token (emitted, not yet fed) at position `pos`; dr[0..K-1] = the MTP head's guesses for pos + 1 .. pos + K
             // - dr[0] from the trunk's states (the MTP block over the positions the last pass verified), dr[j] from the
@@ -1364,7 +1370,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             t_pass = 0;
             if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(n - 1) + ": " + dense.last_error(); }
             else {
-                cur = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch);
+                cur = forced(ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch));
                 done = emit(cur, lg, nv);
                 if (g.sp.penalty_last_n > 0) hist.push_back(cur);
                 if (!done && !draft_chain(&cur, 1, n - 1)) { failed = true; ferr = "MTP draft failed: " + err; }
@@ -1388,6 +1394,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                     const float * row = lg + (size_t) j * nv;
                     last = ds4serve::verify_row(row, nv, g.sp, (uint64_t) (pos + j), hist.data(), hist.size(), scratch,
                                                 dr[(size_t) j], &acc);
+                    if (force && gen < (int) oracle.size()) { last = oracle[(size_t) gen]; acc = last == dr[(size_t) j]; }
                     if (acc) {
                         ++d_acc[(size_t) j];
                         ++accepted;
@@ -1401,7 +1408,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 if (done) break;
                 if (A == K) {          // every draft passed: row K's token for free
                     const float * row = lg + (size_t) K * nv;
-                    last = ds4serve::sample_row(row, nv, g.sp, (uint64_t) (pos + K), hist.data(), hist.size(), scratch);
+                    last = forced(ds4serve::sample_row(row, nv, g.sp, (uint64_t) (pos + K), hist.data(), hist.size(), scratch));
                     if ((done = emit(last, row, nv))) break;
                     if (g.sp.penalty_last_n > 0) hist.push_back(last);
                 }
@@ -1418,7 +1425,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 const float * lg = nullptr;
                 int nv = 0;
                 if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos - 1) + ": " + dense.last_error(); break; }
-                const int tok = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (pos - 1), hist.data(), hist.size(), scratch);
+                const int tok = forced(ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (pos - 1), hist.data(), hist.size(), scratch));
                 if (emit(tok, lg, nv)) break;   // the last token needs no forward pass
                 if (!step(tok, pos)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos) + ": " + err; break; }
                 live.push_back(tok);
