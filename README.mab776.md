@@ -168,3 +168,16 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   (DeepSeek-V4-Flash-MTP GGUF, ~5 GB, NOT on disk); stack 73's DSpark file on disk is a different, 3-block "dflash"
   drafter (block of 5, target layers 41-43) the engine does not implement. Decode already beats stack 73 WITH its
   drafter; the user-visible gap is prefill, so prefill attention / resident MMQ may deserve to go first.
+
+## Session 2026-10-10 afternoon - prefill target met, M4/M5 merged, M7b in progress (usage limit)
+- **Prefill beats stack 73 at every depth** (bench/mab776-m2/PREFILL-REPORT.md): 1018 / 970 / 752 tok/s at 8k / 127k /
+  251k vs 1011 / 843 / 693, needle 251k FOUND, decode unchanged. 8k needs `STRATA_MMQ_FP4=1` (2 MXFP4 layers on FP4 MMQ,
+  llama.cpp's arithmetic; ppl768 9.95 vs llama.cpp 9.96) - Marc to confirm; without it 968-973.
+- **M5 merged** (f5cf8d79, ds4_serve, CPU gate 34/34). **M6 not started**: port --gpu1/--vram-grow into ds4_serve, CUDA
+  build, resident chunk buffers, GPU gates (plan: bench/mab776-m2/work/m6/PLAN.md).
+- **M7b (drafter)**: MTP head downloaded (philpax DeepSeek-V4-Flash-MTP-bf16.gguf, sha ok, models/deepseek-v4-draft/mtp/).
+  Done: MTP window after chunked prefill (2f636ab5; 96 % draft acceptance at 8k code), verify passes with LRU (12432abb):
+  **8k verify 52.5 tok/s vs plain 45.3 (+16 %)**. Next: MTP experts on GPU 1 (draft 4.7 ms, 3.4 of it CPU experts; the
+  tier shrinks ~380 experts for 3.2 GB MXFP4) + Marc's sweep (peer msg 10-10): quant BF16/Q8_0/Q4_K/Q2_K x placement (a)
+  head on GPU 1 / (b) experts in pinned RAM / (c) GPU 0, net tok/s vs 45/42/41 at 8k/127k/250k; then the 2-token dense
+  pass (attention+router 18.6 vs 13.3 ms for one token - profile it with work/prof.sh).
