@@ -4,29 +4,34 @@ Fork of https://github.com/Indras-Mirror/Strata-DS4 (one developer, no releases,
 https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster than our llama.cpp stack (stack 73
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
-## STATUS 2026-10-10 evening - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+## STATUS 2026-10-10 night - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
 - **Runs**: container `strata-ds4`, image `strata-ds4:cu13` (portainer/deepseek-strata/Dockerfile: Ubuntu 24.04 +
   Python + libnccl; nothing of the engine baked in), serve/server.py + `ds4_serve` from the DEPLOY SNAPSHOT
   `models/strata-ds4/run` (bind-mounted read-only at /app; the previous one is `run.prev`). A DROP-IN for llama.cpp
   stack 73: host :8330, network alias `ds4-lcpp`, model id `deepseek-v4-flash` (+ alias `deepseek-v4-flash-strata`).
   Mode page :8500 DeepSeek tile: **llama.cpp | Strata** picks the engine (they share the port: never both).
-- **Update the engine**: build here (mab776-build.sh, BUILD_DIR=build-ds4-cu13, CUDA 13 image) ->
-  `portainer/deepseek-strata/snapshot.sh` (copies ds4_serve, serve/, the tokenizer files, the profile and
-  ds4-server.json into run/) -> restart the container (mode page Restart, or `docker restart strata-ds4`).
-  Rollback: stop it, swap run/ and run.prev/, start it. Config edits: portainer/deepseek-strata/ds4-server.json, then
-  snapshot. Stack edits: portainer/deepseek-strata/docker-compose.yml + deploy.sh (native stack via the API).
+- **Update the engine**: build here (mab776-build.sh, BUILD_DIR=build-ds4-cu13, CUDA 13 image; it applies
+  tools/ds4/patches/*.patch to ggml) -> `portainer/deepseek-strata/snapshot.sh` (copies ds4_serve, serve/, the
+  tokenizer files, the profile and ds4-server.json into run/) -> restart the container (mode page Restart, or
+  `docker restart strata-ds4`). Rollback: stop it, swap run/ and run.prev/, start it. Config-only edit: change
+  portainer/deepseek-strata/ds4-server.json and copy it to run/ (snapshot.sh would also deploy whatever is built).
 - **Engine config** (ds4-server.json): `--gpu1 1` (GPU 1 tier) `--vram-margin 9 --vram-grow 2` (elastic GPU 0 cache,
   shrunk per prompt) `--prefill-chunk 2048 --chunk-mmq --chunk-prestage` + env `STRATA_MMQ_FP4=1` (Marc: keep it)
-  `--mtp ... --mtp-device 1` (speculative decoding, the MTP head's experts on GPU 1) `--park-mib 4096` (conversation
-  parking) `--arena-gib 41`. ~42 GiB container RAM, mem_limit 50g.
-- **Measured through the server**: prefill 1,104-1,362 / 1,007 / 749 tok/s at 8k / 127k / 250k (stack 73: 1011 / 843
-  / 693); decode 55.8-59.0 / 49.7 / ~43 tok/s (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k;
-  parked chat back in 1.3-1.4 s; agent turns read only what they appended.
+  `--mtp ... --mtp-device 1 --mtp-k 2` (speculative decoding with two chained drafts for sampled requests; greedy
+  requests fall back to one, `--mtp-k-greedy` 1; a request's `strata_tune.mtp_k` wins, 0 = none) `--park-mib 4096`
+  (conversation parking) `--arena-gib 41`. ~42 GiB container RAM, mem_limit 50g.
+- **Measured through the server (10-10 night)**: prefill 1,100-1,250 / **1,297** / **1,192** tok/s at 8k / 127k / 250k
+  (stack 73: 1011 / 843 / 693); decode K=2 60-68 / **61** / **61**, K=1 56-63 / 57 / 57, plain 47 / 45 / 43 (stack 73
+  with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k; parked chat back in 1.3-1.4 s; agent turns read only what
+  they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
   WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
-- **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 prefill;
-  verify pass at 250k still 1.8x a step; serve/ fixes of Strata 0.1.42 worth taking (#984 thinking budget, #1620,
-  #1624 tool order, #1601 cgroup RAM) = a rebase-picture change, ask Marc.
+- **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 next targets
+  (250k profile of the deployed build, bench/mab776-m2/work/prof/p250k-m10c): li_mma indexer 20 % (FP8 tensor cores or
+  cp.async pipelining), HCA chunk attention ~13 % with its per-block concats (DS4_PF_HCA1 cut it but moved ppl768
+  +0.48 % - find out why), expert MMQ ~15 %, dense Q8_0 7 %; serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
+  #1624, #1601) = a rebase-picture change, ask Marc; after the RAM upgrade: Q3_K_M, the MTP Q2_K expert sweep again,
+  the 0731-aligned head again.
 
 ## Repo layout / git
 - Local clone: `~/Documents/portainer/strata-ds4`. Branch `mab776-main` = our work; `main` on the fork = upstream mirror.
@@ -264,9 +269,11 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   Acceptance by draft position (conditional) ~74-78 / 51-55 / 36-41 / 19-30 / 12-13 %; tokens per pass 1.77 / 2.1 /
   2.3 / 2.2 / 2.3; each extra verify token +3.1-4.2 ms (step 21.4 / 22.6 / 23.2 ms) = ~15 % of a step, so K=2 (vLLM's
   k=4 rule does not carry over).  Per-pass d1 acceptance looks lower for K >= 2: a selection effect (bigger passes
-  eat the easy runs, so more passes start at hard tokens) - judge by net tok/s.  **Deployed `--mtp-k 1` for now**:
-  greedy (T=0) needle runs at 240k looped more with K=2 (11/53 vs 1/45 by 18:00) although K=2's math is clean (below);
-  Marc 10-10: decide on the SAMPLED loop rate (what clients use) - trial running, K=2 goes default if it matches.
+  eat the easy runs, so more passes start at hard tokens) - judge by net tok/s.  **K=2 deployed for sampled requests,
+  greedy ones fall back to K=1** (2b733950, Marc 10-10): the greedy (T=0) 240k needle looped more with K=2 (all trials
+  11/106 vs 3/95; the last clean 60+60 run 4 vs 2) although K=2's math is clean (below); sampled - what clients use
+  (OpenHands leaves temperature to the server's 1.0, the VS Code block sends null) - 0/60 loops for both K at T=1.0
+  and T=0.6 (needles 58/60 vs 60/60).  `--mtp-k-greedy` (default 1) caps greedy requests that set no mtp_k.
 - **0731 alignment**: philpax's bf16 MTP file = the ORIGINAL V4-Flash head (avlp12's sidecar differs: linears cos
   0.995 / rel 9 % - its base was a 4-bit pack - and hc_head.fn cos 0.89).  Applied r6c_step5000 with
   tools/ds4/mtp_sidecar.py -> `models/deepseek-v4-draft/mtp/DeepSeek-V4-Flash-MTP-bf16-aligned0731-r6c.gguf` (kept;
@@ -298,3 +305,18 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   same server already differ (the expert tier's placement moves between requests; CPU and GPU expert numerics
   differ).  So outputs cannot be compared by hash across builds; correctness rests on the CPU gate, the kernels'
   standalone exact tests, and needles.
+- **M10 lean prefill masks (dfbb071c)**: a chunk's CSA layers no longer materialise the [cap, n] visibility mask
+  (repeat / add / step / log at F32, then F16 casts: ~6.6 GB per layer-chunk at 250k).  The fused indexer takes an
+  F32 [1, n] count mask (ggml patch ggml-lightning-indexer-count-mask.patch + li_mma's epilogue: kv < count -> +0 else
+  -inf) and, once every query sees >= 512 blocks, the attention mask is the F16 -inf fill with zeros at the top-k picks.
+  Same values: ppl768 9.9034 both.  Through the server: prefill 1,256 -> **1,297** at 127k, 1,133 -> **1,192** at 250k.
+  `DS4_PF_LEAN_MASK=0` = the dense masks.
+- **One-call HCA chunk attention (`DS4_PF_HCA1=1`, OFF by default)**: the CSA chunks' layout for HCA layers (one
+  flash-attn per layer-chunk instead of 32 blocks re-concatenating the compressed K): +~3 % prefill at 250k, but ppl768
+  (real text, one deterministic chunk) 9.9034 -> 9.9512 and the 8k filler NLL +0.0005 every run - not shipped until
+  the cause is known.  For scale: chunks of 64 instead of 2048 move ppl768 to 10.0335 (code-path numerics, ~1 %), and
+  the chunk path itself varies run to run (8k NLL 0.03281-0.03313).
+- **Profile of the deployed build** (250k prefill window, p250k-m10c): matmuls 28.8 % (expert MMQ ~15 %, dense Q8_0
+  7.3 %), li_mma 20.3 %, flash-attn 15.0 % (CSA sparse 7.2 %, HCA blocked 6.0 %), elementwise 14.3 %, copies 12.7 %
+  (HCA's per-block concats 4.6 %, transposes 2.5 %), expert-tier moves 7.4 %, radix top-k 1.5 %.
+

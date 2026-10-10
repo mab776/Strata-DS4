@@ -31,7 +31,9 @@ at long context:
   - chunked prefill (2,048 tokens) on MMQ, with FP4 MMQ for the MXFP4 layers;
   - a tensor-core lightning indexer (`tools/ds4/patches/ggml-lightning-indexer-mma.patch`);
   - a radix-select top-k (`tools/ds4/patches/ggml-topk-radix-select.patch`). The radix select is 10× faster than
-    sorting every row, and it also made verify passes almost flat in depth.
+    sorting every row, and it also made verify passes almost flat in depth;
+  - lean masks for the compressed layers: the indexer takes per-query visible counts
+    (`tools/ds4/patches/ggml-lightning-indexer-count-mask.patch`) instead of a dense 65k × 2k visibility mask.
 
 ## How fast is it?
 
@@ -43,20 +45,21 @@ llama-fit-params, plus the DSpark Q2_K drafter (experts in RAM, n = 3).
 
 All numbers are tok/s, measured through the HTTP API: code generation, 512 tokens, greedy.
 
-| context | prefill, Strata-DS4 | prefill, llama.cpp | decode K=1 / K=2, Strata-DS4 | decode, llama.cpp |
+| context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
-| 8k   | 1,100-1,250 | 1,011 | 56-63 / 60-68 | 40.8 |
-| 127k | **1,256**   | 843   | 56 / **61-64** | 39.0 |
-| 250k | **1,133**   | 693   | 56 / **60**    | ~36 |
+| 8k   | 1,100-1,250 | 1,011 | 60-68 / 56-63 | 40.8 |
+| 127k | **1,297**   | 843   | **61** / 57    | 39.0 |
+| 250k | **1,192**   | 693   | **61** / 57    | ~36 |
 
-- **Without drafts**, decode is 47 / 44 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
+- **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
   tokens on average.
-- **Default is K=1 for now.** In greedy (temperature 0) needle runs at 240k, K=2 fell into repetition loops more
-  often (7 of 46 vs 1 of 35, p ≈ 0.07). Its rows differ from plain decoding by KL ≈ 0.001 (diffuse kernel numerics,
-  no position pattern). A larger trial decides; a request can ask for K=2 with `strata_tune`.
-- **Needle in a haystack:** the code word was found at 240k tokens (depths 10 / 50 / 90 %). One caveat: greedy
-  decoding sometimes talks itself into a repetition loop ("But wait… let me check…") after finding the word. The
-  default sampling (temperature 1.0, min_p 0.05) is the remedy.
+- **K=2 for sampled requests, K=1 for greedy ones.** Clients normally sample. In sampled needle runs at 240k (T=1.0
+  and T=0.6, 60 per K) neither K ever looped. In greedy (temperature 0) runs, K=2 fell into repetition loops a little
+  more often (11/106 vs 3/95). Teacher-forced checks show K=2's logits are as close to plain decoding as plain decoding
+  is to itself, with or without rejected drafts. Greedy requests therefore fall back to one draft (`--mtp-k-greedy`).
+- **Needle in a haystack:** 3/3 at 240k tokens (depths 10 / 50 / 90 %). One caveat: greedy decoding occasionally
+  talks itself into a repetition loop ("But wait… let me check…") after finding the word. The default sampling
+  (temperature 1.0, min_p 0.05) avoids it.
 - **Draft depth sweep** (K = drafts per pass, before the top-k kernel):
 
   | context | plain | K=1 | K=2 | K=3 | K=4 | K=5 |
@@ -90,7 +93,7 @@ The engine flags that matter are all in [tools/ds4/ds4-server.json.example](tool
 | `--gpu1 1` | GPU 1 expert tier |
 | `--vram-margin 9 --vram-grow 2` | GPU 0's elastic cache |
 | `--prefill-chunk 2048 --chunk-mmq --chunk-prestage`, env `STRATA_MMQ_FP4=1` | prefill |
-| `--mtp DeepSeek-V4-Flash-MTP-bf16.gguf --mtp-device 1 --mtp-k 1` | speculative decoding (K drafts per pass) |
+| `--mtp DeepSeek-V4-Flash-MTP-bf16.gguf --mtp-device 1 --mtp-k 2` | speculative decoding (K drafts per pass; greedy requests: `--mtp-k-greedy`, default 1) |
 | `--park-mib 4096` | conversation parking |
 | `--comp-type iq4_nl --icomp-q8` | compressed KV cache |
 | `--arena-gib 41` | pinned RAM arena |
