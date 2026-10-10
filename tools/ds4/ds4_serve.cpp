@@ -120,6 +120,7 @@ struct Args {
     bool verify = false;
     bool mtp_resident = false;
     int mtp_keep = 0;
+    int mtp_device = -1;   // --mtp-device N: the MTP head's experts on GPU N (3.4 GB MXFP4) instead of the CPU
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -166,7 +167,7 @@ void usage() {
         "       [--f16-q8] [--dense-requant q4_k|q5_k|q6_k] [--route-bias F] [--vram-lru] [--arena-adapt]\n"
         "       [--arena-skip-resident] [--skip-miss T] [--seed N] [--stop id,id] [--turn-token ID] [--no-ckpt]\n"
         "       [--gpu1 N [--gpu1-gib G] [--gpu1-reserve G]] [--vram-grow G] [--park-mib MiB [--park-min tokens]]\n"
-        "       [--mtp FILE [--mtp-resident] [--mtp-keep K]]\n"
+        "       [--mtp FILE [--mtp-resident] [--mtp-keep K] [--mtp-device N]]\n"
         "  Strata's engine line protocol on stdin/stdout (serve/server.py); see the head of tools/ds4/ds4_serve.cpp.\n");
 }
 
@@ -267,6 +268,7 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--mtp") { if (!next()) return false; a.mtp = v; a.verify = true; }
         else if (k == "--mtp-resident") a.mtp_resident = true;
         else if (k == "--mtp-keep") { if (!num_i(0, 64, iv)) return false; a.mtp_keep = (int) iv; }
+        else if (k == "--mtp-device") { if (!num_i(-1, 64, iv)) return false; a.mtp_device = (int) iv; }
         else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
@@ -283,7 +285,10 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         }
     }
     if (a.model.empty()) { why = "-m model.gguf is required"; return false; }
-    if ((a.mtp_resident || a.mtp_keep > 0) && a.mtp.empty()) { why = "--mtp-resident / --mtp-keep need --mtp FILE"; return false; }
+    if ((a.mtp_resident || a.mtp_keep > 0 || a.mtp_device >= 0) && a.mtp.empty()) {
+        why = "--mtp-resident / --mtp-keep / --mtp-device need --mtp FILE";
+        return false;
+    }
     if (a.ctx <= 0) { why = "--ctx N (or --max-context N) is required"; return false; }
     if (a.backend != "cuda" && a.backend != "cpu") { why = "--backend cuda|cpu"; return false; }
     if (a.experts != "gpu" && a.experts != "cpu") { why = "--experts gpu|cpu"; return false; }
@@ -558,6 +563,8 @@ struct Server {
     std::vector<int> oracle;
     int corrupt_every = 0, n_fixed = 0;
     double t_mtp_win = 0;               // ms: the MTP window over this request's prompt
+    double t_mtp_all = 0;               // ms in mtp_draft_n since the request began (window + decode drafts)
+    int64_t n_mtp_calls = 0;
     std::vector<Parked> parked;      // mab776 M6: conversations in host RAM (--park-mib)
     size_t park_used = 0;
     int64_t park_tick = 0;
@@ -657,6 +664,27 @@ bool Server::init(std::string & why) {
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     if (!dense.init(a.model, dc, err)) { why = "dense init: " + err; return false; }
     if (!dense.reserve_graphs(a.verify ? 2 : 1)) { why = dense.last_error(); return false; }
+    // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's routed experts - on the CPU, or on GPU --mtp-device.
+    // On a GPU they go in NOW, before GPU 0's cache is sized from its free VRAM and before GPU 1's tier is filled, so
+    // the tier that card holds is what gives the room up (Marc's placement sweep: 1 = GPU 1, 0 = GPU 0)
+    auto init_mtp = [&]() -> bool {
+        il_mtp = dense.mtp_layer();
+        if (il_mtp < 0) return true;
+        mtp_x.keep = a.mtp_keep;
+        mtp_x.device = a.mtp_device;
+        if (!mtp_x.init(a.mtp, il_mtp, dense.geom().n_embd, dense.geom().n_expert_used,
+                        (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err,
+                        a.mtp_resident)) {
+            why = err;
+            return false;
+        }
+        std::fprintf(stderr, "MTP head: layer %d from %s (experts on %s, MXFP4%s%s)\n", il_mtp, a.mtp.c_str(),
+                     a.mtp_device >= 0 ? ("GPU " + std::to_string(a.mtp_device)).c_str() : "the CPU",
+                     a.mtp_resident && a.mtp_device < 0 ? ", resident" : "",
+                     a.mtp_keep > 0 ? (", keep " + std::to_string(a.mtp_keep)).c_str() : "");
+        return true;
+    };
+    if (a.mtp_device >= 0 && !init_mtp()) return false;
 
     // = ds4_generate.cpp:252-298 @b588dbd1 (M1: byte-sized slots auto) - verbatim but for return values / the name
     double slot_gib_auto = 0.0;   // mab776: the auto cache budget in GiB when blob sizes differ per layer
@@ -758,19 +786,7 @@ bool Server::init(std::string & why) {
                      tier.gpu1_device(), (long long) tier.resident1(), tier.gpu1_gib(), tier.gpu1_seed_s());
     // mab776 M6: between requests the cache is grown (decode's budget); a prompt that runs chunks shrinks it first
     if (a.vram_grow >= 0 && tier.grow_cache(a.vram_grow, err, true) < 0) { why = err; return false; }
-    // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's experts on the CPU
-    il_mtp = dense.mtp_layer();
-    if (il_mtp >= 0) {
-        mtp_x.keep = a.mtp_keep;
-        if (!mtp_x.init(a.mtp, il_mtp, dense.geom().n_embd, dense.geom().n_expert_used,
-                        (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err,
-                        a.mtp_resident)) {
-            why = err;
-            return false;
-        }
-        std::fprintf(stderr, "MTP head: layer %d from %s (experts on the CPU, MXFP4%s%s)\n", il_mtp, a.mtp.c_str(),
-                     a.mtp_resident ? ", resident" : "", a.mtp_keep > 0 ? (", keep " + std::to_string(a.mtp_keep)).c_str() : "");
-    }
+    if (a.mtp_device < 0 && !init_mtp()) return false;
 
     // = ds4_generate.cpp:333-359 @b588dbd1 (the step buffers)
     n_layer = (int) dense.n_layer();
@@ -853,12 +869,17 @@ bool Server::step_n(const int * toks, int n, int pos0) {
 // = ds4_generate.cpp mtp_draft_n (mab776 M7b): the MTP block at positions pos0..pos0+n-1 (the decode state's last pass
 // rows) with the tokens that follow them -> the last position's argmax, the draft for pos0 + n + 1
 bool Server::mtp_draft_n(const int * next, int n, int pos0, int * draft) {
+    struct Timer { Server & s; double t0; ~Timer() { s.t_mtp_all += now_ms() - t0; ++s.n_mtp_calls; } } tm{ *this, now_ms() };
     const float * x = nullptr;
     if (!dense.mtp_begin(next, n)) { err = dense.last_error(); return false; }
     if (!dense.attn_router_n(il_mtp, pos0, n, mids.data(), mw.data(), &x)) { err = dense.last_error(); return false; }
-    for (int t = 0; t < n; ++t)
-        if (!mtp_x.run(x + (size_t) t * n_embd, mids.data() + t * top_k, mw.data() + t * top_k,
-                       mrouted.data() + (size_t) t * n_embd)) { err = "MTP experts failed"; return false; }
+    if (a.mtp_device >= 0) {   // one batched call on the GPU (the CPU keeps its per-token graph: the verified one)
+        if (!mtp_x.run_n(x, mids.data(), mw.data(), mrouted.data(), n)) { err = "MTP experts failed"; return false; }
+    } else {
+        for (int t = 0; t < n; ++t)
+            if (!mtp_x.run(x + (size_t) t * n_embd, mids.data() + t * top_k, mw.data() + t * top_k,
+                           mrouted.data() + (size_t) t * n_embd)) { err = "MTP experts failed"; return false; }
+    }
     if (!dense.finish_layer_n(il_mtp, n, mrouted.data())) { err = dense.last_error(); return false; }
     const float * lg = nullptr;
     int nv = 0;
@@ -1175,6 +1196,8 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
     // mab776 M7b: the MTP window = the positions the first drafts attend to, of those this request reads
     const int W = il_mtp >= 0 ? std::max(R, n - 1 - (int) dense.geom().n_swa) : INT32_MAX;
     t_mtp_win = 0;
+    t_mtp_all = 0;
+    n_mtp_calls = 0;
     drafts = accepted = 0;
     auto pp = [&](int pos) {
         const double ms = now_ms() - t0;
@@ -1363,10 +1386,10 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         std::snprintf(read_txt, sizeof read_txt, "%d", n - R);
     int nck = 0;
     for (int s = 0; s < slots_ck; ++s) nck += ck[s].pos > 0;
-    char dtxt[96] = "";
+    char dtxt[128] = "";
     if (il_mtp >= 0)
-        std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted, MTP window %.0f ms", (long long) accepted,
-                      (long long) drafts, t_mtp_win);
+        std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted, MTP window %.0f ms, %.2f ms/draft", (long long) accepted,
+                      (long long) drafts, t_mtp_win, drafts > 0 ? (t_mtp_all - t_mtp_win) / (double) drafts : 0.0);
     std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s; cache shrink %.0f + "
                          "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s; live %zu, %d checkpoints [last %d, "
                          "turn %d, user %d]\n",
