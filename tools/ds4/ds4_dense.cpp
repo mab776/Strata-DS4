@@ -139,7 +139,8 @@ bool f16_q8_target(const std::string & n) {
 
 bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, bool skip_experts, int requant,
                   std::string & err, const std::string & prefix = "",
-                  const std::map<std::string, std::string> & alias = {}, bool f16_q8 = false) {
+                  const std::map<std::string, std::string> & alias = {}, bool f16_q8 = false,
+                  const std::map<std::string, uint32_t> * want_type = nullptr) {
     if (!w.ctx) {
         ggml_init_params ip = { /*mem_size*/ 256ull * 1024 * 1024, /*mem_buffer*/ nullptr, /*no_alloc*/ true };
         w.ctx = ggml_init(ip);
@@ -191,6 +192,12 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
             int64_t ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
             for (size_t d = 0; d < ti.shape.size() && d < GGML_MAX_DIMS; ++d) ne[d] = (int64_t) ti.shape[d];
             ggml_type ty = (ggml_type) ti.type;
+            // mab776: a file with another quant mix (unsloth UD-*) - dense tensors take the type this engine's graphs
+            // and fused kernels were written for (converted below by the requantize path); experts keep theirs
+            if (want_type && !is_routed_expert(ti.name)) {
+                auto wt = want_type->find(ti.name);
+                if (wt != want_type->end() && (int) wt->second != (int) ty) ty = (ggml_type) wt->second;
+            }
             if (requant >= 0 && (ty == GGML_TYPE_Q8_0 || ty == GGML_TYPE_BF16) && requant_target(ti.name) &&
                 ne[0] % ggml_blck_size((ggml_type) requant) == 0)
                 ty = (ggml_type) requant;
@@ -229,7 +236,10 @@ bool load_weights(const GgufModel & model, ggml_backend_t backend, WStore & w, b
                 th.emplace_back([&, k] {
                     std::vector<float> f((size_t) n0);
                     for (int64_t r = k; r < nr; r += nth) {
-                        ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
+                        if (ti.type == GGML_TYPE_F32)   // mab776: F32 has no to_float (unsloth's F32 hc mixers)
+                            std::memcpy(f.data(), src + (size_t) r * src_row, (size_t) n0 * sizeof(float));
+                        else
+                            ggml_get_type_traits((ggml_type) ti.type)->to_float(src + (size_t) r * src_row, f.data(), n0);
                         ggml_quantize_chunk(t->type, f.data(), dst.data() + (size_t) r * dst_row, 0, 1, n0, nullptr);
                     }
                 });
@@ -1273,8 +1283,11 @@ bool Ds4Dense::init(const std::string & model_path, const Ds4DenseConfig & cfg, 
     if (im.model->size() == 0) { err = "cannot open " + model_path; return false; }
     if (!(err = ds4_read_geometry(*im.model, im.g)).empty()) return false;
     if (!(err = check_ds4_model(*im.model, im.g)).empty()) return false;
+    std::map<std::string, uint32_t> want_type;
+    for (const auto & sp : ds4_expected_tensors(im.g)) want_type[sp.name] = sp.type;
     if (!load_weights(*im.model, im.backend, im.w, cfg.skip_routed_experts,
-                      ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err, "", {}, cfg.f16_q8)) return false;
+                      ggml_backend_is_cpu(im.backend) ? -1 : cfg.requant_type, err, "", {}, cfg.f16_q8,
+                      &want_type)) return false;
     im.n_trunk = im.g.n_layer();
     if (!cfg.mtp_path.empty()) {   // the MTP head: its own GGUF, block blk.<n_trunk>
         im.mtp_model = std::make_unique<GgufModel>(GgufModel::open(cfg.mtp_path));

@@ -40,6 +40,21 @@ constexpr uint32_t IQ2_XXS = 16;
 constexpr uint32_t I32 = 26;
 }  // namespace ds4_type
 
+/// mab776: file types a tensor may have instead of the expected one - float and block-quant types ggml can
+/// dequantize (ds4_dense converts dense tensors to the expected type at load; routed experts keep theirs).
+inline bool ds4_type_convertible(uint32_t t) {
+    switch (t) {
+        case 0: case 1: case 30:                                   // F32 F16 BF16
+        case 2: case 3: case 6: case 7: case 8:                    // Q4_0 Q4_1 Q5_0 Q5_1 Q8_0
+        case 10: case 11: case 12: case 13: case 14:               // Q2_K .. Q6_K
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29:   // IQ*
+        case 39:                                                   // MXFP4
+            return true;
+        default:
+            return false;
+    }
+}
+
 /// The DSV4 geometry.  Field names track `llama-hparams`' DSV4 fields (docs/ds4/DSV4_ARCH_SPEC.md s1.1) so a
 /// value can be traced both ways; every one is read from a key by `ds4_read_geometry`.
 struct Ds4Geometry {
@@ -212,7 +227,12 @@ inline std::string ds4_read_geometry(const GgufModel& model, Ds4Geometry& out) {
     if (!(err = ds4_want_f64(g, "deepseek4.rope.scaling.yarn_beta_slow", out.yarn_beta_slow)).empty()) return err;
     if (!(err = ds4_want_f64(g, "deepseek4.attention.compress_rope_freq_base", out.compress_rope_base)).empty()) return err;
 
-    if (!(err = ds4_want_u64(g, "deepseek4.vocab_size", u)).empty()) return err;
+    if (!(err = ds4_want_u64(g, "deepseek4.vocab_size", u)).empty()) {
+        // unsloth's GGUFs carry no deepseek4.vocab_size; llama.cpp takes n_vocab from the tokenizer then
+        const MetaValue* t = g.get("tokenizer.ggml.tokens");
+        if (err.rfind("missing ", 0) != 0 || !t || t->type != MetaType::ARRAY || t->count == 0) return err;
+        u = t->count;
+    }
     out.vocab_size = (int64_t)u;
     if (!(err = ds4_want_u64(g, "deepseek4.context_length", u)).empty()) return err;
     out.context_length = (int64_t)u;
@@ -239,7 +259,11 @@ inline std::string ds4_read_geometry(const GgufModel& model, Ds4Geometry& out) {
     }
     if (out.swiglu_clamp_shexp.empty()) out.swiglu_clamp_shexp = out.swiglu_clamp_exp;
 
-    if (!(err = ds4_want_u64(g, "deepseek4.nextn_predict_layers", u)).empty()) return err;
+    if (!(err = ds4_want_u64(g, "deepseek4.nextn_predict_layers", u)).empty()) {
+        // unsloth's GGUFs ship the MTP/DSpark head as a separate file and omit the key: no nextn blocks
+        if (err.rfind("missing ", 0) != 0) return err;
+        u = 0;
+    }
     out.n_layer_nextn_requested = (int64_t)u;
     out.n_layer_nextn = 0;
     if (out.n_layer_nextn_requested > 0 && out.n_layer_nextn_requested < out.n_layer_all) {
@@ -415,7 +439,9 @@ inline std::string check_ds4_model(const GgufModel& model, const Ds4Geometry& g)
                 if (t.shape[d] != w.shape[d])
                     return "tensor '" + t.name + "' dim " + std::to_string(d) + " = " + std::to_string(t.shape[d]) +
                            ", expected " + std::to_string(w.shape[d]);
-            if (t.type != w.type)
+            // mab776: other quant mixes (unsloth UD-*) load too - routed experts keep their file type (the MoE tier
+            // checks it has a kernel per layer), dense tensors are converted to w.type at load (ds4_dense load_weights)
+            if (t.type != w.type && !ds4_type_convertible(t.type))
                 return "tensor '" + t.name + "' is " + ggml_type_name(t.type) + ", expected " +
                        ggml_type_name(w.type);
             if (!model.in_bounds(t, sh))
