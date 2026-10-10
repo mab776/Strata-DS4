@@ -1,0 +1,15 @@
+== B2-8k-code1-skip: 2026-10-09 22:41:10 MEM 46g ARENA 40 SKIP 1 CHUNK 4096 PCIE 0.55 build-ds4-cu13 
+context cap 262144 tokens
+slots auto: 38.99 GiB free after the dense half -> 36.99 GiB of expert slots (margin 2.00 GiB; expert 7.19-9.38 MiB -> 4040-5270 experts)
+tier: gpu, 0 resident slots, arena 40.0 GiB (5636 experts), file tier 75; load 62.7 s
+chunk prof: 129 calls, 3374 launches: wall 35566 ms = waits on reads 29712 + wave/copy waits 0 + final sync 4704 + other host 1150; reader wall 29888 ms; GPU grouped kernels 8448 ms (resident 0); file tier 76.6 GB read in 29853 ms of reader time = 2.57 GB/s
+prefill chunks of 4096: dense 6085 ms (attention+router 5955, finish 130), experts 35567 ms, head/ppl 23 ms, cache seed 15246 ms -> 5217 resident slots
+prefill: 8234 tokens in 57.47 s = 143.27 tok/s (chunked)
+decode : 512 tokens, 511 forward passes in 15.58 s = 32.80 tok/s
+experts/token: hit 89.1% (prefetched-useful 9.1/token of 27.9 issued), cpu 5.2%, pcie 5.7%, file tier 757
+tier moves: vram_lru swaps 3.77/pass (demoted 1929), arena swaps 0, file reads 5.60 ms/pass
+decode ms/token: predict+prefetch 1.45, attention+router 13.44, experts 13.81, finish 1.12, head 0.50
+tier ms/token: wall 13.80 (gpu hits 2.33, pcie 3.04, cpu pool 7.13)
+VRAM free at the end: 1.51 GiB (calibrates --vram-margin)
+exit=0 oom=false wall=139s
+peak VmHWM 44.1 GiB, cgroup peak 46.0 GiB, min host avail 11.1 GiB, peak VRAM 46857 MiB
