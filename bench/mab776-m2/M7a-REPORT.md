@@ -28,6 +28,9 @@ order). Host RAM cap MEM 42g (arena cap 36) - 4 GiB LESS than the M2 runs had (4
   (ppl768 chunked). A plain on/off ppl A/B cannot show it on this box: without GPU 1 the arena cannot hold every
   non-VRAM expert under the RAM rule, and file-tier experts are computed on the CPU (Q8_K) instead of the GPU (q8_1).
 - ppl768 (same ids as M2): decode loop **9.8654** (M2 9.8681), chunked + MMQ **9.8678** (M2 9.8967); llama.cpp 9.9624.
+- Needle at 251,199 tokens, 50 % depth: **FOUND** ("falcon-quartz-940" after a 283-char think; prefill 323 tok/s vs
+  M2's 267, decode 38.3 tok/s over the 78-token answer). The 10 % / 90 % needles were not re-run: GPU-1 rows are
+  byte-identical to GPU 0's, so placement cannot change what attention sees.
 
 ## Results (code1)
 
