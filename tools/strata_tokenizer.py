@@ -12,6 +12,11 @@ offset for a byte, a merge applied in the wrong order, a pre-tokenizer split tha
 produces plausible token ids.  `decode(encode(s)) == s` is the check that sees them, and it is exact because
 the byte layer is lossless.  It is asserted over a corpus chosen to hit the boundaries: multi-byte UTF-8,
 emoji (4-byte), combining marks, whitespace runs, and C0 control bytes.
+
+mab776 merge (Strata v0.1.41 fb58e0db + Strata-DS4 85c3eab3): v0.1.41's file (piece cache, #1385 `_bpe`,
+`control_tokens`) with DS4's `joyai-llm` pre-tokenizer (`JOYAI_LLM_PATTERNS`, `PRE_PATTERNS`, `_pre_split`) for
+DeepSeek-V4-Flash; plus `from_dir()` (the pack's own `pre`, as Project Maya #27 does for GLM), special tokens
+decoding to their own text (llama.cpp's token_to_piece), and `extract()` writing the patterns of the actual `pre`.
 """
 from __future__ import annotations
 
@@ -83,9 +88,14 @@ JOYAI_LLM_PATTERNS = [
 ]
 
 # pre type -> the pattern list llama.cpp applies, in order.  The `pre` string in GGUF metadata selects it.
+# mab776: llama.cpp's case for joyai-llm also covers deepseek-v3, hunyuan-dense and hy_v4 (llama-vocab.cpp
+# L319-327, pinned 3cf03257: same three regexes, none sets ignore_merges, all clean_spaces=false).
 PRE_PATTERNS = {
     "qwen35": [QWEN35_PATTERN],
     "joyai-llm": JOYAI_LLM_PATTERNS,
+    "deepseek-v3": JOYAI_LLM_PATTERNS,
+    "hunyuan-dense": JOYAI_LLM_PATTERNS,
+    "hy_v4": JOYAI_LLM_PATTERNS,
 }
 
 
@@ -134,6 +144,7 @@ class Tokenizer:
                 if ty in (3, 4):
                     self.special_tokens[tokens[i]] = i
         always = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 4]
+        self.control_tokens = [t for t, i in self.special_tokens.items() if token_types and token_types[i] == 3]
         # Longest literal first, or `<|im_end|>` could match a shorter prefix of itself.  `regex.escape` so a
         # token containing regex metacharacters (several do: `<|`, `[`, `(`) is matched literally.
         self._always_re = self._alt(always)
@@ -146,6 +157,22 @@ class Tokenizer:
         return regex.compile("|".join(regex.escape(s) for s in sorted(literals, key=len, reverse=True)))
 
     # -------------------------------------------------------------- constructors
+    @classmethod
+    def from_dir(cls, path) -> "Tokenizer":
+        """mab776: a pack's tokenizer/ directory (extract() below) WITH the pre-tokenizer and special ids its
+        tokenizer.json names.  Built as Tokenizer(tokens, merges, types) - what serve/server.py did - a DeepSeek
+        pack gets the qwen35 split (one digit a token, no Han/kana cut), the bug Project Maya #27 hit for GLM.
+        No tokenizer.json (never written by extract): qwen35, as before."""
+        t = pathlib.Path(path)
+        vocab = json.loads((t / "vocab.json").read_text(encoding="utf-8"))
+        tokens = [None] * len(vocab)
+        for s, i in vocab.items():
+            tokens[i] = s
+        meta = json.loads((t / "tokenizer.json").read_text(encoding="utf-8")) if (t / "tokenizer.json").exists() else {}
+        types = json.loads((t / "token_type.json").read_text()) if (t / "token_type.json").exists() else None
+        return cls(tokens, (t / "merges.txt").read_text(encoding="utf-8").split("\n"), types,
+                   meta.get("pre", "qwen35"), meta.get("special_ids") or None)
+
     @classmethod
     def from_gguf(cls, path) -> "Tokenizer":
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -177,11 +204,16 @@ class Tokenizer:
         """
         if len(word) > self.HEAP_MIN:
             return self._bpe_heap(word)
+        # `self` is read ONCE, here.  #1385: an interpreter (CPython 3.14.4) was seen handing this frame an int
+        # for `self` partway through the scan (`'int' object has no attribute 'ranks'`).  Nothing in this class
+        # can do that (no cache, decorator, slots or callback; a thread hammering test cannot make it happen),
+        # so the scan below works on a local and no longer re-reads `self` once per symbol pair.
+        ranks_get = self.ranks.get
         parts = list(word)
         while len(parts) > 1:
             best, best_rank = None, None
             for i in range(len(parts) - 1):
-                r = self.ranks.get((parts[i], parts[i + 1]))
+                r = ranks_get((parts[i], parts[i + 1]))
                 if r is not None and (best_rank is None or r < best_rank):
                     best, best_rank = i, r
             if best is None:
@@ -250,15 +282,26 @@ class Tokenizer:
             spans = nxt
         return [text[a:b] for a, b in spans]
 
+    PIECE_CACHE_MAX = 200_000    # pre-tokenizer pieces remembered (an agent resends its whole history every turn)
+
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
+        # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
+        # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
+        cache = self.__dict__.setdefault("_piece_ids", {})
         for piece in self._pre_split(text):
-            mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
-            for tok in self._bpe(mapped):
-                i = self.ids.get(tok)
-                if i is None:
-                    raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
-                out.append(i)
+            got = cache.get(piece)
+            if got is None:
+                mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
+                got = []
+                for tok in self._bpe(mapped):
+                    i = self.ids.get(tok)
+                    if i is None:
+                        raise KeyError("BPE produced a token outside the vocabulary: %r" % tok)
+                    got.append(i)
+                if len(cache) < self.PIECE_CACHE_MAX:
+                    cache[piece] = got
+            out.extend(got)
         return out
 
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
@@ -295,12 +338,19 @@ class Tokenizer:
         return self._encode_matching(text, self._special_re if parse_special else self._always_re, plain)
 
     def token_bytes(self, i: int) -> bytes:
-        """The raw bytes of one token (a multi-byte character can be split across tokens)."""
+        """The raw bytes of one token (a multi-byte character can be split across tokens).
+
+        mab776: a special token (type 3/4) is its own text, as llama.cpp's token_to_piece gives it - DeepSeek's
+        `<｜end▁of▁sentence｜>` and `｜DSML｜` hold characters outside the byte alphabet and raised KeyError here.
+        Qwen's specials are printable ASCII, which the byte alphabet maps to itself: their bytes do not change."""
         cache = self.__dict__.setdefault("_bytes_cache", {})
         b = cache.get(i)
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.token_types and self.token_types[i] in (3, 4):
+                b = cache[i] = self.tokens[i].encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)
@@ -320,17 +370,28 @@ def extract(gguf_path, out_dir) -> dict:
     out = pathlib.Path(out_dir) / "tokenizer"
     out.mkdir(parents=True, exist_ok=True)
     tk = Tokenizer.from_gguf(gguf_path)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    from gguf_reader import GGUFFile
+    md = GGUFFile(pathlib.Path(gguf_path)).metadata
+    pats = PRE_PATTERNS[tk.pre]
     cfg = {
         "model": "gpt2",
         "pre": tk.pre,
         "vocab_size": len(tk.tokens),
         "n_merges": len(tk.ranks),
         "special_ids": tk.special_ids,
-        "add_bos_token": False,
+        # mab776: the GGUF's own flag (DeepSeek-V4-Flash: False, its chat template writes bos_token itself)
+        "add_bos_token": bool(md.get("tokenizer.ggml.add_bos_token", False)),
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        # mab776: the patterns of THIS pre, applied in order (joyai-llm: three; qwen35: one).
+        "pre_patterns": list(pats),
+        "pre_pattern": pats[0] if len(pats) == 1 else None,
+        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"
+                               if tk.pre == "qwen35" else
+                               "llama.cpp 3cf03257 src/llama-vocab.cpp L319-327 (LLAMA_VOCAB_PRE_TYPE_%s; three "
+                               "regexes applied in sequence, unicode.cpp unicode_regex_split)"
+                               % tk.pre.upper().replace("-", "_")),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in
@@ -338,9 +399,7 @@ def extract(gguf_path, out_dir) -> dict:
     (out / "token_type.json").write_text(json.dumps(tk.token_types), encoding="utf-8")
     (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     # the model's own chat template: fine-tunes change it (Swift 1.5 differs from Qwen3.8-Flash-Next's)
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    from gguf_reader import GGUFFile
-    tpl = GGUFFile(pathlib.Path(gguf_path)).metadata.get("tokenizer.chat_template")
+    tpl = md.get("tokenizer.chat_template")
     if tpl:
         (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
     return cfg
