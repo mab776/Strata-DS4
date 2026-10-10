@@ -69,6 +69,11 @@ struct Ds4DenseConfig {
     /// The compressed-row K cache in pinned host RAM, read zero-copy over PCIe (CUDA only; s22 (e)).  Decode gathers a
     /// fixed top-512 rows per CSA layer, so the cost is constant in the context; the VRAM goes to the expert cache.
     bool           comp_host = false;
+    /// mab776 (M5, tools/ds4/ds4_serve.cpp): ring snapshots for a server's prompt reuse - this many slots, each a copy
+    /// of every layer's position-indexed rings (raw window, compressor and indexer states; ~23.5 MiB on the real
+    /// model), allocated by init() on the backend's default buffer type, so a caller that sizes its caches from the
+    /// free memory after init() has already paid for them.  0 = none (snapshot() then refuses).
+    int            snapshot_slots = 0;
 };
 
 /// One-token decode of the DS4 dense half.  Not thread-safe; one instance decodes one sequence.
@@ -174,6 +179,27 @@ public:
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;
+
+    // ---- sequence state (mab776 M5: a resident server's prompt reuse, tools/ds4/ds4_serve.cpp) ----
+    // The decode state is position-indexed, so "the state holds positions [0, pos)" is all a caller tracks:
+    //   - appending positions pos.. continues it (nothing to do);
+    //   - redoing the last K <= max_tokens() positions is exact (every ring is max_tokens() - 1 slots longer than its
+    //     gather window, so nothing a redone position reads was overwritten);
+    //   - anything further back needs a snapshot taken at or before the target.
+    /// Back to the state of a fresh init: the compressor / indexer score rings re-seeded with SENTINEL, the raw window
+    /// and the state rings zeroed, the host input caches dropped and every snapshot emptied.  The compressed rows
+    /// (comp / icomp) keep stale rows: a row is invisible until its block completes, and completing it rewrites it.
+    /// The weights and the constants that share the state buffer (rot, neg_ramp, i_idx_all) are untouched.
+    void   reset();
+    /// Copy every ring into snapshot slot `slot`; `pos` = the positions the state holds ([0, pos)).  It stays exact
+    /// while every later write lands at positions >= pos: a compressed row is written only by its own block's
+    /// positions, so the rows below pos never change.  False (nothing copied) for a slot init() did not allocate.
+    bool   snapshot(int pos, int slot = 0);
+    /// Copy slot `slot` back (false when it is empty); the next pass uploads its inputs again.
+    bool   restore(int slot = 0);
+    int    snapshot_pos(int slot = 0) const;   ///< the positions slot `slot` holds, -1 = empty / no such slot
+    size_t snapshot_bytes() const;             ///< bytes of one slot
+    int    snapshot_slots() const;
 
     const std::string & last_error() const;
 
