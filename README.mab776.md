@@ -101,3 +101,13 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   ppl768 (BOS + p600 + p3000[:167]): llama.cpp 9.9624; DS4 decode-loop 9.8681 (-0.95 %), chunked w/o MMQ 9.8737 (-0.89 %).
   ⚠️ --chunk-mmq gives NaN ppl on our file (MMQ path, our types) -> run chunked prefill WITHOUT --chunk-mmq (fix later).
 - NEXT: B2-B4 (8k / 127k code prompts, MMQ=0, full RAM) = the go/no-go number; then 250k code + needles x3; then STOP.
+
+## Marc's decisions 2026-10-09 ~23:55 (before leaving the session unattended) - binding for the next steps
+- GPU 0+1 may be used whenever the mode page is "off" (also at night), short test runs only (no LCB/SWE nights);
+  every run checks first and refuses if anything holds the GPUs; never press the mode page, never touch stacks 67/72/73,
+  restore nothing, keep >= 8 GiB host RAM free.
+- M2 gate (corrected via the DeepSeek-V4-Flash session): like-for-like vs stack 73 WITHOUT drafter (28.0/25.0/22.3 decode,
+  1011/843/693 prefill); hard stop only on correctness. M2 = GO if the 3 needles at 251k pass (ppl and decode already pass).
+- Order after M2 (Marc, M7 first): M7a = GPU 1 (16 GB) as an extra expert tier to remove the disk reads (re-measure the M2
+  table), then M7b DSpark drafter on GPU 1, then prefill attention; M4 (serve/deepseek.py) and M5 (tools/ds4/ds4_serve.cpp)
+  on CPU in parallel. Still ask Marc before M8 (Portainer/mode page) and anything public beyond pushing mab776-main.
