@@ -127,6 +127,9 @@ struct Args {
     // mab776 M7c: --mtp-k K = K chained drafts per verify pass (the head fed its own output for drafts 2..K), one pass
     // of K + 1 tokens; a request's `mtp_k` key overrides it.  1 = M7b's single draft.
     int mtp_k = 1;
+    // mab776 M7c (Marc 10-10): greedy (temperature 0) requests that set no mtp_k draft --mtp-k-greedy (default 1):
+    // greedy needle runs at 240k looped more often with 2 chained drafts (11/106 vs 3/95), sampled ones never did
+    int mtp_k_greedy = 1;
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -173,7 +176,7 @@ void usage() {
         "       [--f16-q8] [--dense-requant q4_k|q5_k|q6_k] [--route-bias F] [--vram-lru] [--arena-adapt]\n"
         "       [--arena-skip-resident] [--skip-miss T] [--seed N] [--stop id,id] [--turn-token ID] [--no-ckpt]\n"
         "       [--gpu1 N [--gpu1-gib G] [--gpu1-reserve G]] [--vram-grow G] [--park-mib MiB [--park-min tokens]]\n"
-        "       [--mtp FILE [--mtp-resident] [--mtp-keep K] [--mtp-device N] [--mtp-k 1..7]]\n"
+        "       [--mtp FILE [--mtp-resident] [--mtp-keep K] [--mtp-device N] [--mtp-k 1..7] [--mtp-k-greedy 1..7]]\n"
         "  Strata's engine line protocol on stdin/stdout (serve/server.py); see the head of tools/ds4/ds4_serve.cpp.\n");
 }
 
@@ -276,6 +279,7 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--mtp-keep") { if (!num_i(0, 64, iv)) return false; a.mtp_keep = (int) iv; }
         else if (k == "--mtp-device") { if (!num_i(-1, 64, iv)) return false; a.mtp_device = (int) iv; }
         else if (k == "--mtp-k") { if (!num_i(1, 7, iv)) return false; a.mtp_k = (int) iv; }
+        else if (k == "--mtp-k-greedy") { if (!num_i(1, 7, iv)) return false; a.mtp_k_greedy = (int) iv; }
         else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
@@ -1342,7 +1346,9 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             // feeds cur and the K drafts; rows 0..K-1 decide the drafts in order (ds4serve::verify_row: exact
             // speculative sampling) up to the first rejection, whose row gives the replacement token, and when all K
             // pass row K gives one more.  Counters = the rows' positions, as in plain decoding.
-            const int K = std::clamp(g.mtp_k > 0 ? g.mtp_k : a.mtp_k, 1, NT - 1);   // mtp_k=0: the plain loop below
+            // a request's own mtp_k wins; otherwise greedy requests draft at most --mtp-k-greedy (mtp_k=0: the plain loop)
+            const int K = std::clamp(g.mtp_k > 0 ? g.mtp_k
+                                     : g.sp.temperature <= 0.0f ? std::min(a.mtp_k, a.mtp_k_greedy) : a.mtp_k, 1, NT - 1);
             const float * lg = nullptr;
             int nv = 0;
             bool done = false;

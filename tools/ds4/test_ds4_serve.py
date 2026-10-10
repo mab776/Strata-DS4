@@ -1437,7 +1437,7 @@ class T8Verify(Case):
         for k in (2, 3, 5, 7):
             for c in (None, 0, 2, 3, 5):
                 with self.subTest(k=k, corrupt=c):
-                    r = self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k))
+                    r = self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k, "--mtp-k-greedy", k))
                     acc, drafted = int(r.done[6]), int(r.done[7])
                     self.assertEqual(drafted % k, 0, "drafts are offered K at a time")
                     if c == 0:   # every draft right: only the last pass may leave drafts unexamined (max_new)
@@ -1451,16 +1451,16 @@ class T8Verify(Case):
         for k in (3, 6):
             for n in (1, 2, 3, 4, 5, 7, 9):
                 with self.subTest(k=k, max_new=n):
-                    self.run_case(ids, n, corrupt=0, args=("--mtp-k", k))
+                    self.run_case(ids, n, corrupt=0, args=("--mtp-k", k, "--mtp-k-greedy", k))
             for at in (5, 6, 9):
                 for c in (0, 3):
                     with self.subTest(k=k, stop_at=at, corrupt=c):
-                        self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k), stop=(plain[at - 1],))
+                        self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k, "--mtp-k-greedy", k), stop=(plain[at - 1],))
         for n in (150, 600):
             for c in (None, 0, 3):
                 with self.subTest(n=n, corrupt=c):
                     self.run_case(prompt(n, 260 + n), 24, corrupt=c,
-                                  args=("--mtp-k", 4, "--prefill-chunk", 64, "--chunk-min", 8))
+                                  args=("--mtp-k", 4, "--mtp-k-greedy", 4, "--prefill-chunk", 64, "--chunk-min", 8))
         eng = self.eng()   # --mtp-k 1; requests ask for 4, the default, and none (plain decoding)
         try:
             for mk, want_k in (("mtp_k=4", 4), ("", 1), ("mtp_k=0", 0)):
@@ -1474,6 +1474,24 @@ class T8Verify(Case):
                 else:
                     self.assertEqual(int(r.done[7]) % want_k, 0)
                     self.assertIn(f"(K={want_k},", last, f"key {mk!r}: the log line's K")
+        finally:
+            self.assertEqual(eng.close(), 0)
+
+    def test_greedy_fallback(self):
+        """Marc 10-10: with --mtp-k 2, greedy requests (no temperature) draft once unless they set mtp_k; sampled ones
+        draft twice.  Greedy outputs stay plain greedy's either way."""
+        eng = self.eng("--mtp-k", 2)
+        try:
+            for keys, want_k, greedy in (("", 1, True), ("mtp_k=3", 3, True), ("temperature=0.8 seed=7", 2, False),
+                                         ("temperature=0.8 seed=7 mtp_k=1", 1, False)):
+                a = prompt(20, 280 + want_k + (0 if greedy else 10))
+                r = eng.gen(a, 16, keys)
+                if greedy:
+                    self.same(r, ref("tame", a, 16), f"keys {keys!r}")
+                else:
+                    self.assertIsNone(r.err)
+                last = [x for x in eng.log_text().splitlines() if "ds4_serve: prompt" in x][-1]
+                self.assertIn(f"(K={want_k},", last, f"keys {keys!r}: the log line's K")
         finally:
             self.assertEqual(eng.close(), 0)
 
