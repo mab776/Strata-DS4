@@ -354,12 +354,24 @@ public:
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
-    /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
-    void release_chunk();
+    /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).  mab776 M6:
+    /// `keep_host` keeps the pinned ones (the 2 x 1 GiB bounce halves, the summed rows), the stream and the events -
+    /// a resident server pays cudaMallocHost's page-locking once, not on every prompt.
+    void release_chunk(bool keep_host = false);
     /// mab776 M7a, elastic cache (cfg.slot_gib_max): after the prompt (release_chunk), map more of GPU 0's cache - up
     /// to its full size, leaving `keep_free_gib` of VRAM free - and fill the new slots with the next experts of the
     /// seed's ranking (arena copies, else file reads).  Returns the slots added (0 when not elastic), -1 on error.
-    int64_t grow_cache(double keep_free_gib, std::string& err);
+    /// mab776 M6: `reseed_lru` false (a server regrowing after a prompt) keeps the decode LRU's recency and files
+    /// the grown experts as its oldest entries, in rank order; true restarts it from the profile's rank (the
+    /// one-shot path, where nothing has run yet).
+    int64_t grow_cache(double keep_free_gib, std::string& err, bool reseed_lru = true);
+    /// mab776 M6, elastic cache: gives back the slots past the prompt budget (cfg.slot_gib) before a prompt's chunk
+    /// buffers need their VRAM: their experts are forgotten (each has an arena copy: the grow set stays in the arena
+    /// and an LRU swap into a grown slot never takes an arena slot away) and the segments unmapped.  Returns the
+    /// experts forgotten (0 when not elastic or already shrunk), -1 on error.
+    int64_t shrink_cache(std::string& err);
+    /// mab776 M6: whether GPU 0's cache is mapped past the prompt budget (shrink_cache has something to give back).
+    bool cache_grown() const;
     /// mab776 M7a: GPU 1's tier - experts it holds, their GiB, the device (-1 = off), and whether it holds one.
     int64_t resident1() const;
     double gpu1_gib() const;

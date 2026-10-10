@@ -687,6 +687,7 @@ struct B {
 // per-query visibility mask (a block completed by token t is visible to tokens > t, never the reverse).  The
 // compressor rings take every token's state before any gather; each token gathers its own `ring` slots.
 static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
+static bool sparse_n_off();   // mab776 DS4_SPARSE_N=0: multi-token decode passes back on the masked path
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
@@ -960,6 +961,29 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 sel = ggml_reshape_1d(gc, ggml_get_rows(gc, tk1, ord), ntk);                             // I32 [ntk]
                 ggml_tensor * msel = ggml_get_rows(gc, ggml_reshape_2d(gc, var.vis, 1, cap), sel);      // [1, ntk]
                 cmask = ggml_cast(gc, ggml_reshape_2d(gc, msel, ntk, 1), GGML_TYPE_F16);
+            } else if (n > 1 && !im.pf && sparse_on() && !sparse_n_off()) {
+                // mab776 M7b: the same gather for a multi-token decode pass (speculative verify, n <= kNtMax).  The
+                // masked path below ran a dense flash-attn over all `cap` compressed rows per query (23k at 93k
+                // tokens, 65k at 262k: a 2-token pass cost 2.3x a one-token step at 93k, so verify LOST to plain
+                // decoding at depth).  Here every query gathers its own top-k rows, sorted ascending: K = [query 0's
+                // ntk rows | query 1's | ...], each query's mask open on its own block only (and its visibility), -inf
+                // on the others.  Each query attends exactly the keys it did, in the order it did (the reference
+                // flash-attn skips -inf keys): bit-identical on the CPU.  Per-row argsort and batched get_rows keep it
+                // to a handful of ops for any n.
+                ggml_tensor * ordn = ggml_argsort(gc, ggml_cast(gc, tk, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);  // [ntk, n]
+                ggml_tensor * seln = ggml_get_rows(gc, ggml_reshape_3d(gc, tk, 1, ntk, n), ordn);            // [1, ntk, n]
+                sel = ggml_reshape_1d(gc, seln, ntk * n);                                                  // I32 [ntk * n]
+                ggml_tensor * visn = ggml_reshape_3d(gc, ggml_cont(gc, var.vis), 1, cap, n);
+                ggml_tensor * mseln = ggml_cont(gc, ggml_reshape_2d(gc, ggml_get_rows(gc, visn,
+                                                    ggml_reshape_2d(gc, seln, ntk, n)), ntk, n));          // [ntk, n]
+                ggml_tensor * mk = nullptr;
+                for (int64_t j = 0; j < n; ++j) {
+                    ggml_tensor * col = ggml_view_2d(gc, mseln, ntk, 1, mseln->nb[1], (size_t) j * mseln->nb[1]);
+                    if (j > 0) col = ggml_concat(gc, b.fill_f32({ j * ntk, 1 }, NEG_INF), col, 0);
+                    if (j < n - 1) col = ggml_concat(gc, col, b.fill_f32({ (n - 1 - j) * ntk, 1 }, NEG_INF), 0);
+                    mk = mk ? ggml_concat(gc, mk, col, 1) : col;                                          // [ntk * n, j + 1]
+                }
+                cmask = ggml_cast(gc, mk, GGML_TYPE_F16);
             } else {
                 ggml_tensor * a = ggml_fill(gc, var.vis, NEG_INF);
                 a = ggml_view_4d(gc, a, 1, cap, n, 1, a->nb[0], a->nb[1], a->nb[2], 0);
@@ -1700,6 +1724,13 @@ static Ds4Dense::Impl::Var * attn_var(Ds4Dense::Impl & im, int il, int64_t cap, 
 }
 
 // DS4_SPARSE (default on): one-token CSA attention gathers the indexer's top rows instead of masking all blocks
+// mab776 M7b, DS4_SPARSE_N (default on): a multi-token decode pass (speculative verify) gathers each query's top-k
+// compressed rows as one-token decode does, instead of a dense masked flash-attn over every row (build_attn).
+static bool sparse_n_off() {
+    static const bool off = [] { const char * e = std::getenv("DS4_SPARSE_N"); return e && std::atoi(e) == 0; }();
+    return off;
+}
+
 static bool sparse_on() {
     static const bool on = [] { const char * e = std::getenv("DS4_SPARSE"); return !e || std::atoi(e) != 0; }();
     return on;
@@ -2535,3 +2566,94 @@ int Ds4Dense::snapshot_pos(int slot) const {
 
 size_t Ds4Dense::snapshot_bytes() const { return p_->snap_bytes; }
 int    Ds4Dense::snapshot_slots() const { return (int) p_->snaps.size(); }
+
+// ---- conversation parking (mab776 M6)
+namespace {
+struct ParkHdr {
+    uint32_t magic = 0x4B524150;   // "PARK"
+    uint32_t version = 1;
+    int32_t  max_pos = 0, n_slots = 0;
+    uint64_t ring_bytes = 0, total = 0;
+};
+// the compressed rows a park keeps for one layer: the blocks below max_pos and the partial block's row
+int64_t park_rows(const Ds4Dense::Impl::Layer & L, int max_pos) {
+    if (!L.ratio || !L.comp) return 0;
+    return std::min<int64_t>(L.comp_max + 1, (int64_t) max_pos / L.ratio + 1);
+}
+}  // namespace
+
+size_t Ds4Dense::park_bytes(int max_pos) const {
+    const Impl & im = *p_;
+    size_t ring_b = 0;
+    for (ggml_tensor * t : im.rings()) ring_b += ggml_nbytes(t);
+    size_t b = sizeof(ParkHdr) + im.snaps.size() * sizeof(int32_t) + ring_b * (1 + im.snaps.size());
+    for (const Impl::Layer & L : im.ly) {
+        const int64_t r = park_rows(L, max_pos);
+        if (L.comp)  b += (size_t) r * L.comp->nb[1];
+        if (L.icomp) b += (size_t) r * L.icomp->nb[1];
+    }
+    return b;
+}
+
+bool Ds4Dense::park(int max_pos, std::vector<uint8_t> & out) {
+    Impl & im = *p_;
+    if (max_pos < 0) { im.err = "park: negative position"; return false; }
+    for (int sp : im.snap_pos)
+        if (sp > max_pos) { im.err = "park: a snapshot holds positions past max_pos"; return false; }
+    const std::vector<ggml_tensor *> rs = im.rings();
+    ParkHdr h;
+    h.max_pos = max_pos;
+    h.n_slots = (int32_t) im.snaps.size();
+    for (ggml_tensor * t : rs) h.ring_bytes += ggml_nbytes(t);
+    h.total = park_bytes(max_pos);
+    out.resize((size_t) h.total);
+    uint8_t * p = out.data();
+    std::memcpy(p, &h, sizeof h);
+    p += sizeof h;
+    for (int sp : im.snap_pos) { const int32_t v = sp; std::memcpy(p, &v, 4); p += 4; }
+    ggml_backend_synchronize(im.backend);
+    auto get = [&](ggml_tensor * t, size_t n) { ggml_backend_tensor_get(t, p, 0, n); p += n; };
+    for (ggml_tensor * t : rs) get(t, ggml_nbytes(t));
+    for (const auto & slot : im.snaps)
+        for (ggml_tensor * t : slot) get(t, ggml_nbytes(t));
+    for (const Impl::Layer & L : im.ly) {
+        const int64_t r = park_rows(L, max_pos);
+        if (L.comp)  get(L.comp,  (size_t) r * L.comp->nb[1]);
+        if (L.icomp) get(L.icomp, (size_t) r * L.icomp->nb[1]);
+    }
+    if ((size_t) (p - out.data()) != out.size()) { im.err = "park: size mismatch"; return false; }
+    return true;
+}
+
+bool Ds4Dense::unpark(const std::vector<uint8_t> & in) {
+    Impl & im = *p_;
+    ParkHdr h;
+    if (in.size() < sizeof h) { im.err = "unpark: truncated"; return false; }
+    std::memcpy(&h, in.data(), sizeof h);
+    const std::vector<ggml_tensor *> rs = im.rings();
+    size_t ring_b = 0;
+    for (ggml_tensor * t : rs) ring_b += ggml_nbytes(t);
+    if (h.magic != ParkHdr().magic || h.version != 1 || h.n_slots != (int32_t) im.snaps.size() || h.ring_bytes != ring_b ||
+        h.total != in.size() || h.total != park_bytes(h.max_pos)) {
+        im.err = "unpark: the parked state does not fit this engine's layout";
+        return false;
+    }
+    const uint8_t * p = in.data() + sizeof h;
+    std::vector<int> sp((size_t) h.n_slots);
+    for (int & v : sp) { int32_t x = 0; std::memcpy(&x, p, 4); v = x; p += 4; }
+    ggml_backend_synchronize(im.backend);
+    auto set = [&](ggml_tensor * t, size_t n) { ggml_backend_tensor_set(t, p, 0, n); p += n; };
+    for (ggml_tensor * t : rs) set(t, ggml_nbytes(t));
+    for (auto & slot : im.snaps)
+        for (ggml_tensor * t : slot) set(t, ggml_nbytes(t));
+    for (Impl::Layer & L : im.ly) {
+        const int64_t r = park_rows(L, h.max_pos);
+        if (L.comp)  set(L.comp,  (size_t) r * L.comp->nb[1]);
+        if (L.icomp) set(L.icomp, (size_t) r * L.icomp->nb[1]);
+    }
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = sp;
+    im.in_pos = -1;      // the decode inputs are uploaded again by the next attn_router
+    im.cur_tid = -1;
+    return true;
+}

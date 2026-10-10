@@ -60,6 +60,7 @@ FIXTURES = {   # name -> (generator, extra env)
     "tame": ("bench/ds4-2026-10-06/dense/make_mini_tame.py", {}),
     "swa16": ("bench/ds4-2026-10-06/dense/make_mini_tame.py", {"DS4_SWA": "16"}),
     "tamex": ("tools/ds4/make_mini_serve.py", {}),
+    "mtp": ("tools/ds4/make_mini_mtp.py", {}),     # mab776 M7b: the mini MTP head (pairs with tame)
 }
 _fx_lock = threading.Lock()
 
@@ -1056,7 +1057,7 @@ class TErrors(Case):
         try:
             self.assertEqual(e.ctx, CTX)
             self.assertEqual(e.info.get("context"), CTX)
-            self.assertEqual(e.info.get("engine"), "ds4-serve-0.1")
+            self.assertEqual(e.info.get("engine"), "ds4-serve-0.2")
             self.assertTrue(e.can_stop)
             self.assertNotIn("batch_slots", e.info)
         finally:
@@ -1075,8 +1076,8 @@ class TErrors(Case):
                     self.same(e.gen(prompt(12, 420), 4), ref("tame", prompt(12, 420), 4))
                 finally:
                     self.assertEqual(e.close(), 0)
-        for args, want in ((("--slots", "auto"), "--expert-slots"), (("--mtp", "x.gguf"), "MTP"),
-                           (("--verify",), "MTP"), (("--temp", "0.7"), "greedy"), (("--ids", "1,2"), "one-shot"),
+        for args, want in ((("--slots", "auto"), "--expert-slots"), (("--mtp-resident",), "need --mtp FILE"),
+                           (("--mtp-keep", "3"), "need --mtp FILE"), (("--temp", "0.7"), "greedy"), (("--ids", "1,2"), "one-shot"),
                            (("--bogus",), "unknown argument --bogus"), (("--prefill-chunk", "9000"), "--prefill-chunk")):
             with self.subTest(args=args):
                 out = subprocess.run([SERVE, "--serve", "-m", str(fixture("tame")), "--backend", "cpu", "--experts",
@@ -1139,8 +1140,8 @@ class T5Server(Case):
         try:
             self.assertEqual(eng.max_context, CTX)
             self.assertTrue(eng.can_stop)
-            self.assertEqual(eng.info["engine"], "ds4-serve-0.1")
-            self.assertEqual(eng.info["version"], "ds4-serve-0.1")
+            self.assertEqual(eng.info["engine"], "ds4-serve-0.2")
+            self.assertEqual(eng.info["version"], "ds4-serve-0.2")
             self.assertEqual(eng.batch, 0)
             pid = eng.proc.pid
             p = prompt(40, 500)
@@ -1258,6 +1259,190 @@ class T5Server(Case):
 
 
 # ------------------------------------------------------------------------------------------------ T6
+
+# ------------------------------------------------------------------------------------------------ T7 (mab776 M6)
+
+class T7Park(Case):
+    """M6 conversation parking (--park-mib): a conversation the engine switched away from comes back from host RAM;
+    the request then reads only what is new and equals the same request run fresh, bit for bit (the compressed rows
+    past a parked position keep the other conversation's bytes: invisible, as after a reset)."""
+
+    ARGS = ("--park-mib", 64, "--park-min", 16, "--prefill-chunk", 64, "--chunk-min", 8)
+    PARKED = re.compile(r" parked (\d+) tokens \([^,]+, [0-9.]+ MiB = (\d+) B")
+
+    def gen_log(self, eng, seq):
+        for line in eng.log_text().splitlines():
+            if f"GEN #{seq}:" in line:
+                return line
+        self.fail(f"no GEN #{seq} line: " + eng.log_tail())
+
+    def turn(self, eng, ids, max_new, want_resume, what, unparked=None):
+        r = eng.gen(ids, max_new)
+        self.assertIsNone(r.err, what)
+        self.assertEqual(r.resume, want_resume, f"{what}: RESUME ({self.gen_log(eng, eng.seq)})")
+        self.assertEqual(r.prompt_read, len(ids) - r.resume, f"{what}: prompt read")
+        if unparked is not None:
+            self.assertEqual("unparked" in self.gen_log(eng, eng.seq), unparked, f"{what}: unpark")
+        self.same(r, ref(eng.fx, ids, max_new), what)
+        return r
+
+    @staticmethod
+    def next_turn(prev, seed, k=5):
+        """the next turn of a conversation whose last prompt was `prev`: DeepSeek's template turns that prompt's last
+        token (<think>) into </think> - it diverges at n - 1 -, then the answer and the new user message follow"""
+        return prev[:-1] + [other(prev[-1])] + prompt(k, seed)
+
+    def test_aba(self):
+        for fx in ("tame", "tamex"):
+            with self.subTest(fx=fx):
+                eng = Serve(fx, *self.ARGS)
+                try:
+                    a1 = prompt(300, 70)
+                    self.turn(eng, a1, 6, 0, "A1")
+                    b1 = prompt(200, 71)
+                    self.turn(eng, b1, 6, 0, "B1 (A parked)", unparked=False)
+                    m = self.PARKED.search(self.gen_log(eng, eng.seq))
+                    self.assertTrue(m, "A was not parked")
+                    self.assertEqual(int(m.group(1)), len(a1) + 5)   # max_new 6: the last token is never fed
+                    a2 = self.next_turn(a1, 72)
+                    self.turn(eng, a2, 8, len(a1) - 1, "A2 (unparked: its turn checkpoint)", unparked=True)
+                    b2 = self.next_turn(b1, 73)
+                    self.turn(eng, b2, 8, len(b1) - 1, "B2 (unparked)", unparked=True)
+                finally:
+                    self.assertEqual(eng.close(), 0)
+
+    def test_abca_and_append(self):
+        """three parked conversations; a return that APPENDS to a parked live state (a continuation pass)"""
+        eng = Serve("tame", *self.ARGS)
+        try:
+            a1, b1, c1 = prompt(250, 80), prompt(180, 81), prompt(120, 82)
+            ra = self.turn(eng, a1, 6, 0, "A1")
+            a_live = a1 + ra.tokens[:-1]
+            self.turn(eng, b1, 6, 0, "B1")
+            self.turn(eng, c1, 6, 0, "C1")
+            self.turn(eng, a_live + prompt(3, 83), 8, len(a_live), "A continued (unparked, append)", unparked=True)
+            self.turn(eng, self.next_turn(b1, 84), 8, len(b1) - 1, "B2", unparked=True)
+            self.turn(eng, self.next_turn(c1, 85), 8, len(c1) - 1, "C2", unparked=True)
+        finally:
+            self.assertEqual(eng.close(), 0)
+
+    def test_budget_evicts_oldest(self):
+        """room for one parked conversation: B's park evicts A's, so A comes back as a reset (read again, still exact)
+        while B comes back from RAM - taken out of the list before A2 is parked to make room (else A2's park would
+        evict the very conversation the request is switching to).  C is too short to be parked (--park-min)."""
+        a1, b1, c1 = prompt(260, 90), prompt(240, 91), prompt(9, 92)
+        probe = Serve("tame", *self.ARGS)
+        try:
+            self.turn(probe, a1, 6, 0, "probe A1")
+            self.turn(probe, b1, 6, 0, "probe B1")
+            sa = int(self.PARKED.search(self.gen_log(probe, probe.seq)).group(2))
+            self.turn(probe, c1, 6, 0, "probe C1")
+            sb = int(self.PARKED.search(self.gen_log(probe, probe.seq)).group(2))
+        finally:
+            self.assertEqual(probe.close(), 0)
+        eng = Serve("tame", *self.ARGS, env={"DS4_SERVE_TEST_PARK_BYTES": str(max(sa, sb) + min(sa, sb) // 2)})
+        try:
+            self.turn(eng, a1, 6, 0, "A1")
+            self.turn(eng, b1, 6, 0, "B1 (A parked)")
+            self.turn(eng, c1, 6, 0, "C1 (B parked, A evicted)")
+            self.assertIn("evicting a parked conversation", eng.log_text())
+            self.turn(eng, self.next_turn(a1, 93), 8, 0, "A2: evicted -> read again", unparked=False)
+            self.turn(eng, self.next_turn(b1, 94), 8, len(b1) - 1, "B2: from RAM", unparked=True)
+        finally:
+            self.assertEqual(eng.close(), 0)
+
+    def test_off_by_default(self):
+        """without --park-mib nothing is parked: A after B is a reset (M5's behaviour)"""
+        eng = Serve("tame", "--prefill-chunk", 64, "--chunk-min", 8)
+        try:
+            a1 = prompt(200, 95)
+            self.turn(eng, a1, 6, 0, "A1")
+            self.turn(eng, prompt(150, 96), 6, 0, "B1")
+            self.turn(eng, self.next_turn(a1, 97), 8, 0, "A2: reset", unparked=False)
+            self.assertNotIn(" parked ", eng.log_text().replace("parked 0 (", ""))
+        finally:
+            self.assertEqual(eng.close(), 0)
+
+
+# ------------------------------------------------------------------------------------------------ T8 (mab776 M7b)
+
+class T8Verify(Case):
+    """M7b speculative decoding in serve mode (--mtp): greedy requests give plain greedy's tokens AND logits rows, bit
+    for bit (on the CPU a 2-token pass is bit-identical to one-token decoding), whatever the drafts - the mini MTP's own
+    (always rejected), an oracle's (always accepted) or a mix; through chunked prompts and reuse."""
+
+    def eng(self, *args, **kw):
+        return Serve("tame", "--mtp", str(fixture("mtp")), *args, **kw)
+
+    def oracle_file(self, eng, toks):
+        path = os.path.join(eng.dir, "oracle")
+        Path(path).write_text("\n".join(map(str, toks)) + "\n")
+        return path
+
+    def run_case(self, ids, max_new, corrupt=None, args=(), stop=()):
+        want = ref("tame", ids, max_new, stop=stop)
+        env = {}
+        if corrupt is not None:
+            plain = ref("tame", ids, 40)[0]   # the drafts: plain greedy's tokens
+            d = tempfile.mkdtemp(prefix="ds4oracle-")
+            Path(d, "o").write_text("\n".join(map(str, plain)) + "\n")
+            env = {"DS4_SERVE_TEST_ORACLE": os.path.join(d, "o"), "DS4_SERVE_TEST_CORRUPT": str(corrupt)}
+        sargs = [*args]
+        if stop:
+            sargs += ["--stop", ",".join(map(str, stop))]
+        eng = self.eng(*sargs, env=env)
+        try:
+            r = eng.gen(ids, max_new)
+            self.same(r, want, f"n={len(ids)} max_new={max_new} corrupt={corrupt} {args} stop={stop}")
+            return r
+        finally:
+            self.assertEqual(eng.close(), 0)
+
+    def test_drafts(self):
+        for i, ids in enumerate((prompt(8, 200), prompt(3, 201), prompt(40, 202))):
+            with self.subTest(i=i, drafts="mtp"):
+                r = self.run_case(ids, 40)
+                self.assertGreater(int(r.done[7]), 0, "no draft offered")
+            for c in (0, 3, 2):
+                with self.subTest(i=i, corrupt=c):
+                    r = self.run_case(ids, 40, corrupt=c)
+                    if c == 0:   # every draft right: each pass emits 2
+                        self.assertEqual(int(r.done[6]), int(r.done[7]), "an oracle draft was rejected")
+
+    def test_max_new_cuts_and_stop(self):
+        ids = prompt(8, 210)
+        for n in (1, 2, 3, 7, 8):
+            with self.subTest(max_new=n):
+                self.run_case(ids, n, corrupt=0)
+        plain = ref("tame", ids, 40)[0]
+        for k in (5, 6, 9):
+            for c in (0, 3):
+                with self.subTest(stop_at=k, corrupt=c):
+                    self.run_case(ids, 40, corrupt=c, stop=(plain[k - 1],))
+
+    def test_chunked_prompt(self):
+        for n in (150, 600):
+            for c in (None, 0, 3):
+                with self.subTest(n=n, corrupt=c):
+                    self.run_case(prompt(n, 220 + n), 24, corrupt=c, args=("--prefill-chunk", 64, "--chunk-min", 8))
+
+    def test_reuse(self):
+        """append and the next turn's checkpoint restore with the MTP head on: each request == the same one fresh"""
+        eng = self.eng("--prefill-chunk", 64, "--chunk-min", 8)
+        try:
+            a1 = prompt(300, 230)
+            r1 = eng.gen(a1, 12)
+            self.same(r1, ref("tame", a1, 12), "A1")
+            a2 = a1 + r1.tokens[:-1] + prompt(5, 231)   # a continuation: what the state may hold, then new tokens
+            r2 = eng.gen(a2, 12)
+            self.same(r2, ref("tame", a2, 12), "A2 (append)")
+            a3 = a2[:-1] + [other(a2[-1])] + prompt(6, 232)   # the next turn: turn checkpoint at n - 1
+            r3 = eng.gen(a3, 12)
+            self.assertEqual(r3.resume, len(a2) - 1)
+            self.same(r3, ref("tame", a3, 12), "A3 (turn checkpoint)")
+        finally:
+            self.assertEqual(eng.close(), 0)
+
 
 def py_philox(seed: int, counter: int) -> float:
     """sampler.cu's philox_uniform, transcribed independently of ds4_sampler.hpp."""

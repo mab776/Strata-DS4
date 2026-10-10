@@ -124,6 +124,11 @@ public:
     bool grow(int64_t want_bytes, std::string& err);
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
+    /// mab776 (DS4 M6): forgets every expert held in a slot >= `first` and hands those slots out again from `first`
+    /// (the shared counter only - not with per-layer admission).  A resident server shrinks the tail before a
+    /// prompt's chunk buffers take its VRAM: the caller has made sure each forgotten expert has another copy.
+    /// Returns how many experts it forgot.
+    int64_t evict_from(int64_t first);
     /// The bytes the first `n` slots span.
     int64_t bytes_of(int64_t n) const { return slot_end(n < 0 ? 0 : n > slots_ ? slots_ : n); }
 

@@ -152,6 +152,7 @@ struct Gpu {
     /// the other); file-tier blobs are read into the matching pinned bounce half first.
     int64_t c_tok = 0, c_half = 0;
     int64_t c_bhalf = 0;          ///< bytes of one pinned bounce half (file-tier reads); c_half may be larger (prestage)
+    int64_t c_hcap = 0;           ///< mab776 M6: tokens c_hparts holds (kept across prompts with release_chunk(true))
     /// Ds4MoeConfig::chunk_prestage: layer `c_pre_layer`'s arena experts `c_pre_e` (ascending ids, not VRAM-resident)
     /// are DMA'd / being DMA'd into c_stage[c_pre_half] at stride `c_pre_sl`, event c_copied[c_pre_half]
     int c_pre_layer = -1, c_pre_half = -1;
@@ -380,6 +381,7 @@ struct Ds4MoeImpl {
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
     std::unique_ptr<Gpu1> g1;         ///< mab776 M7a: GPU 1's static tier (null = off)
     std::vector<std::pair<int32_t, int32_t>> seed_ranked;   ///< mab776 M7a: the elastic seed's ranking (grow_cache)
+    int64_t prompt_slots = 0;   ///< mab776 M6: the elastic cache's slots within the prompt budget (shrink_cache's target)
 };
 
 /// mab776 M7a, phase 0: the profile's ranking plus every routed (layer, expert) it never saw, appended in index
@@ -1576,6 +1578,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
                 const int64_t live = c.slots_within((int64_t) (im_->cfg.slot_gib * 1073741824.0));
                 if (!c.shrink(c.bytes_of(live), err)) return false;
                 im_->seed_ranked = ranked;
+                im_->prompt_slots = c.slots();
             }
         }
     }
@@ -2649,7 +2652,6 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
 
     if (n > gp.c_tok) {   // (re)allocate for n tokens
         for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
-        if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
         gp.c_tok = n;
         const int64_t ne = (int64_t) n * K;
         ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
@@ -2660,13 +2662,17 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) ne), "c_tok");
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
         ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
-        ck(cudaMallocHost((void**) &gp.c_hparts, (size_t) n * (size_t) H * 4), "c_hparts");   // the summed rows
     }
-    if (!gp.s_cp) {
+    if (n > gp.c_hcap) {   // the summed rows, pinned (mab776 M6: sized for a whole chunk, kept by a server)
+        if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
+        gp.c_hcap = std::max<int64_t>(n, im.cfg.gpu1_chunk_tokens);
+        ck(cudaMallocHost((void**) &gp.c_hparts, (size_t) gp.c_hcap * (size_t) H * 4), "c_hparts");
+    }
+    if (!gp.c_stage[0]) {   // mab776 M6: the device side alone (a server's release_chunk(true) keeps the pinned side)
         const char* mib = std::getenv("MIMO_CHUNK_STAGE_MIB");
         gp.c_half = (int64_t) (mib ? std::atoll(mib) : 1024) * 1048576;
         gp.c_half = std::max<int64_t>(gp.c_half, im.blob);
-        gp.c_bhalf = gp.c_half;   // the pinned bounce halves keep this size
+        if (gp.c_bhalf == 0) gp.c_bhalf = gp.c_half;   // the pinned bounce halves keep this size
         // prestage: one device half holds a whole layer's prestaged set.  mab776 M7a: that set is the layer's arena
         // experts NOT in VRAM (chunk_prestage's own rule; GPU 1's have no arena copy), at the layer's stride - not all
         // 256 at blob + 1 MiB: with GPU 0's cache and GPU 1 holding ~65 % of the experts that cut the two halves from
@@ -2694,13 +2700,17 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
             // zeroed once, so whatever MMQ reads past a blob decodes to finite numbers (llama.cpp zero-pads too)
             ck(cudaMalloc(&gp.c_stage[h], (size_t) gp.c_half + 1048576), "c_stage");
             ck(cudaMemset(gp.c_stage[h], 0, (size_t) gp.c_half + 1048576), "c_stage zero");
-            ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_bhalf), "c_bounce");
+        }
+    }
+    if (!gp.c_bounce[0])
+        for (int h = 0; h < 2; ++h) ck(cudaMallocHost((void**) &gp.c_bounce[h], (size_t) gp.c_bhalf), "c_bounce");
+    if (!gp.c_copied[0])
+        for (int h = 0; h < 2; ++h) {
             ck(cudaEventCreateWithFlags(&gp.c_copied[h], cudaEventDisableTiming), "ev");
             ck(cudaEventCreateWithFlags(&gp.c_used[h], cudaEventDisableTiming), "ev");
             ck(cudaEventRecord(gp.c_used[h], gp.s), "ev");
         }
-        ck(cudaStreamCreateWithFlags(&gp.s_cp, cudaStreamNonBlocking), "s_cp");
-    }
+    if (!gp.s_cp) ck(cudaStreamCreateWithFlags(&gp.s_cp, cudaStreamNonBlocking), "s_cp");
     im.pf_n = 0;   // a chunk does not use the decode prefetch staging
 
     // ---- MMQ (Ds4MoeConfig::chunk_mmq): this layer's types covered -> streamed blobs sit `SL` apart in a half (BL
@@ -3258,7 +3268,7 @@ bool Ds4MoeTier::build_arena_from_routes(const std::string& routes_bin, int batc
 #endif
 }
 
-void Ds4MoeTier::release_chunk() {
+void Ds4MoeTier::release_chunk(bool keep_host) {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu) return;
     if (chunk_prof() && g_cprof.calls) {
@@ -3277,29 +3287,74 @@ void Ds4MoeTier::release_chunk() {
     for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_ptr, gp.c_start, gp.c_ng, gp.c_dst, gp.c_tokv,
                     gp.c_stage[0], gp.c_stage[1], gp.c_w, gp.c_out})
         if (p) cudaFree(p);
-    for (uint8_t* p : gp.c_bounce)
-        if (p) cudaFreeHost(p);
-    if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
-    for (int i = 0; i < 2; ++i) {
-        if (gp.c_copied[i]) cudaEventDestroy(gp.c_copied[i]);
-        if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);
-    }
-    if (gp.s_cp) cudaStreamDestroy(gp.s_cp);
     gp.c_x = gp.c_xq = gp.c_parts = gp.c_scratch = gp.c_ptr = gp.c_start = gp.c_ng = gp.c_dst = gp.c_tokv = nullptr;
     gp.c_w = gp.c_out = nullptr;
     gp.c_stage[0] = gp.c_stage[1] = nullptr;
-    gp.c_bounce[0] = gp.c_bounce[1] = nullptr;
-    gp.c_hparts = nullptr;
-    for (int i = 0; i < 2; ++i) gp.c_copied[i] = gp.c_used[i] = nullptr;
-    gp.s_cp = nullptr;
-    gp.c_tok = gp.c_half = gp.c_bhalf = 0;
+    gp.c_tok = gp.c_half = 0;
+    if (!keep_host) {   // mab776 M6: a server keeps these (see the header)
+        for (uint8_t* p : gp.c_bounce)
+            if (p) cudaFreeHost(p);
+        if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
+        for (int i = 0; i < 2; ++i) {
+            if (gp.c_copied[i]) cudaEventDestroy(gp.c_copied[i]);
+            if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);
+        }
+        if (gp.s_cp) cudaStreamDestroy(gp.s_cp);
+        gp.c_bounce[0] = gp.c_bounce[1] = nullptr;
+        gp.c_hparts = nullptr;
+        gp.c_hcap = 0;
+        for (int i = 0; i < 2; ++i) gp.c_copied[i] = gp.c_used[i] = nullptr;
+        gp.s_cp = nullptr;
+        gp.c_bhalf = 0;
+    }
     gp.c_pre_layer = gp.c_pre_half = -1;
     gp.c_pre_e.clear();
     gp.free_mmq();
 #endif
 }
 
-int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err) {
+bool Ds4MoeTier::cache_grown() const {
+#if defined(DS4_MOE_CUDA)
+    return im_->gpu && im_->gpu->cache && im_->gpu->cache->segmented() && im_->prompt_slots > 0 &&
+           im_->gpu->cache->slots() > im_->prompt_slots;
+#else
+    return false;
+#endif
+}
+
+int64_t Ds4MoeTier::shrink_cache(std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!cache_grown()) return 0;
+    Gpu& gp = *im_->gpu;
+    strata::core::ExpertCache& c = *gp.cache;
+    const double t0 = now_ms();
+    if (gp.s) cudaStreamSynchronize(gp.s);       // nothing in flight may still read a slot past the budget
+    if (gp.s_pf) cudaStreamSynchronize(gp.s_pf);
+    // the tail's experts must each have an arena copy (else their next use is a file read): true by construction -
+    // the grow set stays in the arena, and an LRU promotion into a grown slot finds a victim WITH an arena copy there,
+    // so the promoted expert keeps its own.  Counted, not trusted.
+    const int64_t NX = im_->g.n_experts;
+    int64_t no_copy = 0;
+    for (int64_t l = 0; l < im_->g.n_layers; ++l)
+        for (int64_t e = 0; e < NX; ++e) {
+            const int32_t sl = c.slot_of(l, e);
+            if (sl >= im_->prompt_slots && !gp.arena.ptr(l, e)) ++no_copy;
+        }
+    const int64_t before = c.slots();
+    const int64_t n = c.evict_from(im_->prompt_slots);
+    if (!c.shrink(c.bytes_of(im_->prompt_slots), err)) return -1;
+    std::fprintf(stderr, "shrink_cache: %lld -> %lld slots (%lld experts back to the arena%s) in %.0f ms\n",
+                 (long long) before, (long long) c.slots(), (long long) n,
+                 no_copy ? (", " + std::to_string(no_copy) + " WITHOUT an arena copy -> file reads").c_str() : "",
+                 now_ms() - t0);
+    return n;
+#else
+    (void) err;
+    return 0;
+#endif
+}
+
+int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err, bool reseed_lru) {
 #if defined(DS4_MOE_CUDA)
     if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
     strata::core::ExpertCache& c = *im_->gpu->cache;
@@ -3337,7 +3392,21 @@ int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err) {
     }
     if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess) { err = "grow_cache: queued fills failed"; return -1; }
     im_->admitted += added;
-    lru_seed(*im_, im_->seed_ranked, c.resident());   // the grown experts join the LRU after the seed's, in rank order
+    if (reseed_lru || im_->vlast.empty()) {
+        lru_seed(*im_, im_->seed_ranked, c.resident());   // the grown experts join the LRU after the seed's, in rank order
+    } else if (added > 0) {
+        // mab776 M6 (a server's regrow): the recency decode learned stays; the grown experts become the LRU's oldest
+        // entries, the higher-ranked of them the more recent - what lru_seed gives them on the one-shot path
+        const int64_t NX = im_->g.n_experts;
+        int64_t lo = -1;
+        for (int64_t v : im_->vlast) lo = std::min(lo, v);
+        int64_t r = 0;
+        for (const auto& le : im_->seed_ranked) {
+            const int32_t sl = c.slot_of(le.first, le.second);
+            if (sl < 0 || sl < im_->prompt_slots) continue;   // only the slots this grow filled
+            im_->vlast[(size_t) (le.first * NX + le.second)] = lo - 1 - r++;
+        }
+    }
     std::fprintf(stderr, "grow_cache: %lld -> %lld slots (+%lld, %lld from the file tier) in %.0f ms%s%s\n",
                  (long long) before, (long long) c.slots(), (long long) added, (long long) nfile, now_ms() - t0,
                  e.empty() ? "" : "; grow stopped: ", e.c_str());

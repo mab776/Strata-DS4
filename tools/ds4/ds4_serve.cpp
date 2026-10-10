@@ -32,6 +32,7 @@
 #include "ds4_dense.hpp"
 #include "ds4_moe.hpp"
 #include "ds4_sampler.hpp"
+#include "mtp_experts.hpp"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -69,7 +70,7 @@ namespace {
 
 namespace ds4 = strata::ds4;
 
-constexpr const char * kEngineVersion = "ds4-serve-0.1";
+constexpr const char * kEngineVersion = "ds4-serve-0.2";   // 0.2: M6 (GPU 1 tier, elastic cache per prompt)
 constexpr int kPrefillChunkMax = 8192;   // a bigger chunk overflows the attention graph's 4096 nodes at long context
 
 double now_ms() {
@@ -103,9 +104,22 @@ struct Args {
     int comp_rot = -1;
     int turn_token = -1;             // --turn-token: the `user` checkpoint at its last occurrence (-1 = off)
     bool no_ckpt = false;            // --no-ckpt: never take checkpoints (append / rewind reuse only)
-    // refused in serve mode (MTP / verify are a later milestone); kept so the copied blocks read as in ds4_generate
-    const std::string mtp;
-    const bool verify = false;
+    // mab776 M6 (= ds4_generate's M7a flags): GPU 1 as a static expert tier, and the elastic GPU 0 cache - the prompt
+    // chunks run on the --vram-margin budget, the cache is grown to leave --vram-grow GiB free between prompts
+    int gpu1 = -1;
+    double gpu1_gib = 0.0, gpu1_reserve = 0.6;
+    double vram_grow = -1.0;
+    // mab776 M6: conversation parking - a conversation the server switches away from goes to host RAM (its rings,
+    // checkpoints and compressed rows, ~0.3 GB at 127k), so coming back to it reads only what is new
+    int64_t park_mib = 0;            // --park-mib: the host RAM parked conversations may use (0 = off)
+    int park_min = 512;              // --park-min: shorter conversations are not worth parking
+    // mab776 M7b: --mtp FILE = speculative decoding with the DeepSeek MTP head - one 2-token verify pass per step,
+    // exact speculative sampling for sampled requests (ds4_sampler.hpp verify_row); its routed experts on the CPU
+    // (MXFP4; --mtp-resident copies them into RAM, --mtp-keep K computes only the K heaviest)
+    std::string mtp;
+    bool verify = false;
+    bool mtp_resident = false;
+    int mtp_keep = 0;
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -151,6 +165,8 @@ void usage() {
         "       [--comp-type f32|q8_0|q5_0|q4_0|iq4_nl] [--comp-q8] [--comp-rot 0|1] [--icomp-q8] [--comp-host]\n"
         "       [--f16-q8] [--dense-requant q4_k|q5_k|q6_k] [--route-bias F] [--vram-lru] [--arena-adapt]\n"
         "       [--arena-skip-resident] [--skip-miss T] [--seed N] [--stop id,id] [--turn-token ID] [--no-ckpt]\n"
+        "       [--gpu1 N [--gpu1-gib G] [--gpu1-reserve G]] [--vram-grow G] [--park-mib MiB [--park-min tokens]]\n"
+        "       [--mtp FILE [--mtp-resident] [--mtp-keep K]]\n"
         "  Strata's engine line protocol on stdin/stdout (serve/server.py); see the head of tools/ds4/ds4_serve.cpp.\n");
 }
 
@@ -232,6 +248,12 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--comp-host") a.comp_host = true;
         else if (k == "--turn-token") { if (!num_i(-1, INT32_MAX, iv)) return false; a.turn_token = (int) iv; }
         else if (k == "--no-ckpt") a.no_ckpt = true;
+        else if (k == "--gpu1") { if (!num_i(0, 64, iv)) return false; a.gpu1 = (int) iv; }
+        else if (k == "--gpu1-gib") { if (!num_f(fv)) return false; a.gpu1_gib = fv; }
+        else if (k == "--gpu1-reserve") { if (!num_f(fv)) return false; a.gpu1_reserve = fv; }
+        else if (k == "--vram-grow") { if (!num_f(fv)) return false; a.vram_grow = fv; }
+        else if (k == "--park-mib") { if (!num_i(0, (int64_t) 1 << 22, iv)) return false; a.park_mib = iv; }
+        else if (k == "--park-min") { if (!num_i(1, INT32_MAX, iv)) return false; a.park_min = (int) iv; }
         else if (k == "--ids" || k == "--ids-file" || k == "-n" || k == "--n-predict" || k == "--ppl" ||
                  k == "--dump-logits" || k == "--pos-offset" || k == "--quiet") {
             why = k + ": a one-shot ds4_generate option; ds4_serve takes its prompts from GEN lines";
@@ -242,10 +264,10 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
                   "sample the requests that asked for greedy)";
             return false;
         }
-        else if (k == "--mtp" || k == "--mtp-resident" || k == "--mtp-keep" || k == "--verify") {
-            why = k + ": the MTP head / speculative decoding is not in serve mode yet (a later milestone)";
-            return false;
-        }
+        else if (k == "--mtp") { if (!next()) return false; a.mtp = v; a.verify = true; }
+        else if (k == "--mtp-resident") a.mtp_resident = true;
+        else if (k == "--mtp-keep") { if (!num_i(0, 64, iv)) return false; a.mtp_keep = (int) iv; }
+        else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
     // Strata's own name for the VRAM left free beside the expert cache: the margin, unless --vram-margin says it
@@ -261,6 +283,7 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         }
     }
     if (a.model.empty()) { why = "-m model.gguf is required"; return false; }
+    if ((a.mtp_resident || a.mtp_keep > 0) && a.mtp.empty()) { why = "--mtp-resident / --mtp-keep need --mtp FILE"; return false; }
     if (a.ctx <= 0) { why = "--ctx N (or --max-context N) is required"; return false; }
     if (a.backend != "cuda" && a.backend != "cpu") { why = "--backend cuda|cpu"; return false; }
     if (a.experts != "gpu" && a.experts != "cpu") { why = "--experts gpu|cpu"; return false; }
@@ -468,6 +491,36 @@ struct Choice {
     size_t lcp = 0;
 };
 
+// mab776 M6: a parked conversation - everything the server tracks about a state (its tokens and checkpoints) and the
+// state itself (Ds4Dense::park), in host RAM
+struct Parked {
+    std::vector<int> live;
+    Ckpt ck[kSlots];
+    std::vector<uint8_t> blob;
+    int64_t tick = 0;        // last use (LRU)
+};
+
+// the reuse a state (tokens `live`, checkpoints `ck`) offers a prompt: append, rewind in place (the rings keep K spare
+// slots) or restore a checkpoint; the largest wins, the earlier offer on a tie
+Choice best_reuse(const std::vector<int> & live, const Ckpt * ck, int slots, const std::vector<int> & ids, int K) {
+    const int n = (int) ids.size(), L = (int) live.size();
+    Choice best;
+    while ((int) best.lcp < L && (int) best.lcp < n && live[best.lcp] == ids[best.lcp]) ++best.lcp;
+    const int lcp = (int) best.lcp;
+    auto offer = [&](Kind k, int R, int slot) {
+        if (R > best.R) { best.kind = k; best.R = R; best.slot = slot; }
+    };
+    if (L >= 1 && lcp == L && L <= n - 1) offer(Kind::Append, L, -1);
+    const int m = std::min(lcp, n - 1);
+    if (m >= 1 && L - m >= 1 && L - m <= K) offer(Kind::Rewind, m, -1);
+    for (int s = 0; s < slots; ++s) {
+        const Ckpt & c = ck[s];
+        if (c.pos >= 1 && c.pos <= n - 1 && (int) c.ids.size() == c.pos && std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
+            offer(Kind::Restore, c.pos, s);
+    }
+    return best;
+}
+
 struct Server {
     Args a;
     Proto & proto;
@@ -491,14 +544,39 @@ struct Server {
     int64_t gens = 0;                // GEN/GENI lines taken (request numbers, see Input)
     int test_delay_ms = 0;           // DS4_SERVE_TEST_DELAY_MS
     int test_fail_pos = -1;          // DS4_SERVE_TEST_FAIL=<pos>: the engine fails at that position (the ERR path's test)
+    bool shrunk = false;             // mab776 M6: this prompt gave the grown cache's tail back (end_prompt regrows it)
+    double t_shrink = 0, t_grow = 0; // ms, the last prompt's
+    int il_mtp = -1, NT = 1;         // mab776 M7b: the MTP block (-1 = off), tokens a multi-token pass carries
+    ds4::MtpExperts mtp_x;
+    std::vector<int> mids, ids_n;
+    std::vector<int32_t> ids32_n;
+    std::vector<float> mw, mrouted, w_n, routed_n;
+    int64_t drafts = 0, accepted = 0;   // this request's
+    // DS4_SERVE_TEST_ORACLE=<file> (re-read per request): drafts from a plain greedy run's tokens (the draft for the
+    // n-th emitted token = line n), DS4_SERVE_TEST_CORRUPT=k spoils every k-th - the mini MTP's random weights never
+    // draft right, so without this only the reject path would run (= ds4_generate's DS4_VERIFY_ORACLE)
+    std::vector<int> oracle;
+    int corrupt_every = 0, n_fixed = 0;
+    double t_mtp_win = 0;               // ms: the MTP window over this request's prompt
+    std::vector<Parked> parked;      // mab776 M6: conversations in host RAM (--park-mib)
+    size_t park_used = 0;
+    int64_t park_tick = 0;
+    std::string park_note;           // the last request's parking moves, for its log line
 
     Server(const Args & args, Proto & p, Input & i) : a(args), proto(p), in(i) {}
 
     bool init(std::string & why);
     bool step(int tid, int pos);
+    bool step_n(const int * toks, int n, int pos0);
+    bool mtp_draft_n(const int * next, int n, int pos0, int * draft);
+    bool mtp_fill_chunk(const std::vector<int> & ids, int c0, int m, int W, int n);
     bool chunk(const int * toks, int n, int pos0, bool & quit);
+    void before_chunk();
     void end_prompt();
     Choice choose(const std::vector<int> & ids) const;
+    void park_live(const char * why);
+    bool unpark(Parked & P);
+    bool park_room(size_t need);
     int apply(Choice & c);
     void drop_above(int R);
     void forget_all();
@@ -561,6 +639,7 @@ bool Server::init(std::string & why) {
         if (dc.requant_type < 0) { why = "--dense-requant q4_k|q5_k|q6_k"; return false; }
     }
     dc.comp_cap_max = ctx / 4 + 2;
+    dc.mtp_path = a.mtp;   // mab776 M7b
     dc.prefill_chunk = a.prefill_chunk;
     dc.f16_q8 = a.f16_q8;
     dc.comp_q8 = a.comp_q8;
@@ -581,6 +660,7 @@ bool Server::init(std::string & why) {
 
     // = ds4_generate.cpp:252-298 @b588dbd1 (M1: byte-sized slots auto) - verbatim but for return values / the name
     double slot_gib_auto = 0.0;   // mab776: the auto cache budget in GiB when blob sizes differ per layer
+    double slot_gib_max_auto = 0.0;   // mab776 M6: --vram-grow's decode budget
     if (a.slots <= 0) {
         // mab776: long contexts get more headroom after the dense half (2.0 GiB from 65,536 tokens; the M2 depth runs
         // at 262,144 calibrate it); an explicit --vram-margin wins
@@ -626,6 +706,24 @@ bool Server::init(std::string & why) {
                      a.vram_margin_gib, bmin / 1048576.0, bmax / 1048576.0, (long long) (budget / (double) bmax),
                      (long long) (budget / (double) bmin));
         if (budget <= 0) a.slots = 0;
+        // mab776 M6 (= ds4_generate's M7a --vram-grow): the prompt chunks run on the budget above, the cache is grown
+        // between prompts to leave --vram-grow GiB free (mixed blob sizes only: the elastic open)
+        if (a.vram_grow >= 0) {
+            if (bmin == bmax || a.vram_grow >= a.vram_margin_gib) {
+                why = "--vram-grow needs mixed expert sizes and G < --vram-margin";
+                return false;
+            }
+            // the decode graphs the MTP head / verify add are captured after the grow (ds4_generate's extras)
+            a.vram_grow += (a.mtp.empty() ? 0.0 : 0.25) + (a.verify ? 0.75 : 0.0);
+            slot_gib_max_auto = std::max(0.0, (double) fr - a.vram_grow * 1073741824.0) / 1073741824.0;
+            std::fprintf(stderr, "vram grow: prompts on %.2f GiB of slots, decode on up to %.2f GiB (leaving %.2f GiB)\n",
+                         slot_gib_auto, slot_gib_max_auto, a.vram_grow);
+        }
+    }
+    if (a.vram_grow >= 0 && slot_gib_max_auto <= 0) { why = "--vram-grow needs --expert-slots auto"; return false; }
+    if (a.gpu1 >= 0 && (a.experts != "gpu" || a.profile.empty())) {
+        why = "--gpu1 needs --experts gpu and a --profile (its experts come from the ranking)";
+        return false;
     }
 
     // = ds4_generate.cpp:300-331 @b588dbd1 ---- routed-expert tier (the cache seeded at load: a server prefills with
@@ -645,17 +743,44 @@ bool Server::init(std::string & why) {
     mc.chunk_mmq = a.chunk_mmq;
     mc.chunk_prestage = a.chunk_prestage;
     mc.skip_miss = a.skip_miss;
+    mc.slot_gib_max = slot_gib_max_auto;   // mab776 M6
+    mc.gpu1_device = a.gpu1;
+    mc.gpu1_gib = a.gpu1_gib;
+    mc.gpu1_reserve_gib = a.gpu1_reserve;
+    mc.gpu1_chunk_tokens = a.prefill_chunk;
     if (!tier.init(a.model, mc, err)) { why = "tier init: " + err; return false; }
     if (!a.profile.empty() && !mc.cpu_only && !tier.seed_from_routes(a.profile, err)) { why = "profile: " + err; return false; }
     std::fprintf(stderr, "tier: %s, %lld resident slots, arena %.1f GiB (%lld experts), file tier %lld; load %.1f s\n",
                  tier.mode(), (long long) tier.resident(), tier.arena_gib(), (long long) tier.arena_experts(),
                  (long long) tier.file_tier(), (now_ms() - t_load0) / 1000.0);
+    if (tier.gpu1_device() >= 0)
+        std::fprintf(stderr, "gpu1: device %d holds %lld experts (%.2f GiB, filled in %.1f s; no arena copies)\n",
+                     tier.gpu1_device(), (long long) tier.resident1(), tier.gpu1_gib(), tier.gpu1_seed_s());
+    // mab776 M6: between requests the cache is grown (decode's budget); a prompt that runs chunks shrinks it first
+    if (a.vram_grow >= 0 && tier.grow_cache(a.vram_grow, err, true) < 0) { why = err; return false; }
+    // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's experts on the CPU
+    il_mtp = dense.mtp_layer();
+    if (il_mtp >= 0) {
+        mtp_x.keep = a.mtp_keep;
+        if (!mtp_x.init(a.mtp, il_mtp, dense.geom().n_embd, dense.geom().n_expert_used,
+                        (float) dense.geom().swiglu_clamp_exp[(size_t) il_mtp], a.threads > 0 ? a.threads : 8, err,
+                        a.mtp_resident)) {
+            why = err;
+            return false;
+        }
+        std::fprintf(stderr, "MTP head: layer %d from %s (experts on the CPU, MXFP4%s%s)\n", il_mtp, a.mtp.c_str(),
+                     a.mtp_resident ? ", resident" : "", a.mtp_keep > 0 ? (", keep " + std::to_string(a.mtp_keep)).c_str() : "");
+    }
 
     // = ds4_generate.cpp:333-359 @b588dbd1 (the step buffers)
     n_layer = (int) dense.n_layer();
     top_k = (int) tier.geom().top_k;
     n_embd = tier.geom().n_embd;
     n_vocab = (int) dense.geom().vocab_size;
+    NT = dense.max_tokens();
+    mids.resize((size_t) (top_k * NT)); ids_n.resize((size_t) (top_k * NT)); ids32_n.resize((size_t) (top_k * NT));
+    mw.resize((size_t) (top_k * NT)); w_n.resize((size_t) (top_k * NT));
+    mrouted.resize((size_t) (n_embd * NT)); routed_n.resize((size_t) (n_embd * NT));
     ids_i.resize((size_t) top_k); pred_i.resize((size_t) kPredW);
     ids32.resize((size_t) top_k); pred32.resize((size_t) kPredW);
     w.resize((size_t) top_k); routed.resize((size_t) n_embd);
@@ -699,6 +824,69 @@ bool Server::step(int tid, int pos) {
     return true;
 }
 
+// = ds4_generate.cpp step_n (mab776 M7b) ---- n <= max_tokens() consecutive tokens through every trunk layer in one pass
+bool Server::step_n(const int * toks, int n, int pos0) {
+    if (a.route_bias != 0.0f && !mc.cpu_only)
+        for (int l = 0; l < n_layer; ++l) {
+            for (int64_t e = 0; e < (int64_t) rb.size(); ++e) rb[(size_t) e] = tier.resident(l, e) ? a.route_bias : 0.0f;
+            dense.set_route_bias(l, rb.data());
+        }
+    if (!dense.begin_tokens(toks, n)) { err = dense.last_error(); return false; }
+    for (int l = 0; l < n_layer; ++l) {
+        if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {   // token 0's hint
+            int m = 0;
+            for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) m++] = pred_i[(size_t) i];
+            if (m > 0) tier.prefetch(l, pred32.data(), m);
+        }
+        const float * x = nullptr;
+        if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x)) { err = dense.last_error(); return false; }
+        for (int k = 0; k < top_k * n; ++k) ids32_n[(size_t) k] = ids_n[(size_t) k];
+        if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data())) {
+            err = "tier.run_multi refused at layer " + std::to_string(l);
+            return false;
+        }
+        if (!dense.finish_layer_n(l, n, routed_n.data())) { err = dense.last_error(); return false; }
+    }
+    return true;
+}
+
+// = ds4_generate.cpp mtp_draft_n (mab776 M7b): the MTP block at positions pos0..pos0+n-1 (the decode state's last pass
+// rows) with the tokens that follow them -> the last position's argmax, the draft for pos0 + n + 1
+bool Server::mtp_draft_n(const int * next, int n, int pos0, int * draft) {
+    const float * x = nullptr;
+    if (!dense.mtp_begin(next, n)) { err = dense.last_error(); return false; }
+    if (!dense.attn_router_n(il_mtp, pos0, n, mids.data(), mw.data(), &x)) { err = dense.last_error(); return false; }
+    for (int t = 0; t < n; ++t)
+        if (!mtp_x.run(x + (size_t) t * n_embd, mids.data() + t * top_k, mw.data() + t * top_k,
+                       mrouted.data() + (size_t) t * n_embd)) { err = "MTP experts failed"; return false; }
+    if (!dense.finish_layer_n(il_mtp, n, mrouted.data())) { err = dense.last_error(); return false; }
+    const float * lg = nullptr;
+    int nv = 0;
+    if (!dense.mtp_logits_n(n, &lg, &nv)) { err = dense.last_error(); return false; }
+    const float * last = lg + (size_t) (n - 1) * nv;
+    if (draft) *draft = (int) (std::max_element(last, last + nv) - last);
+    return true;
+}
+
+// mab776 M7b: the MTP head's sliding window over a prompt chunk's positions [c0, c0 + m) that fall in [W, n - 1) - the
+// positions the first decode drafts attend to (W = max(the reuse point, n - 1 - SWA)); from the chunk's own trunk
+// states (prefill_state_to_decode), before the next chunk overwrites them.  Positions below the reuse point keep the
+// MTP rows the restored state holds (the one at R - 1 may have seen another next token: drafts only, every draft is
+// verified).
+bool Server::mtp_fill_chunk(const std::vector<int> & ids, int c0, int m, int W, int n) {
+    const double t = now_ms();
+    int p = std::max(W, c0);
+    const int end = std::min(c0 + m, n - 1);
+    while (p < end) {
+        const int cnt = std::min(NT, end - p);
+        if (!dense.prefill_state_to_decode(p - c0, cnt)) { err = dense.last_error(); return false; }
+        if (!mtp_draft_n(ids.data() + p + 1, cnt, p, nullptr)) return false;
+        p += cnt;
+    }
+    t_mtp_win += now_ms() - t;
+    return true;
+}
+
 // = ds4_generate.cpp:475-543 @b588dbd1 ---- one prompt chunk, n <= --prefill-chunk tokens at positions pos0..
 // (no --ppl, no logits: the last prompt token always goes through step()).  QUIT / EOF are checked between layers:
 // a chunk of the real model takes seconds, and the server's close() allows 20 s; `quit` then says the state is half
@@ -727,30 +915,149 @@ bool Server::chunk(const int * toks, int n, int pos0, bool & quit) {
     return true;
 }
 
-// = ds4_generate.cpp:544-545 @b588dbd1.  M5 gives the chunk buffers back after every prompt; M6 (the GPU server)
-// attaches a resident or elastic prefill buffer here instead.
+// mab776 M6: the elastic GPU 0 cache.  Between requests it is grown to the decode budget (--vram-grow GiB left free);
+// a prompt that reads chunks first gives the tail back (its experts each keep an arena copy), so the chunk buffers
+// have the --vram-margin room the one-shot runs measured, and end_prompt grows it again from the arena (~0.1 s for
+// ~900 slots on the M7a runs).  A short follow-up that reads no chunk keeps the grown cache.
+void Server::before_chunk() {
+    if (shrunk || !tier.cache_grown()) return;
+    const double t = now_ms();
+    std::string e;
+    if (tier.shrink_cache(e) < 0)
+        std::fprintf(stderr, "ds4_serve: the cache did not shrink before the prompt (%s): its chunk buffers may not fit\n",
+                     e.c_str());
+    t_shrink = now_ms() - t;
+    shrunk = true;   // even after a failed shrink: the grow below maps whatever is free again
+}
+
+// = ds4_generate.cpp:544-545 @b588dbd1.  mab776 M6: the chunk buffers' device side goes back after every prompt (the
+// pinned host side stays: page-locking 2 GiB again would cost a short turn more than its prompt), then the cache
+// grows back to the decode budget.
 void Server::end_prompt() {
-    tier.release_chunk();
+    tier.release_chunk(/*keep_host=*/true);
     dense.prefill_release();
+    t_grow = 0;
+    if (shrunk) {
+        const double t = now_ms();
+        std::string e;
+        if (tier.grow_cache(a.vram_grow, e, /*reseed_lru=*/false) < 0)
+            std::fprintf(stderr, "ds4_serve: the cache did not grow back after the prompt (%s): decode on the prompt "
+                                 "budget\n", e.c_str());
+        t_grow = now_ms() - t;
+        shrunk = false;
+    }
 }
 
 Choice Server::choose(const std::vector<int> & ids) const {
-    const int n = (int) ids.size(), L = (int) live.size(), K = dense.max_tokens();
-    Choice best;
-    while ((int) best.lcp < L && (int) best.lcp < n && live[best.lcp] == ids[best.lcp]) ++best.lcp;
-    const int lcp = (int) best.lcp;
-    auto offer = [&](Kind k, int R, int slot) {   // strictly larger only: the earlier offer wins a tie (A, B, C)
-        if (R > best.R) { best.kind = k; best.R = R; best.slot = slot; }
+    return best_reuse(live, ck, slots_ck, ids, dense.max_tokens());
+}
+
+// ---- conversation parking (mab776 M6)
+// The RAM a park may take: the budget (oldest parked conversations evicted first) and what the container and the
+// host have left - parking must never be what pushes the engine into the OOM killer (cgroup memory.max is the hard
+// wall; 2 GiB stays free under it, and 4 GiB of the host's MemAvailable).
+bool Server::park_room(size_t need) {
+    size_t budget = (size_t) a.park_mib << 20;
+    if (const char * tb = std::getenv("DS4_SERVE_TEST_PARK_BYTES")) budget = (size_t) std::strtoull(tb, nullptr, 10);
+    if (need > budget) return false;
+    auto evict_oldest = [&]() {
+        if (parked.empty()) return false;
+        size_t o = 0;
+        for (size_t i = 1; i < parked.size(); ++i) if (parked[i].tick < parked[o].tick) o = i;
+        std::fprintf(stderr, "ds4_serve: park: evicting a parked conversation of %zu tokens (%.0f MiB)\n",
+                     parked[o].live.size(), parked[o].blob.size() / 1048576.0);
+        park_used -= parked[o].blob.size();
+        parked.erase(parked.begin() + (std::ptrdiff_t) o);
+        return true;
     };
-    if (L >= 1 && lcp == L && L <= n - 1) offer(Kind::Append, L, -1);
-    const int m = std::min(lcp, n - 1);
-    if (m >= 1 && L - m >= 1 && L - m <= K) offer(Kind::Rewind, m, -1);
-    for (int s = 0; s < slots_ck; ++s) {
-        const Ckpt & c = ck[s];
-        if (c.pos >= 1 && c.pos <= n - 1 && (int) c.ids.size() == c.pos && std::equal(c.ids.begin(), c.ids.end(), ids.begin()))
-            offer(Kind::Restore, c.pos, s);
+    while (park_used + need > budget)
+        if (!evict_oldest()) return false;
+    auto room = [&]() -> double {   // GiB the container / host could still give
+        double r = 1e18;
+        auto rd = [](const char * f, double & v) {   // one number from a cgroup file ("max" = no limit)
+            std::FILE * fp = std::fopen(f, "r");
+            if (!fp) return false;
+            char b[64] = {0};
+            const bool ok = std::fgets(b, sizeof b, fp) != nullptr;
+            std::fclose(fp);
+            if (!ok || std::strncmp(b, "max", 3) == 0) return false;
+            v = std::strtod(b, nullptr);
+            return true;
+        };
+        double mx = 0, cur = 0;
+        if (rd("/sys/fs/cgroup/memory.max", mx) && rd("/sys/fs/cgroup/memory.current", cur)) {
+            // memory.current counts the page cache the cgroup's reads filled (the model file: tens of GB, reclaimed
+            // under pressure) - only what cannot be reclaimed is in use
+            double file = 0;
+            if (std::FILE * fp = std::fopen("/sys/fs/cgroup/memory.stat", "r")) {
+                char line[256];
+                while (std::fgets(line, sizeof line, fp))
+                    if (std::strncmp(line, "active_file ", 12) == 0) file += std::strtod(line + 12, nullptr);
+                    else if (std::strncmp(line, "inactive_file ", 14) == 0) file += std::strtod(line + 14, nullptr);
+                std::fclose(fp);
+            }
+            r = std::min(r, (mx - std::max(0.0, cur - file)) / 1073741824.0 - 2.0);
+        }
+        if (std::FILE * fp = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, fp))
+                if (std::strncmp(line, "MemAvailable:", 13) == 0) { r = std::min(r, std::strtod(line + 13, nullptr) / 1048576.0 - 4.0); break; }
+            std::fclose(fp);
+        }
+        return r;
+    };
+    while (room() < need / 1073741824.0)
+        if (!evict_oldest()) return false;
+    return true;
+}
+
+// the live conversation into host RAM (when parking is on and it is worth it); its state stays in the engine too,
+// so a caller that then fails to use the slot it freed loses nothing
+void Server::park_live(const char * why) {
+    if (a.park_mib <= 0 || (int) live.size() < a.park_min) return;
+    int max_pos = (int) live.size();
+    for (int s = 0; s < slots_ck; ++s) max_pos = std::max(max_pos, ck[s].pos);
+    const size_t need = dense.park_bytes(max_pos);
+    if (!park_room(need)) {
+        std::fprintf(stderr, "ds4_serve: park: no room for a conversation of %zu tokens (%.0f MiB): not parked\n",
+                     live.size(), need / 1048576.0);
+        return;
     }
-    return best;
+    const double t = now_ms();
+    Parked P;
+    P.live = live;
+    for (int s = 0; s < kSlots; ++s) P.ck[s] = ck[s];
+    P.tick = ++park_tick;
+    if (!dense.park(max_pos, P.blob)) {
+        std::fprintf(stderr, "ds4_serve: park failed: %s\n", dense.last_error().c_str());
+        return;
+    }
+    park_used += P.blob.size();
+    char b[192];
+    std::snprintf(b, sizeof b, " parked %zu tokens (%s, %.1f MiB = %zu B, %.0f ms);", live.size(), why,
+                  P.blob.size() / 1048576.0, P.blob.size(), now_ms() - t);
+    park_note += b;
+    parked.push_back(std::move(P));
+}
+
+// a parked conversation (already taken out of the list) becomes the live state
+bool Server::unpark(Parked & P) {
+    const double t = now_ms();
+    const bool ok = dense.unpark(P.blob);
+    if (ok) {
+        live = P.live;
+        for (int s = 0; s < kSlots; ++s) ck[s] = P.ck[s];
+        char b[128];
+        std::snprintf(b, sizeof b, " unparked %zu tokens (%.0f MiB, %.0f ms);", live.size(), P.blob.size() / 1048576.0,
+                      now_ms() - t);
+        park_note += b;
+    } else {
+        std::fprintf(stderr, "ds4_serve: unpark failed (%s): the conversation is read again\n", dense.last_error().c_str());
+        dense.reset();
+        live.clear();
+        forget_all();
+    }
+    return ok;
 }
 
 void Server::forget_all() {
@@ -823,13 +1130,37 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
     auto stopped = [&]() { return in.stop_seq.load() >= seq || in.quit.load(); };
     const double t0 = now_ms();
 
-    // ---- reuse
+    // ---- reuse: the live state, or a parked conversation when it offers clearly more (mab776 M6)
+    park_note.clear();
     Choice c = choose(ids);
+    if (!parked.empty()) {
+        constexpr int kParkGain = 64;   // a swap costs two host copies (~0.1 s at 127k): worth ~64 tokens of prompt
+        size_t pick = parked.size();
+        Choice best;
+        for (size_t i = 0; i < parked.size(); ++i) {
+            const Choice ci = best_reuse(parked[i].live, parked[i].ck, slots_ck, ids, dense.max_tokens());
+            if (ci.R > best.R) { best = ci; pick = i; }
+        }
+        if (pick < parked.size() && best.R > c.R + kParkGain) {
+            // out of the list first: parking the live conversation may evict parked ones, never this one
+            Parked P = std::move(parked[pick]);
+            parked.erase(parked.begin() + (std::ptrdiff_t) pick);
+            park_used -= P.blob.size();
+            park_live("switched away");
+            if (unpark(P)) c = choose(ids);
+            else c = Choice{};
+        }
+    }
+    // the request starts over: the conversation the state holds is kept for a return to it.  (A restore of the turn
+    // checkpoint is every new turn's normal path - DeepSeek's template rewrites the last <think> - and parks nothing.)
+    if (c.kind == Kind::Reset) park_live("new conversation");
     const int L0 = (int) live.size();
     const int R = apply(c);
-    std::fprintf(stderr, "ds4_serve: GEN #%lld: %d tokens, max_new %lld; live %d, common %zu -> %s%s%s, reused %d\n",
+    std::fprintf(stderr, "ds4_serve: GEN #%lld: %d tokens, max_new %lld; live %d, common %zu -> %s%s%s, reused %d;%s parked "
+                         "%zu (%.0f MiB)\n",
                  (long long) seq, n, g.max_new, L0, c.lcp, kind_name(c.kind), c.kind == Kind::Restore ? " " : "",
-                 c.kind == Kind::Restore ? slot_name(c.slot) : "", R);
+                 c.kind == Kind::Restore ? slot_name(c.slot) : "", R, park_note.c_str(), parked.size(),
+                 park_used / 1048576.0);
     proto.line("RESUME %d", R);
 
     // ---- the prompt: [R, n-1), split at the checkpoint positions; then the last token through step()
@@ -841,6 +1172,10 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
     bool cancelled = false, failed = false, quit = false;
     std::string ferr;
     int pp_mark = R;   // the decode-loop PP cadence
+    // mab776 M7b: the MTP window = the positions the first drafts attend to, of those this request reads
+    const int W = il_mtp >= 0 ? std::max(R, n - 1 - (int) dense.geom().n_swa) : INT32_MAX;
+    t_mtp_win = 0;
+    drafts = accepted = 0;
     auto pp = [&](int pos) {
         const double ms = now_ms() - t0;
         proto.line("PP %d %d %.0f %.1f", pos, n, ms, ms > 0 ? 1000.0 * (pos - R) / ms : 0.0);
@@ -856,9 +1191,15 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             const int left = to - pos;
             if (a.prefill_chunk > 0 && left >= a.chunk_min) {
                 const int m = std::min(a.prefill_chunk, left);
+                before_chunk();
                 if (!chunk(ids.data() + pos, m, pos, quit)) {
                     failed = !quit;
                     ferr = "prefill failed: " + err;
+                    break;
+                }
+                if (il_mtp >= 0 && !mtp_fill_chunk(ids, pos, m, W, n)) {   // mab776 M7b
+                    failed = true;
+                    ferr = "MTP window failed: " + err;
                     break;
                 }
                 live.insert(live.end(), ids.begin() + pos, ids.begin() + pos + m);
@@ -867,6 +1208,11 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 pp_mark = pos;
             } else {
                 if (!step(ids[(size_t) pos], pos)) { failed = true; ferr = "prefill failed at " + std::to_string(pos) + ": " + err; break; }
+                if (il_mtp >= 0 && pos >= W && pos < n - 1) {   // mab776 M7b: the MTP window, token by token
+                    const double tm = now_ms();
+                    if (!mtp_draft_n(&ids[(size_t) pos + 1], 1, pos, nullptr)) { failed = true; ferr = "MTP window failed: " + err; break; }
+                    t_mtp_win += now_ms() - tm;
+                }
                 live.push_back(ids[(size_t) pos]);
                 ++pos;
                 if (pos - pp_mark >= 64) { pp(pos); pp_mark = pos; }
@@ -905,22 +1251,93 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         }
         const double td0 = now_ms();
         int pos = n;   // the position the next generated token is fed at
-        for (;;) {
-            if (stopped()) { finish = "cancel"; break; }
-            const float * lg = nullptr;
-            int nv = 0;
-            if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos - 1) + ": " + dense.last_error(); break; }
-            if (tokl) std::fwrite(lg, 4, (size_t) nv, tokl);
-            const int tok = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (pos - 1), hist.data(), hist.size(), scratch);
+        // emits one token; true when the request ends with it (a stop id, or max_new)
+        auto emit = [&](int tok, const float * row, int nv) -> bool {
+            if (tokl) std::fwrite(row, 4, (size_t) nv, tokl);
             proto.line("T %d", tok);
             ++gen;
-            if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) { finish = "stop"; break; }
-            if (gen >= g.max_new) { finish = "length"; break; }   // the last token needs no forward pass
-            if (!step(tok, pos)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos) + ": " + err; break; }
-            live.push_back(tok);
-            if (g.sp.penalty_last_n > 0) hist.push_back(tok);
-            ++pos;
-            delay(stopped);
+            if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) { finish = "stop"; return true; }
+            if (gen >= g.max_new) { finish = "length"; return true; }
+            return false;
+        };
+        if (il_mtp >= 0 && a.verify) {
+            oracle.clear();
+            n_fixed = 0;
+            if (const char * f = std::getenv("DS4_SERVE_TEST_ORACLE")) {
+                if (std::FILE * fp = std::fopen(f, "r")) {
+                    int v = 0;
+                    while (std::fscanf(fp, "%d", &v) == 1) oracle.push_back(v);
+                    std::fclose(fp);
+                }
+                corrupt_every = std::getenv("DS4_SERVE_TEST_CORRUPT") ? std::atoi(std::getenv("DS4_SERVE_TEST_CORRUPT")) : 0;
+            }
+            // mab776 M7b, speculative decoding (= ds4_generate's --verify loop, with the sampler): `cur` = the newest
+            // token (emitted, not yet fed) at position `pos`, `draft` = the MTP head's guess for pos + 1; one pass feeds
+            // both, row 0 decides the draft (ds4serve::verify_row: exact speculative sampling) and on a hit row 1 gives
+            // one more token for free.  Counters = the rows' positions, as in plain decoding.
+            const float * lg = nullptr;
+            int nv = 0;
+            bool done = false;
+            int cur = -1, draft = -1;
+            auto fix_draft = [&]() {   // after each MTP draft: `gen` = the index of the token it guesses
+                if (oracle.empty() || gen >= (int) oracle.size()) return;
+                draft = oracle[(size_t) gen];
+                if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) draft = (draft + 1) % n_vocab;
+            };
+            if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(n - 1) + ": " + dense.last_error(); }
+            else {
+                cur = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch);
+                done = emit(cur, lg, nv);
+                if (g.sp.penalty_last_n > 0) hist.push_back(cur);
+                if (!done && !mtp_draft_n(&cur, 1, n - 1, &draft)) { failed = true; ferr = "MTP draft failed: " + err; }
+                else if (!done) fix_draft();
+            }
+            while (!failed && !done) {
+                if (stopped()) { finish = "cancel"; break; }
+                const int toks[2] = { cur, draft };
+                if (!step_n(toks, 2, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
+                if (!dense.logits_n(2, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
+                live.push_back(cur);   // position pos holds `cur` now
+                ++drafts;
+                bool acc = false;
+                const int t1 = ds4serve::verify_row(lg, nv, g.sp, (uint64_t) pos, hist.data(), hist.size(), scratch, draft, &acc);
+                if (acc) {
+                    ++accepted;
+                    live.push_back(t1);   // position pos + 1 holds the draft, which is t1
+                    if ((done = emit(t1, lg, nv))) break;
+                    if (g.sp.penalty_last_n > 0) hist.push_back(t1);
+                    const int t2 = ds4serve::sample_row(lg + nv, nv, g.sp, (uint64_t) (pos + 1), hist.data(), hist.size(), scratch);
+                    if ((done = emit(t2, lg + nv, nv))) break;
+                    if (g.sp.penalty_last_n > 0) hist.push_back(t2);
+                    const int nxt[2] = { t1, t2 };
+                    if (!mtp_draft_n(nxt, 2, pos, &draft)) { failed = true; ferr = "MTP draft failed: " + err; break; }
+                    fix_draft();
+                    cur = t2;
+                    pos += 2;
+                } else {   // position pos + 1 holds a rejected draft: the next pass rewrites it (the rings' slack)
+                    if ((done = emit(t1, lg, nv))) break;
+                    if (g.sp.penalty_last_n > 0) hist.push_back(t1);
+                    if (!mtp_draft_n(&t1, 1, pos, &draft)) { failed = true; ferr = "MTP draft failed: " + err; break; }
+                    fix_draft();
+                    cur = t1;
+                    pos += 1;
+                }
+                delay(stopped);
+            }
+        } else {
+            for (;;) {
+                if (stopped()) { finish = "cancel"; break; }
+                const float * lg = nullptr;
+                int nv = 0;
+                if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos - 1) + ": " + dense.last_error(); break; }
+                const int tok = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (pos - 1), hist.data(), hist.size(), scratch);
+                if (emit(tok, lg, nv)) break;   // the last token needs no forward pass
+                if (!step(tok, pos)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos) + ": " + err; break; }
+                live.push_back(tok);
+                if (g.sp.penalty_last_n > 0) hist.push_back(tok);
+                ++pos;
+                delay(stopped);
+            }
         }
         dec_ms = now_ms() - td0;
         st = tier.stats();
@@ -935,8 +1352,9 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         return;
     }
     const int read_n = std::max(0, reached - R);
-    proto.line("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d", gen, n, prompt_ms, dec_ms, finish, R,
-               (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, read_n);
+    proto.line("DONE %d %d %.1f %.1f %s %lld %lld %d %lld %lld 0 %lld 0 %d", gen, n, prompt_ms, dec_ms, finish,
+               (long long) accepted, (long long) drafts, R, (long long) st.hits, (long long) st.lookups(),
+               (long long) st.file_tier, read_n);
     // serve/server.py's ENGINE_REQUEST shape (STRATA_REQUEST_LINES echoes it)
     char read_txt[64];
     if (std::strcmp(finish, "cancel") == 0 && reached < n)
@@ -945,11 +1363,17 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         std::snprintf(read_txt, sizeof read_txt, "%d", n - R);
     int nck = 0;
     for (int s = 0; s < slots_ck; ++s) nck += ck[s].pos > 0;
-    std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s), %d generated in "
-                         "%.0f ms (%.1f tok/s), %s; live %zu, %d checkpoints [last %d, turn %d, user %d]\n",
-                 n, R, read_txt, prompt_ms, prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, gen, dec_ms,
-                 dec_ms > 0 ? 1000.0 * gen / dec_ms : 0.0, finish, live.size(), nck, ck[kLast].pos, ck[kTurn].pos,
-                 ck[kUser].pos);
+    char dtxt[96] = "";
+    if (il_mtp >= 0)
+        std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted, MTP window %.0f ms", (long long) accepted,
+                      (long long) drafts, t_mtp_win);
+    std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s; cache shrink %.0f + "
+                         "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s; live %zu, %d checkpoints [last %d, "
+                         "turn %d, user %d]\n",
+                 n, R, read_txt, prompt_ms, prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, t_shrink, t_grow, gen,
+                 dec_ms, dec_ms > 0 ? 1000.0 * gen / dec_ms : 0.0, finish, dtxt, live.size(), nck, ck[kLast].pos,
+                 ck[kTurn].pos, ck[kUser].pos);
+    t_shrink = t_grow = 0;
 }
 
 void Server::loop() {
@@ -1025,6 +1449,11 @@ int main(int argc, char ** argv) {
             ggml_backend_dev_memory(ggml_backend_get_device(srv->be), &fr, &tot);
             extra = " vram_free_mib=" + std::to_string((long long) (fr >> 20));
         }
+        if (srv->tier.gpu1_device() >= 0)
+            extra += " gpu1_experts=" + std::to_string((long long) srv->tier.resident1()) +
+                     " gpu1_mib=" + std::to_string((long long) (srv->tier.gpu1_gib() * 1024.0));
+        if (srv->a.vram_grow >= 0) extra += " elastic=1";
+        if (srv->a.park_mib > 0) extra += " park_mib=" + std::to_string((long long) srv->a.park_mib);
         proto.line("INFO context=%lld engine=%s expert_slots=%lld arena_mib=%lld arena_experts=%lld file_tier=%lld "
                    "prefill_chunk=%d chunk_min=%d checkpoints=%d snapshot_kib=%lld turn_token=%d%s",
                    (long long) srv->ctx, kEngineVersion, (long long) srv->tier.resident(),

@@ -139,26 +139,30 @@ inline int sampled_tail(const int * sel_ids, const float * sel_logit, int k, con
     return pick;
 }
 
+// The penalised row (the logits themselves when no penalty applies; else a copy in `scratch`).
+inline const float * penalised_row(const float * logits, int nv, const SampleParams & p, const int * hist, size_t n_hist,
+                                   std::vector<float> & scratch) {
+    const size_t win = std::min<size_t>(n_hist, (size_t) std::min(std::max(p.penalty_last_n, 0), kPenaltyWindowCap));
+    if (win == 0) return logits;
+    scratch.assign(logits, logits + nv);
+    std::vector<int> w(hist + (n_hist - win), hist + n_hist);
+    std::sort(w.begin(), w.end());
+    for (size_t i = 0; i < w.size();) {
+        size_t j = i;
+        while (j < w.size() && w[j] == w[i]) ++j;
+        const int v = w[i];
+        if (v >= 0 && v < nv) scratch[(size_t) v] = apply_penalty(logits[v], (int) (j - i), p);   // ids outside: ignored
+        i = j;
+    }
+    return scratch.data();
+}
+
 // One token from one row of `nv` logits.  `hist` / `n_hist`: every token up to and including the row's own position
 // (prompt + generated so far), most recent last; only its last min(penalty_last_n, 4096) count.  `counter` = the
 // row's position.  `scratch` holds the penalised copy (reused across calls).
 inline int sample_row(const float * logits, int nv, const SampleParams & p, uint64_t counter,
                       const int * hist, size_t n_hist, std::vector<float> & scratch) {
-    const float * s = logits;
-    const size_t win = std::min<size_t>(n_hist, (size_t) std::min(std::max(p.penalty_last_n, 0), kPenaltyWindowCap));
-    if (win > 0) {
-        scratch.assign(logits, logits + nv);
-        std::vector<int> w(hist + (n_hist - win), hist + n_hist);
-        std::sort(w.begin(), w.end());
-        for (size_t i = 0; i < w.size();) {
-            size_t j = i;
-            while (j < w.size() && w[j] == w[i]) ++j;
-            const int v = w[i];
-            if (v >= 0 && v < nv) scratch[(size_t) v] = apply_penalty(logits[v], (int) (j - i), p);   // ids outside: ignored
-            i = j;
-        }
-        s = scratch.data();
-    }
+    const float * s = penalised_row(logits, nv, p, hist, n_hist, scratch);
     if (p.temperature <= 0.0f) return (int) (std::max_element(s, s + nv) - s);
     if (nv <= 0) return 0;
     const int k = sampled_k(p.top_k, nv);
@@ -166,6 +170,86 @@ inline int sample_row(const float * logits, int nv, const SampleParams & p, uint
     float vals[kSelMax] = {};
     select_top_k(s, nv, k, ids, vals);
     return sampled_tail(ids, vals, k, p, counter);
+}
+
+// mab776 M7b: the probabilities sampled_tail draws from - the same top_p / min_p / temperature steps over a
+// selection-ordered list - as (ids, probs), n_keep returned.  Mirrors sampled_tail line for line.
+inline int tail_distribution(const int * sel_ids, const float * sel_logit, int k, const SampleParams & p, int * ids,
+                             double * probs) {
+    double ex[kSelMax];
+    const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
+    int n_keep = k;
+    float mx = sel_logit[0];
+    for (int i = 1; i < k; ++i) mx = std::fmax(mx, sel_logit[i]);
+    if (p.top_p < 1.0f) {
+        double sum = 0.0;
+        for (int i = 0; i < k; ++i) ex[i] = std::exp((double) sel_logit[i] - (double) mx);
+        for (int i = 0; i < k; ++i) sum += ex[i];
+        for (int i = 0; i < k; ++i) ex[i] = ex[i] / sum;
+        int cut = k;
+        double cum = 0.0;
+        for (int i = 0; i < k; ++i) {
+            cum += ex[i];
+            if (cum >= (double) p.top_p) { cut = i + 1; break; }
+        }
+        if (cut < p.min_keep) cut = p.min_keep < k ? p.min_keep : k;
+        n_keep = cut;
+    }
+    if (p.min_p > 0.0f) {
+        const float thresh = sel_logit[0] + std::log(p.min_p);
+        for (int i = 0; i < n_keep; ++i)
+            if (sel_logit[i] < thresh) { n_keep = i; break; }
+    }
+    float smx = sel_logit[0] * inv_t;
+    for (int i = 1; i < n_keep; ++i) smx = std::fmax(smx, sel_logit[i] * inv_t);
+    double sum = 0.0;
+    for (int i = 0; i < n_keep; ++i) ex[i] = std::exp((double) (sel_logit[i] * inv_t) - (double) smx);
+    for (int i = 0; i < n_keep; ++i) sum += ex[i];
+    for (int i = 0; i < n_keep; ++i) { ids[i] = sel_ids[i]; probs[i] = ex[i] / sum; }
+    return n_keep;
+}
+
+// mab776 M7b: one row of a speculative-decoding verify pass with a DETERMINISTIC draft `draft` (the MTP head's argmax).
+//   greedy (temperature <= 0): the row's argmax - the draft is accepted iff it equals it;
+//   sampled: exact speculative sampling - the draft is accepted with probability p(draft) (a Philox draw on its own
+//   stream: counter | 2^62), else the token comes from p with the draft removed, renormalised (the row's own draw,
+//   counter).  Every token then has exactly the probability plain sampling gives it: p(d) for the draft,
+//   (1 - p(d)) * p(x) / (1 - p(d)) = p(x) for any other x.  The tokens differ from a plain run's with the same seed
+//   (different draws), the distribution does not.
+inline int verify_row(const float * logits, int nv, const SampleParams & p, uint64_t counter, const int * hist,
+                      size_t n_hist, std::vector<float> & scratch, int draft, bool * accepted) {
+    const float * s = penalised_row(logits, nv, p, hist, n_hist, scratch);
+    if (p.temperature <= 0.0f || nv <= 0) {
+        const int t = nv > 0 ? (int) (std::max_element(s, s + nv) - s) : 0;
+        *accepted = t == draft;
+        return t;
+    }
+    const int k = sampled_k(p.top_k, nv);
+    int sel[kSelMax] = {};
+    float vals[kSelMax] = {};
+    select_top_k(s, nv, k, sel, vals);
+    int ids[kSelMax] = {};
+    double pr[kSelMax] = {};
+    const int n = tail_distribution(sel, vals, k, p, ids, pr);
+    double pd = 0.0;
+    for (int i = 0; i < n; ++i) if (ids[i] == draft) pd += pr[i];
+    if (pd > 0.0 && (double) philox_uniform(p.seed, counter | (1ull << 62)) < pd) {
+        *accepted = true;
+        return draft;
+    }
+    *accepted = false;
+    const double rest = 1.0 - pd;
+    const float u = philox_uniform(p.seed, counter);
+    double cum = 0.0;
+    int pick = -1, last = -1;
+    for (int i = 0; i < n; ++i) {
+        if (ids[i] == draft) continue;
+        last = ids[i];
+        cum += rest > 0.0 ? pr[i] / rest : 0.0;
+        if ((double) u < cum) { pick = ids[i]; break; }
+    }
+    if (pick < 0) pick = last >= 0 ? last : (n > 0 ? ids[0] : draft);   // rounding: the last kept non-draft id
+    return pick;
 }
 
 }  // namespace ds4serve

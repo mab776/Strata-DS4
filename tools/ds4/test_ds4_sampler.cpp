@@ -310,6 +310,59 @@ void test_min_p_prefix() {
     }
 }
 
+// mab776 M7b: verify_row is exact speculative sampling - whatever the draft, the token frequencies over many draws
+// equal the plain chain's distribution (tail_distribution), and greedy accepts iff the draft is the argmax.
+void test_verify_row() {
+    std::vector<float> l(300);
+    for (int i = 0; i < 300; ++i) l[(size_t) i] = 4.0f * std::sin(0.37f * (float) i) + 0.01f * (float) i;
+    std::vector<float> scratch;
+    SampleParams g;   // greedy
+    const int am = (int) (std::max_element(l.begin(), l.end()) - l.begin());
+    bool acc = false;
+    CHECK(ds4serve::verify_row(l.data(), 300, g, 0, nullptr, 0, scratch, am, &acc) == am && acc, "greedy hit");
+    CHECK(ds4serve::verify_row(l.data(), 300, g, 0, nullptr, 0, scratch, am + 1, &acc) == am && !acc, "greedy miss");
+    for (int cfg = 0; cfg < 3; ++cfg) {
+        SampleParams p;
+        p.temperature = cfg == 2 ? 0.6f : 1.0f; p.top_k = cfg == 0 ? 40 : 20; p.top_p = cfg == 1 ? 0.9f : 1.0f;
+        p.min_p = cfg == 0 ? 0.05f : 0.0f; p.seed = 1234 + (uint64_t) cfg;
+        const int k = ds4serve::sampled_k(p.top_k, 300);
+        int sel[ds4serve::kSelMax], ids[ds4serve::kSelMax];
+        float vals[ds4serve::kSelMax];
+        double pr[ds4serve::kSelMax];
+        ds4serve::select_top_k(l.data(), 300, k, sel, vals);
+        const int n = ds4serve::tail_distribution(sel, vals, k, p, ids, pr);
+        CHECK(n >= 2, "cfg %d keeps %d tokens", cfg, n);
+        // drafts: the most likely token, a mid one, the least likely kept one, and one outside the kept list
+        int outside = 0;
+        while (std::find(ids, ids + n, outside) != ids + n) ++outside;
+        for (int draft : { ids[0], ids[n / 2], ids[n - 1], outside }) {
+            std::vector<double> cnt(300, 0.0);
+            const int N = 200000;
+            int n_acc = 0;
+            for (int c = 0; c < N; ++c) {
+                const int t = ds4serve::verify_row(l.data(), 300, p, (uint64_t) c, nullptr, 0, scratch, draft, &acc);
+                cnt[(size_t) t] += 1.0;
+                n_acc += acc;
+                CHECK(acc == (t == draft), "accepted must mean the draft came out");
+            }
+            double pd = 0.0;
+            for (int i = 0; i < n; ++i) if (ids[i] == draft) pd = pr[i];
+            CHECK(std::fabs((double) n_acc / N - pd) < 4.0 * std::sqrt(pd * (1.0 - pd) / N) + 1e-3,
+                  "cfg %d draft %d: accept rate %g vs p(d) %g", cfg, draft, (double) n_acc / N, pd);
+            double chi = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double e = pr[i] * N;
+                if (e >= 5.0) chi += (cnt[(size_t) ids[i]] - e) * (cnt[(size_t) ids[i]] - e) / e;
+            }
+            double kept = 0.0;
+            for (int i = 0; i < n; ++i) kept += cnt[(size_t) ids[i]];
+            CHECK(kept == N, "cfg %d draft %d: a token outside the kept list came out", cfg, draft);
+            // n - 1 degrees of freedom; 3x the dof is far above any chance level for these n at this N
+            CHECK(chi < 3.0 * (n - 1) + 30.0, "cfg %d draft %d: chi-square %g over %d tokens", cfg, draft, chi, n);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -326,6 +379,7 @@ int main(int argc, char ** argv) {
     test_against_reference();
     test_order_and_chi_square();
     test_min_p_prefix();
+    test_verify_row();
     if (g_fail) { std::fprintf(stderr, "test_ds4_sampler: %d FAILED\n", g_fail); return 1; }
     std::fprintf(stderr, "test_ds4_sampler: all checks passed\n");
     return 0;

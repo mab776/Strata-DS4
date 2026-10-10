@@ -30,6 +30,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 /// Construction parameters.  `backend` selects the compute backend (CPU or CUDA - the same code path);
 /// NULL means "create and own a CPU backend".  `comp_cap_max` bounds the compressed-row capacity per layer
@@ -204,6 +205,17 @@ public:
     int    snapshot_pos(int slot = 0) const;   ///< the positions slot `slot` holds, -1 = empty / no such slot
     size_t snapshot_bytes() const;             ///< bytes of one slot
     int    snapshot_slots() const;
+
+    // ---- conversation parking (mab776 M6, tools/ds4/ds4_serve.cpp) ----
+    /// The whole sequence state to host memory and back, so a server can switch conversations without reading them
+    /// again: the live rings, every snapshot slot (with its position) and the compressed / indexer rows that hold
+    /// positions below `max_pos` (each layer's completed blocks, plus the partial one's row).  `max_pos` must be at
+    /// least every position the state or a snapshot holds.  unpark() puts all of it back; the rows at and past
+    /// max_pos keep whatever they held, invisible as after reset() (a row is read only once its block completes, and
+    /// completing it rewrites it).
+    size_t park_bytes(int max_pos) const;
+    bool   park(int max_pos, std::vector<uint8_t> & out);
+    bool   unpark(const std::vector<uint8_t> & in);
 
     const std::string & last_error() const;
 
