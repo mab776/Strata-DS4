@@ -889,7 +889,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
             // the result is the same bits, and the peak becomes cap * block * 64 instead of cap * n * 64.  For
             // n <= block the loop runs once with `nb == n` and builds the identical graph, so decode, verify and
             // every chunk up to the block size are byte-identical by construction (DS4_IDX_BLOCK=0 = all at once).
-            const int64_t QB = idx_block_n(n);
+            int64_t QB = idx_block_n(n);
             ggml_tensor * sc = nullptr;
             // DS4_FUSED_IDX (default off-CPU): ggml's fused lightning-indexer op does score, relu, head weights, sum
             // and mask in one kernel (tensor cores when icomp is F16/Q8_0: --icomp-q8) instead of the ~9-op chain
@@ -901,6 +901,10 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 ggml_backend_supports_op(im.backend, ggml_lightning_indexer(gc, iq, lid_src, iw,
                                                                             ggml_cast(gc, var.vis, GGML_TYPE_F16)));
             ggml_tensor * vis16 = fidx ? ggml_cast(gc, var.vis, GGML_TYPE_F16) : nullptr;
+            // mab776: the fused kernel's output is just [cap, n] (no [cap, n, 64] intermediate to bound), so it takes
+            // every query in one call unless DS4_IDX_BLOCK is set: the blocks were joined by sc = concat(sc, scb),
+            // which re-copied all scores so far per block - ~8 GB a CSA layer-chunk at 250k (cap 65536, 32 blocks)
+            if (fidx && !std::getenv("DS4_IDX_BLOCK")) QB = n;
             for (int64_t t0 = 0; t0 < n; t0 += QB) {
                 const int64_t nb = std::min<int64_t>(QB, n - t0);
                 if (fidx) {
