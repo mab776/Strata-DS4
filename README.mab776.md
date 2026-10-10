@@ -257,7 +257,7 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   left.  Pass cap 4 -> 8 tokens (kNtMax + the tier's kMaxTok: the rings' slack, so in-place rewinds, is 8 now).
   Drafts' head = last column only, argmax on the device (`mtp_argmax`).  `--mtp-k K`; per request
   `strata_tune: {"mtp_k": K}` (0 = plain decoding - how the sweep timed a step on the same server).  CPU gate 44/44.
-  Sweep (deployed config, MXFP4 drafter experts on GPU 1, 512 code tokens, greedy, mean of 2 runs; tmp ksweep.py:
+  Sweep (deployed config, MXFP4 drafter experts on GPU 1, 512 code tokens, greedy, mean of 2 runs; bench/mab776-m2/work/m7c/ksweep.py:
   one prompt per depth, every K restores the same n-1 checkpoint):
 
   | depth | plain | K=1 | K=2 | K=3 | K=4 | K=5 |
