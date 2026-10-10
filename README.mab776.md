@@ -242,3 +242,59 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   stack `llm-router`, :8340). OWUI's only OpenAI connection (`http://llm-router:8000/v1`; backup of the old two
   connections: llm-router/owui-openai-config.bak-20261010.json). Lists every coder model (stopped ones "· not
   running"), routes by model id, stopped stack = 503 "start it on the mode page", resolves stack names per request.
+
+## Session 2026-10-10 late - M7c chained drafts (K=2 live), 0731-aligned head A/B, M10 radix-select top-k
+- **M7c (6218d874)** - Marc via the DeepSeek session: "did he try drafter at 2-3-4-5 tokens?".  ds4_serve drafts
+  K tokens per verify pass: dr[0] from the trunk's state as before, dr[1..K-1] from the MTP block's OWN output (its hc
+  streams, one position earlier) fed back as h (`Ds4Dense::mtp_chain_begin`); one pass of K + 1 tokens, rows decided
+  in order with the same exact speculative sampling (first rejection -> its row's replacement; all K accepted -> row
+  K's token free); the MTP block then reruns over the verified positions, rewriting the speculative rows the chain
+  left.  Pass cap 4 -> 8 tokens (kNtMax + the tier's kMaxTok: the rings' slack, so in-place rewinds, is 8 now).
+  Drafts' head = last column only, argmax on the device (`mtp_argmax`).  `--mtp-k K`; per request
+  `strata_tune: {"mtp_k": K}` (0 = plain decoding - how the sweep timed a step on the same server).  CPU gate 44/44.
+  Sweep (deployed config, MXFP4 drafter experts on GPU 1, 512 code tokens, greedy, mean of 2 runs; tmp ksweep.py:
+  one prompt per depth, every K restores the same n-1 checkpoint):
+
+  | depth | plain | K=1 | K=2 | K=3 | K=4 | K=5 |
+  |---|---|---|---|---|---|---|
+  | 8k   | 46.8 | 60.0 | 60.0 | 60.5 | 51.5 | 47.3 |
+  | 127k | 44.3 | 53.1 | **56.3** | 53.9 | 47.0 | 44.8 |
+  | 248k | 43.2 | 46.8 | **50.4** | 49.0 | - | - |
+
+  Acceptance by draft position (conditional) ~74-78 / 51-55 / 36-41 / 19-30 / 12-13 %; tokens per pass 1.77 / 2.1 /
+  2.3 / 2.2 / 2.3; each extra verify token +3.1-4.2 ms (step 21.4 / 22.6 / 23.2 ms) = ~15 % of a step, so K=2 (vLLM's
+  k=4 rule does not carry over).  Per-pass d1 acceptance looks lower for K >= 2: a selection effect (bigger passes
+  eat the easy runs, so more passes start at hard tokens) - judge by net tok/s.  **Deployed `--mtp-k 1` for now**:
+  greedy (T=0) needle runs at 240k looped more with K=2 (11/53 vs 1/45 by 18:00) although K=2's math is clean (below);
+  Marc 10-10: decide on the SAMPLED loop rate (what clients use) - trial running, K=2 goes default if it matches.
+- **0731 alignment**: philpax's bf16 MTP file = the ORIGINAL V4-Flash head (avlp12's sidecar differs: linears cos
+  0.995 / rel 9 % - its base was a 4-bit pack - and hc_head.fn cos 0.89).  Applied r6c_step5000 with
+  tools/ds4/mtp_sidecar.py -> `models/deepseek-v4-draft/mtp/DeepSeek-V4-Flash-MTP-bf16-aligned0731-r6c.gguf` (kept;
+  sidecars in `models/deepseek-v4-draft/sidecar-0731/`).  Chained acceptance up (d2 57-58 vs 48-55 %, d3 41-45 vs 36 %),
+  d1 a bit down (74-76 vs 77-78 %); net decode a wash: 127k K=2 56.1 vs 56.3, K=1 52.1 vs 53.1; 8k K=2 61.2 vs 60.0.
+  Kept the original; re-test after the RAM upgrade.
+- **M10 radix-select top-k (70f22b3c)**, tools/ds4/patches/ggml-topk-radix-select.patch: ggml-cuda's TOP_K for rows
+  >= 2048 columns = one launch, one block per row (12 + 10 + 10-bit histogram passes find the k-th key, early exit,
+  one gather pass; ties across the boundary take the lowest indices = a stable sort's set; `GGML_TOPK_RADIX=0` = stock).
+  The stock path CUB-sorted every whole row: 0.34-0.36 ms per layer for a verify pass's 2-8 rows at 65,536 compressed
+  rows (21 layers per pass!) and 13.5 ms per layer for a 2048-token chunk.  Standalone (exact sets vs a stable-sort
+  reference incl. ties / -inf tails / all-equal): 1.30 vs 13.5 ms (2048 x 65536), 0.07 vs 0.35 ms (1-8 rows).
+  Prompt chunks use ggml_top_k now (`DS4_PF_ARGSORT=1` = the old argsort).  Same binary, same prompts, stock -> new:
+
+  | depth | prefill | plain | K=1 | K=2 |
+  |---|---|---|---|---|
+  | 127k | 1,212 -> **1,256** | 44.5 -> 44.8 | 51.2 -> 56.0 | 55.9 -> **63.7** |
+  | 250k | 1,053 -> **1,133** | 43.2 -> 43.4 | 45.8 -> 55.7 | 51.8 -> **59.9** |
+
+  The verify pass is now nearly flat in depth (K=1 30.0 / 30.2 ms at 127k / 250k, was 33.6 / 36.9).
+- **K=2 numerics, verified** (diagnostic switches, ds4_serve/ds4_moe): `DS4_SERVE_TEST_FORCE=1` + the oracle =
+  teacher forcing (every run emits the oracle's tokens, so plain / K=1 / K=2 logits rows compare row for row - no
+  trajectory divergence); `DS4_MULTI_SERIAL=1` = the GPU tier runs a verify pass token by token; `DS4_CHECK_MULTI=<l>`
+  = layer l's GPU 0 multi-token expert rows recomputed alone and byte-compared.  127k, 384 forced tokens, KL vs a
+  plain reference: plain 0.0019-0.0021, K=1 0.0018-0.0021, K=2 0.0018 (no slot pattern); with every 2nd / 3rd draft
+  corrupted (rejections): plain 0.0026-0.0031, K=2 0.0025-0.0029; serial tier: same.  => no K=2 state or kernel bug;
+  the greedy loop gap is a trajectory effect (temperature 0 at near-ties).
+- **Determinism**: the engine is NOT bit-deterministic run to run - two plain decodes from the same checkpoint on the
+  same server already differ (the expert tier's placement moves between requests; CPU and GPU expert numerics
+  differ).  So outputs cannot be compared by hash across builds; correctness rests on the CPU gate, the kernels'
+  standalone exact tests, and needles.

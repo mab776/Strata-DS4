@@ -9,7 +9,8 @@
   "--vram-margin 9 / --vram-grow 2 = the elastic GPU 0 cache (prompts on the margin budget, decode on the grown one),",
   "--gpu1 1 = GPU 1 as a static expert tier, --mtp = speculative decoding, --park-mib = conversation parking in RAM;",
   "env STRATA_MMQ_FP4=1 = the 2 MXFP4 layers on FP4 MMQ. gpu [0, 1] + gpu_order as_given keep the dense half on GPU 0.",
-  "Left out on purpose - the server refuses them for DeepSeek: vision, parallel, slot_save_path, vram_elastic."
+  "Left out on purpose - the server refuses them for DeepSeek: vision, parallel, slot_save_path, vram_elastic.",
+  "Speculative decoding (10-10): --mtp-device 1 = the MTP head's MXFP4 experts on GPU 1 (--arena-gib 41 = room for the experts GPU 1's tier gives up); --mtp-k K = chained drafts per verify pass: K=2 is the fastest (M7c sweep), K=1 deployed while a greedy-loop trial runs (README.md). A request overrides it with strata_tune.mtp_k (0 = no drafts)."
  ],
  "architecture": "deepseek4",
  "exe": "build/ds4_serve",
@@ -36,7 +37,7 @@
   "--pf-b",
   "0.7",
   "--arena-gib",
-  "38",
+  "41",
   "--arena-skip-resident",
   "--prefill-chunk",
   "2048",
@@ -48,7 +49,10 @@
   "1",
   "--mtp",
   "/mtp/DeepSeek-V4-Flash-MTP-bf16.gguf",
-  "--mtp-resident",
+  "--mtp-device",
+  "1",
+  "--mtp-k",
+  "1",
   "--park-mib",
   "4096"
  ],

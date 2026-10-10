@@ -3,6 +3,10 @@
 <p align="center"><b>DeepSeek-V4-Flash (284B MoE) on one gaming PC, faster than llama.cpp</b><br>
 A DeepSeek-V4 engine built on <a href="https://github.com/Niko1221/Strata">Strata</a> · Linux · NVIDIA · MIT</p>
 
+> *This is the README of upstream [Indras-Mirror/Strata-DS4](https://github.com/Indras-Mirror/Strata-DS4) as of the fork's
+> last merge, kept for its architecture notes and original measurements (RTX 4090 + 5700X). This fork's own README,
+> with its server and its numbers, is [README.md](README.md).*
+
 > **Status: experimental, single-developer research code.** It generates correct, coherent text and beats
 > llama.cpp's best configuration on the machine below, but it has been measured on exactly one PC, has no server or
 > chat UI of its own yet, and serves one sequence at a time. Expect rough edges. The upstream Strata README (the
