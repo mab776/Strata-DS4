@@ -1,7 +1,7 @@
 #!/bin/sh
 # mab776: build Strata-DS4's ds4_generate (+ header-only geometry test) for sm_120 in a throwaway CUDA 12.8 container,
 # WITHOUT a GPU, RAM/CPU-capped so nvcc can't squeeze whatever is serving. Same flags as the README's build-ds4-gpu,
-# arch 89 -> 120a (plain 120 can't assemble the MXFP4 block-scale MMA). ggml = full llama.cpp checkout of the pinned commit (third_party/ggml/VERSION.txt) in third_party/llama.cpp.  Log: build-mab776.log
+# arch 89 -> 120a (plain 120 can't assemble the MXFP4 block-scale MMA). BUILD_TARGETS overrides the target list. ggml = full llama.cpp checkout of the pinned commit (third_party/ggml/VERSION.txt) in third_party/llama.cpp.  Log: build-mab776.log
 cd "$(dirname "$0")" || exit 1
 docker run --rm --name ds4-build --memory ${BUILD_MEM:-12g} --memory-swap ${BUILD_MEM:-12g} --cpus ${BUILD_CPUS:-8} \
   -v "$PWD":/src -w /src ${CUDA_IMAGE:-nvidia/cuda:12.8.1-devel-ubuntu24.04} bash -euc "
@@ -18,6 +18,6 @@ docker run --rm --name ds4-build --memory ${BUILD_MEM:-12g} --memory-swap ${BUIL
     cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DSTRATA_GGML_DIR=/src/third_party/llama.cpp \
       -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc
-    nice -n 19 cmake --build build-ds4-gpu --target ds4_generate ds4_geometry_test -j ${BUILD_J:-4}
+    nice -n 19 cmake --build build-ds4-gpu --target ${BUILD_TARGETS:-ds4_generate ds4_geometry_test test_ds4_moe} -j ${BUILD_J:-4}
     echo BUILD_DONE
   " > build-mab776.log 2>&1

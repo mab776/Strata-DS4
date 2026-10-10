@@ -58,6 +58,7 @@ struct Args {
     std::string experts = "gpu";    // routed tier: gpu (cache + prefetch + CPU/PCIe) | cpu (pool only)
     int64_t slots = 2150;   // <= 0: auto (free VRAM after the dense half, minus --vram-margin)
     double vram_margin_gib = 0.9;
+    bool vram_margin_set = false;   // mab776: an explicit --vram-margin wins over the long-context default
     double pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int64_t ctx = 0;   // context cap for the compressed-KV state (0 = prompt + n_predict + 64)
@@ -120,7 +121,7 @@ bool parse(int argc, char** argv, Args& a) {
         else if (k == "--backend") a.backend = next();
         else if (k == "--experts") a.experts = next();
         else if (k == "--slots") { const std::string v = next(); a.slots = v == "auto" ? 0 : std::atoll(v.c_str()); }
-        else if (k == "--vram-margin") a.vram_margin_gib = std::atof(next().c_str());
+        else if (k == "--vram-margin") { a.vram_margin_gib = std::atof(next().c_str()); a.vram_margin_set = true; }
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--profile") a.profile = next();
@@ -248,17 +249,52 @@ int main(int argc, char** argv) {
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
     if (!dense.reserve_graphs(a.verify ? 2 : 1)) { std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str()); return 1; }
+    double slot_gib_auto = 0.0;   // mab776: the auto cache budget in GiB when blob sizes differ per layer
     if (a.slots <= 0) {
+        // mab776: long contexts get more headroom after the dense half (2.0 GiB from 65,536 tokens; the M2 depth runs
+        // at 262,144 calibrate it); an explicit --vram-margin wins
+        if (!a.vram_margin_set && ctx >= 65536) a.vram_margin_gib = 2.0;
         // CUDA-graph instances take VRAM when first captured (after this point): the MTP block and the 2-token
         // verify graphs add many (a 0.9 GiB margin OOMed in cudaGraphInstantiate with --mtp, 2026-10-07)
         if (!a.mtp.empty()) a.vram_margin_gib += 0.25;
         if (a.verify) a.vram_margin_gib += 0.75;
         size_t fr = 0, tot = 0;
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
-        const double blob = 6.75 * 1048576.0;   // one DS4 expert (IQ2_XXS gate/up + Q2_K down)
-        a.slots = std::max<int64_t>(0, (int64_t) (((double) fr - a.vram_margin_gib * 1073741824.0) / blob));
-        std::fprintf(stderr, "slots auto: %.2f GiB free after the dense half -> %lld slots (margin %.2f GiB)\n",
-                     fr / 1073741824.0, (long long) a.slots, a.vram_margin_gib);
+        const double budget = std::max(0.0, (double) fr - a.vram_margin_gib * 1073741824.0);
+        // mab776: size by the file's REAL expert bytes, per layer.  A fixed 6.75 MiB (the author's IQ2_XXS + Q2_K
+        // file) over-asks on unsloth UD files, whose experts are 7.19-9.38 MiB (UD-IQ2_M: IQ2_XXS/IQ2_S gate/up,
+        // IQ3_XXS/MXFP4 down): 44.7 GB asked of 39.4 free.  Mixed sizes -> a byte budget (Ds4MoeConfig::slot_gib, every slot sized
+        // to its own layer's blob) with an uncapped count, the way Strata-GLM's glm_generate sizes its cache;
+        // uniform sizes -> the slot count that fits (the tier ignores slot_gib there).
+        strata::ds4::Ds4MoeGeom mg;
+        if (!strata::ds4::ds4_moe_geom_from_gguf(a.model, mg, err)) {
+            std::fprintf(stderr, "ds4_generate: slots auto: %s\n", err.c_str());
+            return 1;
+        }
+        int64_t bmin = 0, bmax = 0;
+        for (int64_t l = 0; l < mg.n_layers; ++l) {
+            if (!mg.routed(l)) continue;
+            strata::kernels::cpu::NativeFmt lf;
+            if (!strata::ds4::ds4_moe_layer_layout(mg, l, lf, err)) {
+                std::fprintf(stderr, "ds4_generate: slots auto: %s\n", err.c_str());
+                return 1;
+            }
+            const int64_t b = (int64_t) lf.bytes;
+            bmin = bmin == 0 ? b : std::min(bmin, b);
+            bmax = std::max(bmax, b);
+        }
+        if (bmax <= 0) { std::fprintf(stderr, "ds4_generate: slots auto: no routed experts in %s\n", a.model.c_str()); return 1; }
+        if (bmin == bmax) {
+            a.slots = (int64_t) (budget / (double) bmax);
+        } else {
+            slot_gib_auto = budget / 1073741824.0;
+            a.slots = mg.n_routed() * mg.n_experts;   // the byte budget binds, not the count
+        }
+        std::fprintf(stderr, "slots auto: %.2f GiB free after the dense half -> %.2f GiB of expert slots (margin %.2f GiB; "
+                             "expert %.2f-%.2f MiB -> %lld-%lld experts)\n", fr / 1073741824.0, budget / 1073741824.0,
+                     a.vram_margin_gib, bmin / 1048576.0, bmax / 1048576.0, (long long) (budget / (double) bmax),
+                     (long long) (budget / (double) bmin));
+        if (budget <= 0) a.slots = 0;
     }
 
     // ---- routed-expert tier
@@ -266,6 +302,7 @@ int main(int argc, char** argv) {
     ds4::Ds4MoeTier tier;
     ds4::Ds4MoeConfig mc;
     mc.slots = a.slots;
+    mc.slot_gib = slot_gib_auto;   // mab776: 0 = slots x the largest blob (an explicit --slots N, or uniform blobs)
     mc.pcie_frac = a.pcie;
     mc.pf_b = a.pf_b;
     mc.threads = a.threads;

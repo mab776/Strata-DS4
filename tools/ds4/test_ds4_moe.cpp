@@ -144,6 +144,13 @@ void deq_q8_k(const uint8_t* q, int64_t n, float* out) {
     }
 }
 
+/// mab776: the activation the kernel consumes, dequantized in ITS format: Q8_K for the IQ/K-quant types, but Q8_0
+/// for MXFP4 (ggml-cpu's vec_dot_type) - reading Q8_0 bytes as Q8_K gave the MXFP4-down layers a garbage reference.
+void deq_act(int type, const uint8_t* q, int64_t n, float* out) {
+    if (type == (int) GGML_TYPE_Q8_K) { deq_q8_k(q, n, out); return; }
+    ggml_get_type_traits((ggml_type) type)->to_float(q, out, n);
+}
+
 /// The activation's scale.  The experts consume `fn = rms_norm(...) * ffn_norm.weight` and an RMS-norm output is
 /// unit-RMS, so `x_i = ffn_norm.weight[i] * z_i` with z ~ N(0,1) is what the experts actually see - which is what
 /// decides how large the gate/up pre-activations (and so the clamp probe) are.  Both real arms read the model's
@@ -206,7 +213,7 @@ void ref_expert(const cpu::NativeFmt& f, const uint8_t* blob, const float* x, fl
     std::vector<float> xd((size_t) H), g((size_t) FF), u((size_t) FF), h((size_t) FF), hd((size_t) FF);
     if (engine_activation) {
         cpu::native_quant_act(f, x, act.data());
-        deq_q8_k(act.data(), H, xd.data());
+        deq_act(f.gu_act, act.data(), H, xd.data());
     } else {
         std::memcpy(xd.data(), x, (size_t) H * 4);
     }
@@ -223,7 +230,7 @@ void ref_expert(const cpu::NativeFmt& f, const uint8_t* blob, const float* x, fl
     swiglu_ref(g.data(), u.data(), h.data(), FF, f.swiglu_limit, probe);
     if (engine_activation) {
         cpu::native_quant_h(f, h.data(), hq.data());
-        deq_q8_k(hq.data(), FF, hd.data());
+        deq_act(f.d_act, hq.data(), FF, hd.data());
     } else {
         std::memcpy(hd.data(), h.data(), (size_t) FF * 4);
     }
@@ -420,11 +427,23 @@ int arm_real(const std::string& gguf, int sets, bool require_gguf, float lim_ove
     cpu::ExpertPool& pool = tier.pool();
     // Layer 0 is hash-routed (its experts are chosen by token id) and layer 20 is router-routed; both hold the
     // same expert tensors, which is the whole point - the tier does not care how the ids were chosen.
-    const int64_t layers[2] = {0, 20};
+    std::vector<int64_t> layers = {0, 20};
+    // mab776: a per-layer file also gets the first layer of every other (gate, up, down) type combination, so each
+    // format the tier runs is checked (unsloth UD-IQ2_M: the IQ2_S gate/up layer and the two MXFP4-down layers)
+    if (g.per_layer())
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (!g.routed(l)) continue;
+            bool seen = false;
+            for (int64_t m : layers)
+                seen = seen || (g.gate_type(m) == g.gate_type(l) && g.up_type(m) == g.up_type(l) &&
+                                g.down_type(m) == g.down_type(l));
+            if (!seen) layers.push_back(l);
+        }
+    const int nsets = g.per_layer() ? (int) layers.size() : std::min(sets, 2);
     std::mt19937 rng(20261006);
     std::normal_distribution<float> xn(0.f, 1.0f);
     std::vector<float> x((size_t) f.n_embd), nw((size_t) f.n_embd), w6((size_t) g.top_k);
-    for (int s = 0; s < std::min(sets, 2); ++s) {
+    for (int s = 0; s < nsets; ++s) {
         // THE ACTIVATION SCALE MATTERS FOR THE CLAMP PROBE, so it is the model's own.
         read_ffn_norm(gguf, layers[s], f.n_embd, nw);
         const double nw_rms = rms_of(nw);
@@ -433,9 +452,17 @@ int arm_real(const std::string& gguf, int sets, bool require_gguf, float lim_ove
         for (int64_t e = 0; e < g.top_k; ++e) ids[(size_t) e] = (int32_t) (s * 11 + e * 7 + 3);
         for (int64_t i = 0; i < f.n_embd; ++i) x[(size_t) i] = nw[(size_t) i] * xn(rng);
         router_weights(rng, g.top_k, w6.data());
-        std::printf("   L%lld: ffn_norm.weight RMS %.4f (the activation's scale)\n", (long long) layers[s], nw_rms);
+        std::printf("   L%lld: ffn_norm.weight RMS %.4f (the activation's scale); types gate %d up %d down %d\n",
+                    (long long) layers[s], nw_rms, g.gate_type(layers[s]), g.up_type(layers[s]), g.down_type(layers[s]));
+        // mab776: a per-layer file (unsloth UD: IQ2_XXS/IQ2_S gate/up, IQ3_XXS/MXFP4 down) must be checked against
+        // ITS layer's format; `f` is the per-role maximum (a buffer size, no real layer has it)
+        cpu::NativeFmt fl = f;
+        if (g.per_layer() && !strata::ds4::ds4_moe_layer_layout(g, layers[s], fl, err)) {
+            std::printf("real: %s\n", err.c_str());
+            return 1;
+        }
         SetResult r;
-        check_set(tier, blobs, f, pool, layers[s], ids.data(), x.data(), w6.data(),
+        check_set(tier, blobs, fl, pool, layers[s], ids.data(), x.data(), w6.data(),
                   "real L" + std::to_string(layers[s]), r);
         probe_total.merge(r.probe);
     }
@@ -539,6 +566,11 @@ int arm_gpu(const std::string& gguf, int sets, float lim_override = 0.0f) {
     // NOT a model load).  Layer 0 because the arena's index-order default IS this list, so nothing is read twice -
     // the tier does not care which layer's experts it is handed.
     const int64_t L = 0;
+    // mab776: the reference must use layer L's own format on a per-layer file (f = the per-role maximum)
+    if (g.per_layer() && !strata::ds4::ds4_moe_layer_layout(g, L, f, err)) {
+        std::printf("gpu: %s\n", err.c_str());
+        return 1;
+    }
     std::vector<std::pair<int32_t, int32_t>> ranked;
     for (int e = 0; e < kArena; ++e) ranked.push_back({(int32_t) L, (int32_t) e});
 
