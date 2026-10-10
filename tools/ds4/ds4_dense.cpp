@@ -34,9 +34,10 @@ namespace {
 constexpr float NEG_INF  = -INFINITY;
 constexpr float SENTINEL = -1.0e30f;   // "compressor state row not written yet" score: exp() underflows to 0
 
-// Tokens one verify pass carries (the main token + up to 3 drafts).  Every ring is this many - 1 slots longer than
-// its gather window, so a later token of a pass never overwrites a row an earlier token of the same pass reads.
-constexpr int64_t kNtMax = 4;
+// Tokens one verify pass carries (the main token + up to 7 chained drafts; was 4 before mab776 M7c).  Every ring is
+// this many - 1 slots longer than its gather window, so a later token of a pass never overwrites a row an earlier token
+// of the same pass reads.
+constexpr int64_t kNtMax = 8;
 
 // Every graph here has its own gallocr and never changes after it is built, so it needs allocating once.  Stamping it
 // with a uid then lets ggml-cuda skip its per-call node-property memcpy/memcmp (ggml_cuda_graph_update_required) and
@@ -454,6 +455,13 @@ struct Ds4Dense::Impl {
     ggml_tensor * mtp_logits_t[kNtMax + 1] = {};
     ggml_gallocr_t allo_mtp_in[kNtMax + 1] = {};
     ggml_gallocr_t allo_mtp_head[kNtMax + 1] = {};
+    // mab776 M7c, chained drafts: the MTP input for one token whose h is x_state column c (the MTP block's own output
+    // one position earlier), and the MTP head on column c reduced to its argmax on the device - both by c
+    ggml_cgraph * gf_mtp_chain[kNtMax] = {};
+    ggml_gallocr_t allo_mtp_chain[kNtMax] = {};
+    ggml_cgraph * gf_mtp_arg[kNtMax] = {};
+    ggml_tensor * mtp_arg_t[kNtMax] = {};         // I32 [1]
+    ggml_gallocr_t allo_mtp_arg[kNtMax] = {};
     ggml_cgraph * gf_head[kNtMax + 1] = {};
     ggml_tensor * logits_t[kNtMax + 1] = {};      // [V, n] head graph outputs
     ggml_gallocr_t allo_init[kNtMax + 1] = {};
@@ -490,6 +498,8 @@ struct Ds4Dense::Impl {
         for (ggml_gallocr_t a : allo_head) free_allo(a);
         for (ggml_gallocr_t a : allo_mtp_in) free_allo(a);
         for (ggml_gallocr_t a : allo_mtp_head) free_allo(a);
+        for (ggml_gallocr_t a : allo_mtp_chain) free_allo(a);
+        for (ggml_gallocr_t a : allo_mtp_arg) free_allo(a);
         if (shared_allo) ggml_gallocr_free(shared_allo);
         if (sbuf) ggml_backend_buffer_free(sbuf);
         if (hbuf) ggml_backend_buffer_free(hbuf);
@@ -1341,14 +1351,17 @@ static ggml_cgraph * build_init(Ds4Dense::Impl & im, int64_t n) {
 // the MTP file: llama.cpp loads that file as its own model, so graph_mtp's hc_head_* are the file's) and
 // shared_head_norm, the trunk's output (the file's is a BF16 copy of the original V4's; ours is 0731's).
 // DS4_MTP_TRUNK_HC=1: the trunk's hc_head instead (the pre-2026-10-07 behaviour, for A/B and mutation checks)
-static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false) {
+// mab776 M7c: `arg_col` >= 0 = the MTP head on x_state column arg_col alone (n = 1), reduced to its argmax (I32 [1] in
+// mtp_arg_t[arg_col]): a draft needs no [V] row on the host
+static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false, int64_t arg_col = -1) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 256, false);
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC;
 
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2],
-                                     im.pf ? (size_t) im.pf_row0 * im.x_state->nb[2] : 0);   // chunk: rows row0..
+    const size_t x_off = im.pf ? (size_t) im.pf_row0 * im.x_state->nb[2]                 // chunk: rows row0..
+                       : arg_col >= 0 ? (size_t) arg_col * im.x_state->nb[2] : 0;
+    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], x_off);
     ggml_tensor * flat = ggml_reshape_2d(gc, xin, HC * D, n);
     ggml_tensor * flat_norm = ggml_rms_norm(gc, flat, (float) im.g.rms_eps);
     static const bool trunk_hc = [] { const char * e = std::getenv("DS4_MTP_TRUNK_HC"); return e && *e && *e != '0'; }();
@@ -1362,6 +1375,13 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
     ggml_tensor * rn = b.rms_w(hc_head, mtp ? b.BL((int) im.il_mtp, "nextn.shared_head_norm.weight")
                                             : im.w.get("output_norm.weight"));
     ggml_tensor * lg = ggml_mul_mat(gc, im.w.get("output.weight"), rn);
+    if (arg_col >= 0) {
+        ggml_tensor * am = ggml_argmax(gc, lg);
+        ggml_set_output(am);
+        ggml_build_forward_expand(gf, am);
+        im.mtp_arg_t[arg_col] = am;
+        return gf;
+    }
     ggml_set_output(lg);
     ggml_build_forward_expand(gf, lg);
     if (im.pf) im.pf_logits = lg;
@@ -1371,17 +1391,21 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
 
 // MTP input: x_state <- eh_proj(concat(enorm(embd[next]) repeated over the hc streams, hnorm(x_state))), per token.
 // x_state holds the trunk's final hc streams (after the last finish_layer); i_emb the next tokens' embeddings.
-static ggml_cgraph * build_mtp_in(Ds4Dense::Impl & im, int64_t n) {
+// mab776 M7c: `src` > 0 (n = 1, a chained draft) reads h from column src - the MTP block's own output for the
+// previous draft - and writes column 0.
+static ggml_cgraph * build_mtp_in(Ds4Dense::Impl & im, int64_t n, int64_t src = 0) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 64, false);
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC;
     const int il = (int) im.il_mtp;
     ggml_tensor * xs = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * xh = src == 0 ? xs : ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2],
+                                                    (size_t) src * im.x_state->nb[2]);
     ggml_tensor * emb = ggml_view_2d(gc, im.i_emb, D, n, im.i_emb->nb[1], 0);
     ggml_tensor * en = b.rms_w(emb, b.BL(il, "nextn.enorm.weight"));
     en = ggml_repeat_4d(gc, ggml_reshape_3d(gc, en, D, 1, n), D, HC, n, 1);
-    ggml_tensor * hn = b.rms_w(xs, b.BL(il, "nextn.hnorm.weight"));
+    ggml_tensor * hn = b.rms_w(xh, b.BL(il, "nextn.hnorm.weight"));
     ggml_tensor * x = ggml_mul_mat(gc, b.BL(il, "nextn.eh_proj.weight"), ggml_concat(gc, en, hn, 0));   // [D, HC, n]
     ggml_build_forward_expand(gf, ggml_cpy(gc, x, xs));
     return gf;
@@ -2032,7 +2056,10 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             caps.push_back(L.comp_max);
         }
         for (int n = 1; n <= n_max; ++n) {
+            // mab776 M7c: passes of 3+ tokens (chained drafts) reserve their largest capacity only - it sizes the shared
+            // arena; the smaller ones are built when the context first reaches them (~3x the graph nodes otherwise)
             for (int64_t cap : caps) {
+                if (n > 2 && Impl::shared_on() && cap != caps.back()) continue;
                 Impl::Var * var = attn_var(im, il, cap, n);
                 if (!ggml_gallocr_reserve(var->allo, var->gf)) { im.err = "reserve: attention graph"; return false; }
                 if (n == 1 && cap > 0 && comp_skip_on()) {   // the no-block-completes variant too
@@ -2052,6 +2079,24 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             im.err = "reserve: mtp"; return false;
         }
     }
+    if (im.il_mtp >= 0 && n_max > 1) {   // mab776 M7c: the chained drafts' input and argmax graphs
+        for (int c = 0; c < n_max; ++c) {
+            if (!im.gf_mtp_arg[c]) {
+                im.gf_mtp_arg[c] = build_head(im, 1, true, c);
+                im.allo_mtp_arg[c] = im.make_allo();
+            }
+            if (!im.allo_mtp_arg[c] || !ggml_gallocr_reserve(im.allo_mtp_arg[c], im.gf_mtp_arg[c])) {
+                im.err = "reserve: mtp argmax"; return false;
+            }
+            if (c > 0 && !im.gf_mtp_chain[c]) {
+                im.gf_mtp_chain[c] = build_mtp_in(im, 1, c);
+                im.allo_mtp_chain[c] = im.make_allo();
+                if (!im.allo_mtp_chain[c] || !ggml_gallocr_reserve(im.allo_mtp_chain[c], im.gf_mtp_chain[c])) {
+                    im.err = "reserve: mtp chain"; return false;
+                }
+            }
+        }
+    }
     if (Impl::shared_on() && im.shared_allo) {
         std::fprintf(stderr, "dense compute buffers: one shared arena %.1f MiB for every decode graph\n",
                      ggml_gallocr_get_buffer_size(im.shared_allo, 0) / 1048576.0);
@@ -2066,6 +2111,7 @@ bool Ds4Dense::reserve_graphs(int n_max) {
         }
         for (int n = 0; n <= (int) kNtMax; ++n) other += sz(im.allo_init[n]) + sz(im.allo_head[n]);
         for (int n = 0; n <= (int) kNtMax; ++n) other += sz(im.allo_mtp_in[n]) + sz(im.allo_mtp_head[n]);
+        for (int c = 0; c < (int) kNtMax; ++c) other += sz(im.allo_mtp_chain[c]) + sz(im.allo_mtp_arg[c]);
         const double M = 1048576.0;
         std::fprintf(stderr, "dense compute buffers: attention %.0f MiB (%lld graphs, largest %.1f MiB), finish %.0f, "
                              "predict %.0f, init/head/mtp %.0f MiB\n", attn / M, (long long) n_attn, attn_max / M,
@@ -2116,14 +2162,11 @@ bool Ds4Dense::logits_n(int n, const float ** out, int * n_vocab) {
     return true;
 }
 
-bool Ds4Dense::mtp_begin(const int * next_tids, int n) {
-    Impl & im = *p_;
-    if (im.il_mtp < 0) { im.err = "mtp_begin: no MTP head loaded"; return false; }
-    if (!im.ensure_n(n)) return false;
-    if (!alloc_graph(im.allo_mtp_in[n], im.gf_mtp_in[n])) { im.err = "gallocr(mtp_in) failed"; return false; }
+// embd[tids] for n tokens into i_emb's first n columns (looked up on the host, from the GGUF mmap)
+static bool put_emb(Ds4Dense::Impl & im, const int * tids, int n) {
     im.host_emb.resize((size_t) (im.D * n));
     for (int t = 0; t < n; ++t) {
-        const int tid = next_tids[t];
+        const int tid = tids[t];
         if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
         const uint8_t * row = im.embd_data + (size_t) tid * im.embd_row;
         float * dst = im.host_emb.data() + (size_t) t * im.D;
@@ -2131,6 +2174,56 @@ bool Ds4Dense::mtp_begin(const int * next_tids, int n) {
         else ggml_get_type_traits((ggml_type) im.embd_type)->to_float(row, dst, im.D);
     }
     ggml_backend_tensor_set(im.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    return true;
+}
+
+bool Ds4Dense::mtp_chain_begin(int next_tid, int src) {
+    Impl & im = *p_;
+    if (im.il_mtp < 0) { im.err = "mtp_chain_begin: no MTP head loaded"; return false; }
+    if (src < 0 || src >= (int) kNtMax) { im.err = "mtp_chain_begin: bad source column"; return false; }
+    if (!im.ensure_n(1)) return false;
+    if (!im.gf_mtp_chain[src]) {
+        im.gf_mtp_chain[src] = src == 0 ? im.gf_mtp_in[1] : build_mtp_in(im, 1, src);
+        im.allo_mtp_chain[src] = src == 0 ? nullptr : im.make_allo();
+        if (src != 0 && !im.allo_mtp_chain[src]) { im.err = "ggml_gallocr_new failed"; return false; }
+    }
+    ggml_gallocr_t a = src == 0 ? im.allo_mtp_in[1] : im.allo_mtp_chain[src];
+    if (!alloc_graph(a, im.gf_mtp_chain[src])) { im.err = "gallocr(mtp chain) failed"; return false; }
+    if (!put_emb(im, &next_tid, 1)) return false;
+    if (ggml_backend_graph_compute(im.backend, im.gf_mtp_chain[src]) != GGML_STATUS_SUCCESS) {
+        im.err = "mtp chain input graph compute failed";
+        return false;
+    }
+    return true;
+}
+
+bool Ds4Dense::mtp_argmax(int col, int * tok) {
+    Impl & im = *p_;
+    if (im.il_mtp < 0) { im.err = "mtp_argmax: no MTP head loaded"; return false; }
+    if (col < 0 || col >= (int) kNtMax) { im.err = "mtp_argmax: bad column"; return false; }
+    if (!im.gf_mtp_arg[col]) {
+        im.gf_mtp_arg[col] = build_head(im, 1, true, col);
+        im.allo_mtp_arg[col] = im.make_allo();
+        if (!im.allo_mtp_arg[col]) { im.err = "ggml_gallocr_new failed"; return false; }
+    }
+    if (!alloc_graph(im.allo_mtp_arg[col], im.gf_mtp_arg[col])) { im.err = "gallocr(mtp argmax) failed"; return false; }
+    if (ggml_backend_graph_compute(im.backend, im.gf_mtp_arg[col]) != GGML_STATUS_SUCCESS) {
+        im.err = "mtp argmax graph compute failed";
+        return false;
+    }
+    int32_t v = -1;
+    ggml_backend_tensor_get(im.mtp_arg_t[col], &v, 0, 4);
+    if (v < 0 || v >= im.g.vocab_size) { im.err = "mtp argmax out of range"; return false; }
+    *tok = (int) v;
+    return true;
+}
+
+bool Ds4Dense::mtp_begin(const int * next_tids, int n) {
+    Impl & im = *p_;
+    if (im.il_mtp < 0) { im.err = "mtp_begin: no MTP head loaded"; return false; }
+    if (!im.ensure_n(n)) return false;
+    if (!alloc_graph(im.allo_mtp_in[n], im.gf_mtp_in[n])) { im.err = "gallocr(mtp_in) failed"; return false; }
+    if (!put_emb(im, next_tids, n)) return false;
     if (const char * dbg = std::getenv("DS4_DBG_MTP_H")) {    // append the trunk state the MTP reads (D*HC*n f32)
         std::vector<float> v((size_t) (im.D * im.HC * n));
         ggml_backend_tensor_get(im.x_state, v.data(), 0, v.size() * 4);

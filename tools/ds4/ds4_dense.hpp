@@ -94,7 +94,7 @@ public:
 
     const strata::Ds4Geometry & geom()     const;
     int64_t                     n_layer()  const;
-    int                         max_tokens() const;   ///< tokens a multi-token pass may carry
+    int                         max_tokens() const;   ///< tokens a multi-token pass may carry (8 since mab776 M7c)
     /// The MTP block's layer index (== n_layer()) when an MTP head is loaded, else -1.  Drafting a token at position
     /// p: after the trunk's last finish_layer and logits for p, mtp_begin(&tok[p+1], 1), then the usual
     /// attn_router(_n) / routed experts / finish_layer(_n) with il = mtp_layer() at position p, then mtp_logits_n()
@@ -143,6 +143,14 @@ public:
     bool mtp_begin(const int * next_tids, int n);
     /// MTP head (hc_head -> nextn.shared_head_norm -> output) after the MTP block's finish_layer(_n).
     bool mtp_logits_n(int n, const float ** out, int * n_vocab);
+    /// mab776 M7c, chained drafts: the MTP input for ONE token whose h is the MTP block's own output in state column
+    /// `src` (the previous draft's, one position earlier) instead of the trunk's: column 0 <- eh_proj(enorm(embd[
+    /// next_tid]), hnorm(column src)).  Then attn_router_n / experts / finish_layer_n(mtp_layer(), 1) at the position
+    /// after the previous draft's, and mtp_argmax(0) for the next draft.
+    bool mtp_chain_begin(int next_tid, int src);
+    /// mab776 M7c: the MTP head's argmax for state column `col` (after the MTP block's finish_layer(_n)), on the device:
+    /// the draft without a [n_vocab] row to the host.
+    bool mtp_argmax(int col, int * tok);
 
     /// Diagnostics for the gate, all as computed on the last `attn_router`/`finish_layer` call (host copies):
     /// the flash-attn output before the output LoRA [n_head*d_head], the attention output after it [n_embd],

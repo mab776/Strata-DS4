@@ -10,10 +10,13 @@
 //   out  INFO k=v ...                 once, before READY (context, engine, expert_slots, ...)
 //   out  READY <ctx> stop             "stop": STOP is honoured mid-request
 //   in   GEN <max_new>[ key=value ...] <id,id,...>    the WHOLE prompt every time; the engine finds what it can reuse
+//                                     (keys: the sampler's, seed, ckpt, mtp_k = chained drafts per pass, 0 = plain
+//                                     decoding; others skipped)
 //   out  RESUME <reused>              before reading: the prompt tokens not read again (always <= n - 1)
 //   out  PP <pos> <n> <ms> <tok/s>    after every prompt chunk (every 64 tokens without chunks), and once at n
 //   out  T <id>                       per generated token - the stop token too
-//   out  DONE <gen> <n> <prompt_ms> <decode_ms> <stop|length|cancel> 0 0 <reused> <hits> <lookups> 0 <file_tier> 0
+//   out  DONE <gen> <n> <prompt_ms> <decode_ms> <stop|length|cancel> <accepted> <drafted> <reused> <hits> <lookups> 0
+//        <file_tier> 0
 //        <prompt_read>                exactly once per accepted GEN (15 fields: serve/server.py _parse_done)
 //   out  ERR <why>                    instead of DONE; the engine stays in step (nothing follows)
 //   in   STOP                         ends the running request (DONE ... cancel); a STOP between requests is stale
@@ -70,7 +73,7 @@ namespace {
 
 namespace ds4 = strata::ds4;
 
-constexpr const char * kEngineVersion = "ds4-serve-0.2";   // 0.2: M6 (GPU 1 tier, elastic cache per prompt)
+constexpr const char * kEngineVersion = "ds4-serve-0.3";   // 0.2: M6 (GPU 1 tier, elastic cache); 0.3: M7c (K drafts)
 constexpr int kPrefillChunkMax = 8192;   // a bigger chunk overflows the attention graph's 4096 nodes at long context
 
 double now_ms() {
@@ -121,6 +124,9 @@ struct Args {
     bool mtp_resident = false;
     int mtp_keep = 0;
     int mtp_device = -1;   // --mtp-device N: the MTP head's experts on GPU N (3.4 GB MXFP4) instead of the CPU
+    // mab776 M7c: --mtp-k K = K chained drafts per verify pass (the head fed its own output for drafts 2..K), one pass
+    // of K + 1 tokens; a request's `mtp_k` key overrides it.  1 = M7b's single draft.
+    int mtp_k = 1;
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -167,7 +173,7 @@ void usage() {
         "       [--f16-q8] [--dense-requant q4_k|q5_k|q6_k] [--route-bias F] [--vram-lru] [--arena-adapt]\n"
         "       [--arena-skip-resident] [--skip-miss T] [--seed N] [--stop id,id] [--turn-token ID] [--no-ckpt]\n"
         "       [--gpu1 N [--gpu1-gib G] [--gpu1-reserve G]] [--vram-grow G] [--park-mib MiB [--park-min tokens]]\n"
-        "       [--mtp FILE [--mtp-resident] [--mtp-keep K] [--mtp-device N]]\n"
+        "       [--mtp FILE [--mtp-resident] [--mtp-keep K] [--mtp-device N] [--mtp-k 1..7]]\n"
         "  Strata's engine line protocol on stdin/stdout (serve/server.py); see the head of tools/ds4/ds4_serve.cpp.\n");
 }
 
@@ -269,6 +275,7 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--mtp-resident") a.mtp_resident = true;
         else if (k == "--mtp-keep") { if (!num_i(0, 64, iv)) return false; a.mtp_keep = (int) iv; }
         else if (k == "--mtp-device") { if (!num_i(-1, 64, iv)) return false; a.mtp_device = (int) iv; }
+        else if (k == "--mtp-k") { if (!num_i(1, 7, iv)) return false; a.mtp_k = (int) iv; }
         else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
@@ -390,6 +397,7 @@ struct Gen {
     ds4serve::SampleParams sp;
     unsigned long long seed = 0;   // 0 = none given
     bool ckpt = true;
+    int mtp_k = -1;                // mab776 M7c: this request's chained drafts per pass (-1 = --mtp-k, 0 = none)
 };
 
 // upstream generate.cpp's parse_i64_list: commas and blanks separate, every id an int32 >= 0
@@ -453,6 +461,7 @@ std::string parse_gen(const std::string & line, Gen & g, int n_vocab, int64_t ct
         else if (key == "penalty_present") fval(pen_present);
         else if (key == "seed") g.seed = std::strtoull(val, nullptr, 10);   // a 30-digit seed saturates
         else if (key == "ckpt") g.ckpt = std::strtoll(val, nullptr, 10) != 0;
+        else if (key == "mtp_k") { long long v = 0; ival(v); g.mtp_k = (int) std::clamp<long long>(v, 0, 64); }
     }
     std::string pe;
     if (g.max_new < 1 || !parse_ids(endp, g.ids, pe)) return "bad request: " + (pe.empty() ? std::string("max_new") : pe);
@@ -557,6 +566,11 @@ struct Server {
     std::vector<int32_t> ids32_n;
     std::vector<float> mw, mrouted, w_n, routed_n;
     int64_t drafts = 0, accepted = 0;   // this request's
+    // mab776 M7c: this request's drafts examined / accepted by chain position (row j of a pass is examined when the
+    // drafts before it passed), its verify passes and their ms (step_n + logits_n)
+    std::vector<int64_t> d_off, d_acc;
+    int64_t passes = 0;
+    double t_pass = 0;
     // DS4_SERVE_TEST_ORACLE=<file> (re-read per request): drafts from a plain greedy run's tokens (the draft for the
     // n-th emitted token = line n), DS4_SERVE_TEST_CORRUPT=k spoils every k-th - the mini MTP's random weights never
     // draft right, so without this only the reject path would run (= ds4_generate's DS4_VERIFY_ORACLE)
@@ -576,6 +590,7 @@ struct Server {
     bool step(int tid, int pos);
     bool step_n(const int * toks, int n, int pos0);
     bool mtp_draft_n(const int * next, int n, int pos0, int * draft);
+    bool mtp_chain(int next, int src, int pos, int * draft);
     bool mtp_fill_chunk(const std::vector<int> & ids, int c0, int m, int W, int n);
     bool chunk(const int * toks, int n, int pos0, bool & quit);
     void before_chunk();
@@ -663,7 +678,7 @@ bool Server::init(std::string & why) {
     dc.snapshot_slots = slots_ck;
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     if (!dense.init(a.model, dc, err)) { why = "dense init: " + err; return false; }
-    if (!dense.reserve_graphs(a.verify ? 2 : 1)) { why = dense.last_error(); return false; }
+    if (!dense.reserve_graphs(a.verify ? a.mtp_k + 1 : 1)) { why = dense.last_error(); return false; }
     // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's routed experts - on the CPU, or on GPU --mtp-device.
     // On a GPU they go in NOW, before GPU 0's cache is sized from its free VRAM and before GPU 1's tier is filled, so
     // the tier that card holds is what gives the room up (Marc's placement sweep: 1 = GPU 1, 0 = GPU 0)
@@ -881,11 +896,27 @@ bool Server::mtp_draft_n(const int * next, int n, int pos0, int * draft) {
                            mrouted.data() + (size_t) t * n_embd)) { err = "MTP experts failed"; return false; }
     }
     if (!dense.finish_layer_n(il_mtp, n, mrouted.data())) { err = dense.last_error(); return false; }
-    const float * lg = nullptr;
-    int nv = 0;
-    if (!dense.mtp_logits_n(n, &lg, &nv)) { err = dense.last_error(); return false; }
-    const float * last = lg + (size_t) (n - 1) * nv;
-    if (draft) *draft = (int) (std::max_element(last, last + nv) - last);
+    // the head for the last position only, its argmax on the device (mab776 M7c; the window needs no head at all)
+    if (draft && !dense.mtp_argmax(n - 1, draft)) { err = dense.last_error(); return false; }
+    return true;
+}
+
+// mab776 M7c: one chained draft - the MTP block at position `pos` for the token `next` (the previous draft), its h the
+// MTP block's own output for pos - 1 in state column `src` (the trunk has not seen these tokens yet) -> the draft for
+// pos + 2.  The MTP row it writes at pos is speculative: the next verified pass's mtp_draft_n rewrites it.
+bool Server::mtp_chain(int next, int src, int pos, int * draft) {
+    struct Timer { Server & s; double t0; ~Timer() { s.t_mtp_all += now_ms() - t0; ++s.n_mtp_calls; } } tm{ *this, now_ms() };
+    const float * x = nullptr;
+    if (!dense.mtp_chain_begin(next, src)) { err = dense.last_error(); return false; }
+    if (!dense.attn_router_n(il_mtp, pos, 1, mids.data(), mw.data(), &x)) { err = dense.last_error(); return false; }
+    if (a.mtp_device >= 0) {
+        if (!mtp_x.run_n(x, mids.data(), mw.data(), mrouted.data(), 1)) { err = "MTP experts failed"; return false; }
+    } else if (!mtp_x.run(x, mids.data(), mw.data(), mrouted.data())) {
+        err = "MTP experts failed";
+        return false;
+    }
+    if (!dense.finish_layer_n(il_mtp, 1, mrouted.data())) { err = dense.last_error(); return false; }
+    if (!dense.mtp_argmax(0, draft)) { err = dense.last_error(); return false; }
     return true;
 }
 
@@ -1199,6 +1230,10 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
     t_mtp_all = 0;
     n_mtp_calls = 0;
     drafts = accepted = 0;
+    d_off.clear();
+    d_acc.clear();
+    passes = 0;
+    t_pass = 0;
     auto pp = [&](int pos) {
         const double ms = now_ms() - t0;
         proto.line("PP %d %d %.0f %.1f", pos, n, ms, ms > 0 ? 1000.0 * (pos - R) / ms : 0.0);
@@ -1283,7 +1318,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             if (gen >= g.max_new) { finish = "length"; return true; }
             return false;
         };
-        if (il_mtp >= 0 && a.verify) {
+        if (il_mtp >= 0 && a.verify && g.mtp_k != 0) {
             oracle.clear();
             n_fixed = 0;
             if (const char * f = std::getenv("DS4_SERVE_TEST_ORACLE")) {
@@ -1294,57 +1329,87 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 }
                 corrupt_every = std::getenv("DS4_SERVE_TEST_CORRUPT") ? std::atoi(std::getenv("DS4_SERVE_TEST_CORRUPT")) : 0;
             }
-            // mab776 M7b, speculative decoding (= ds4_generate's --verify loop, with the sampler): `cur` = the newest
-            // token (emitted, not yet fed) at position `pos`, `draft` = the MTP head's guess for pos + 1; one pass feeds
-            // both, row 0 decides the draft (ds4serve::verify_row: exact speculative sampling) and on a hit row 1 gives
-            // one more token for free.  Counters = the rows' positions, as in plain decoding.
+            // mab776 M7b/M7c, speculative decoding (= ds4_generate's --verify loop, with the sampler): `cur` = the newest
+            // token (emitted, not yet fed) at position `pos`; dr[0..K-1] = the MTP head's guesses for pos + 1 .. pos + K
+            // - dr[0] from the trunk's states (the MTP block over the positions the last pass verified), dr[j] from the
+            // MTP block's own output one position earlier (chained: the trunk has not seen those tokens).  One pass
+            // feeds cur and the K drafts; rows 0..K-1 decide the drafts in order (ds4serve::verify_row: exact
+            // speculative sampling) up to the first rejection, whose row gives the replacement token, and when all K
+            // pass row K gives one more.  Counters = the rows' positions, as in plain decoding.
+            const int K = std::clamp(g.mtp_k > 0 ? g.mtp_k : a.mtp_k, 1, NT - 1);   // mtp_k=0: the plain loop below
             const float * lg = nullptr;
             int nv = 0;
             bool done = false;
-            int cur = -1, draft = -1;
-            auto fix_draft = [&]() {   // after each MTP draft: `gen` = the index of the token it guesses
-                if (oracle.empty() || gen >= (int) oracle.size()) return;
-                draft = oracle[(size_t) gen];
-                if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) draft = (draft + 1) % n_vocab;
+            int cur = -1;
+            std::vector<int> dr((size_t) K), toks((size_t) K + 1), nxt((size_t) K + 1);
+            auto fix_draft = [&](int j) {   // dr[j] guesses the token emitted at index gen + j
+                if (oracle.empty() || gen + j >= (int) oracle.size()) return;
+                dr[(size_t) j] = oracle[(size_t) (gen + j)];
+                if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) dr[(size_t) j] = (dr[(size_t) j] + 1) % n_vocab;
             };
+            // the MTP block at the verified positions p0 .. p0+nn-1 with the tokens after them (its last column guesses
+            // p0 + nn + 1), then K - 1 chained drafts at the positions after it
+            auto draft_chain = [&](const int * next, int nn, int p0) -> bool {
+                if (!mtp_draft_n(next, nn, p0, &dr[0])) return false;
+                fix_draft(0);
+                for (int j = 1; j < K; ++j) {
+                    if (!mtp_chain(dr[(size_t) j - 1], j == 1 ? nn - 1 : 0, p0 + nn - 1 + j, &dr[(size_t) j])) return false;
+                    fix_draft(j);
+                }
+                return true;
+            };
+            d_off.assign((size_t) K, 0);
+            d_acc.assign((size_t) K, 0);
+            passes = 0;
+            t_pass = 0;
             if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(n - 1) + ": " + dense.last_error(); }
             else {
                 cur = ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch);
                 done = emit(cur, lg, nv);
                 if (g.sp.penalty_last_n > 0) hist.push_back(cur);
-                if (!done && !mtp_draft_n(&cur, 1, n - 1, &draft)) { failed = true; ferr = "MTP draft failed: " + err; }
-                else if (!done) fix_draft();
+                if (!done && !draft_chain(&cur, 1, n - 1)) { failed = true; ferr = "MTP draft failed: " + err; }
             }
             while (!failed && !done) {
                 if (stopped()) { finish = "cancel"; break; }
-                const int toks[2] = { cur, draft };
-                if (!step_n(toks, 2, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
-                if (!dense.logits_n(2, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
+                toks[0] = cur;
+                for (int j = 0; j < K; ++j) toks[(size_t) j + 1] = dr[(size_t) j];
+                const double tp = now_ms();
+                if (!step_n(toks.data(), K + 1, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
+                if (!dense.logits_n(K + 1, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
+                t_pass += now_ms() - tp;
+                ++passes;
                 live.push_back(cur);   // position pos holds `cur` now
-                ++drafts;
-                bool acc = false;
-                const int t1 = ds4serve::verify_row(lg, nv, g.sp, (uint64_t) pos, hist.data(), hist.size(), scratch, draft, &acc);
-                if (acc) {
-                    ++accepted;
-                    live.push_back(t1);   // position pos + 1 holds the draft, which is t1
-                    if ((done = emit(t1, lg, nv))) break;
-                    if (g.sp.penalty_last_n > 0) hist.push_back(t1);
-                    const int t2 = ds4serve::sample_row(lg + nv, nv, g.sp, (uint64_t) (pos + 1), hist.data(), hist.size(), scratch);
-                    if ((done = emit(t2, lg + nv, nv))) break;
-                    if (g.sp.penalty_last_n > 0) hist.push_back(t2);
-                    const int nxt[2] = { t1, t2 };
-                    if (!mtp_draft_n(nxt, 2, pos, &draft)) { failed = true; ferr = "MTP draft failed: " + err; break; }
-                    fix_draft();
-                    cur = t2;
-                    pos += 2;
-                } else {   // position pos + 1 holds a rejected draft: the next pass rewrites it (the rings' slack)
-                    if ((done = emit(t1, lg, nv))) break;
-                    if (g.sp.penalty_last_n > 0) hist.push_back(t1);
-                    if (!mtp_draft_n(&t1, 1, pos, &draft)) { failed = true; ferr = "MTP draft failed: " + err; break; }
-                    fix_draft();
-                    cur = t1;
-                    pos += 1;
+                drafts += K;
+                int A = 0;             // drafts accepted: positions pos + 1 .. pos + A hold them
+                int last = -1;         // the token after them (emitted, not fed): the next pass's `cur`
+                for (int j = 0; j < K && !done; ++j) {
+                    ++d_off[(size_t) j];
+                    bool acc = false;
+                    const float * row = lg + (size_t) j * nv;
+                    last = ds4serve::verify_row(row, nv, g.sp, (uint64_t) (pos + j), hist.data(), hist.size(), scratch,
+                                                dr[(size_t) j], &acc);
+                    if (acc) {
+                        ++d_acc[(size_t) j];
+                        ++accepted;
+                        ++A;
+                        live.push_back(last);   // position pos + 1 + j holds the draft, which is `last`
+                    }
+                    done = emit(last, row, nv);
+                    if (!done && g.sp.penalty_last_n > 0) hist.push_back(last);
+                    if (!acc) break;   // positions above pos + A hold rejected drafts: later passes rewrite them
                 }
+                if (done) break;
+                if (A == K) {          // every draft passed: row K's token for free
+                    const float * row = lg + (size_t) K * nv;
+                    last = ds4serve::sample_row(row, nv, g.sp, (uint64_t) (pos + K), hist.data(), hist.size(), scratch);
+                    if ((done = emit(last, row, nv))) break;
+                    if (g.sp.penalty_last_n > 0) hist.push_back(last);
+                }
+                for (int j = 0; j < A; ++j) nxt[(size_t) j] = dr[(size_t) j];
+                nxt[(size_t) A] = last;
+                if (!draft_chain(nxt.data(), A + 1, pos)) { failed = true; ferr = "MTP draft failed: " + err; break; }
+                cur = last;
+                pos += A + 1;
                 delay(stopped);
             }
         } else {
@@ -1392,10 +1457,24 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         std::snprintf(htxt, sizeof htxt, "; experts GPU0 %.1f%% GPU1 %.1f%% CPU %.1f%% PCIe %.1f%%", 100.0 * st.hits / L,
                       100.0 * st.hits1 / L, 100.0 * st.cpu / L, 100.0 * st.pcie / L);
     }
-    char dtxt[128] = "";
-    if (il_mtp >= 0)
-        std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted, MTP window %.0f ms, %.2f ms/draft", (long long) accepted,
-                      (long long) drafts, t_mtp_win, drafts > 0 ? (t_mtp_all - t_mtp_win) / (double) drafts : 0.0);
+    char dtxt[384] = "";
+    if (il_mtp >= 0 && d_off.empty()) {
+        std::snprintf(dtxt, sizeof dtxt, "; drafts off (mtp_k=0)");
+    } else if (il_mtp >= 0) {
+        // mab776 M7c: acceptance by chain position (of the rows examined: draft j is examined when 0..j-1 passed), the
+        // tokens a pass gives, and a pass's ms (step_n + logits_n) apart from the drafts'
+        std::string by;
+        for (size_t j = 0; j < d_off.size(); ++j) {
+            char b[48];
+            std::snprintf(b, sizeof b, "%s%lld/%lld", j ? " " : "", (long long) d_acc[j], (long long) d_off[j]);
+            by += b;
+        }
+        std::snprintf(dtxt, sizeof dtxt, "; drafts %lld/%lld accepted (K=%zu, by position %s; %lld passes of %.1f ms, "
+                                         "%.2f tokens each), MTP window %.0f ms, %.2f ms/draft",
+                      (long long) accepted, (long long) drafts, d_off.size(), by.c_str(), (long long) passes,
+                      passes > 0 ? t_pass / (double) passes : 0.0, passes > 0 ? (double) gen / (double) passes : 0.0,
+                      t_mtp_win, drafts > 0 ? (t_mtp_all - t_mtp_win) / (double) drafts : 0.0);
+    }
     std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s; cache shrink %.0f + "
                          "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s%s; live %zu, %d checkpoints [last %d, "
                          "turn %d, user %d]\n",

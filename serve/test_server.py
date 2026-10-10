@@ -1521,6 +1521,11 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("spec_min_p=0.7", k)
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
+        # mab776 M7c: the DeepSeek engine's chained drafts per pass, an int 1..7
+        self.assertIn("mtp_k=3", self.keys(temperature=0, strata_tune={"mtp_k": 3}))
+        self.assertIn("mtp_k=0", self.keys(temperature=0, strata_tune={"mtp_k": 0}))   # no drafts
+        for mk in (-1, 8, True, 2.0, "3"):
+            self.assertFalse([x for x in self.keys(strata_tune={"mtp_k": mk}) if x.startswith("mtp_k=")], mk)
 
     def test_checkpoint_key(self):
         self.assertIn("ckpt=0", self.keys(temperature=0, strata_checkpoint=False))

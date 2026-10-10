@@ -973,6 +973,11 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+            # mab776 M7c: the DeepSeek engine's chained MTP drafts per verify pass (ds4_serve --mtp-k) for this request;
+            # 0 = no drafts (plain decoding, e.g. to time a step)
+            mk = tune.get("mtp_k")
+            if isinstance(mk, int) and not isinstance(mk, bool) and 0 <= mk <= 7:
+                keys += f" mtp_k={mk}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:

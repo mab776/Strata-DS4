@@ -315,7 +315,7 @@ class Spec:
     """DESIGN.md section 4, in Python: which RESUME each request must get, and what the engine holds afterwards.
     Mutation runs set DS4_TEST_SPEC_K / DS4_TEST_SPEC_KEEP_ABOVE=1 / DS4_TEST_SPEC_KEEP_RESET=1 so the spec makes the
     mutated engine's choice and the logits comparison (not a decision mismatch) has to catch the mutant."""
-    K = int(os.environ.get("DS4_TEST_SPEC_K", "4"))                       # Ds4Dense::max_tokens()
+    K = int(os.environ.get("DS4_TEST_SPEC_K", "8"))                       # Ds4Dense::max_tokens() (4 before M7c)
     KEEP_ABOVE = os.environ.get("DS4_TEST_SPEC_KEEP_ABOVE") == "1"        # mutation: checkpoints above R are kept
     KEEP_RESET = os.environ.get("DS4_TEST_SPEC_KEEP_RESET") == "1"        # mutation: a reset keeps the checkpoints
 
@@ -473,10 +473,11 @@ class T2Reuse(Case):
                 choice = spec.choose(ids)
                 self.assertEqual(choice[:2], ("rewind", len(live) - k), f"drop {k}")
                 self.step(eng, spec, ids, 10, what=f"rewind {k}")
-            live = spec.live   # 5 positions back: beyond the rings' slack -> the newest checkpoint below it
-            ids = live[:len(live) - 5] + [other(live[len(live) - 5])] + prompt(3, 30)
+            live = spec.live   # K + 1 positions back: beyond the rings' slack -> the newest checkpoint below it
+            d = Spec.K + 1
+            ids = live[:len(live) - d] + [other(live[len(live) - d])] + prompt(3, 30)
             r7 = ids
-            self.step(eng, spec, ids, 24, what="drop 5 -> checkpoint")
+            self.step(eng, spec, ids, 24, what=f"drop {d} -> checkpoint")
             self.assertEqual(eng.decision(eng.seq)[0], "checkpoint")
             self.step(eng, spec, r7, 24, what="regenerate -> turn checkpoint at n-1")
             ids = r7[:len(r7) - 1] + [other(r7[-1])] + prompt(6, 31)   # H12: the template's </think> for <think>
@@ -661,7 +662,8 @@ class T2Reuse(Case):
                     self.assertEqual(eng.close(), 0)
 
     def test_swa16_wrap(self):
-        """The 16-token window: the raw ring (19 slots) wraps inside the prompts; rewinds 1..4 and restores across it."""
+        """The 16-token window: the raw ring (16 + K - 1 slots) wraps inside the prompts; rewinds 1..4 and restores across
+        it."""
         for args in ((), ("--prefill-chunk", 7, "--chunk-min", 1)):
             with self.subTest(args=args):
                 eng, spec = Serve("swa16", *args), Spec()
@@ -674,7 +676,8 @@ class T2Reuse(Case):
                         self.assertEqual(spec.choose(ids)[0], "rewind")
                         self.step(eng, spec, ids, 8, what=f"rewind {k}")
                     live = spec.live
-                    ids = live[:len(live) - 6] + [other(live[len(live) - 6])] + prompt(20, 116)
+                    d = Spec.K + 2
+                    ids = live[:len(live) - d] + [other(live[len(live) - d])] + prompt(20, 116)
                     self.assertEqual(spec.choose(ids)[0], "checkpoint")
                     self.step(eng, spec, ids, 8, what="restore across the wrap")
                     self.step(eng, spec, prompt(40, 117), 8, what="reset")
@@ -1057,7 +1060,7 @@ class TErrors(Case):
         try:
             self.assertEqual(e.ctx, CTX)
             self.assertEqual(e.info.get("context"), CTX)
-            self.assertEqual(e.info.get("engine"), "ds4-serve-0.2")
+            self.assertEqual(e.info.get("engine"), "ds4-serve-0.3")
             self.assertTrue(e.can_stop)
             self.assertNotIn("batch_slots", e.info)
         finally:
@@ -1140,8 +1143,8 @@ class T5Server(Case):
         try:
             self.assertEqual(eng.max_context, CTX)
             self.assertTrue(eng.can_stop)
-            self.assertEqual(eng.info["engine"], "ds4-serve-0.2")
-            self.assertEqual(eng.info["version"], "ds4-serve-0.2")
+            self.assertEqual(eng.info["engine"], "ds4-serve-0.3")
+            self.assertEqual(eng.info["version"], "ds4-serve-0.3")
             self.assertEqual(eng.batch, 0)
             pid = eng.proc.pid
             p = prompt(40, 500)
@@ -1425,6 +1428,54 @@ class T8Verify(Case):
             for c in (None, 0, 3):
                 with self.subTest(n=n, corrupt=c):
                     self.run_case(prompt(n, 220 + n), 24, corrupt=c, args=("--prefill-chunk", 64, "--chunk-min", 8))
+
+    def test_chain(self):
+        """M7c: K chained drafts per pass (--mtp-k K; the pass carries up to K + 1 = 8 tokens).  Greedy == plain greedy,
+        tokens and logits, whatever the drafts: the MTP's own (row 0 rejects, the chain is never examined), all right
+        (every pass emits K + 1), or a rejection at each chain position in turn (corrupt every 2nd / 3rd / 5th)."""
+        ids = prompt(8, 240)
+        for k in (2, 3, 5, 7):
+            for c in (None, 0, 2, 3, 5):
+                with self.subTest(k=k, corrupt=c):
+                    r = self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k))
+                    acc, drafted = int(r.done[6]), int(r.done[7])
+                    self.assertEqual(drafted % k, 0, "drafts are offered K at a time")
+                    if c == 0:   # every draft right: only the last pass may leave drafts unexamined (max_new)
+                        self.assertLess(drafted - acc, k, "an oracle draft was rejected")
+
+    def test_chain_cuts_chunks_and_key(self):
+        """K drafts with max_new / stop cutting a pass at every chain position, through chunked prompts (the MTP window
+        then runs 8-token passes), and a request's own mtp_k key over --mtp-k."""
+        ids = prompt(8, 250)
+        plain = ref("tame", ids, 40)[0]
+        for k in (3, 6):
+            for n in (1, 2, 3, 4, 5, 7, 9):
+                with self.subTest(k=k, max_new=n):
+                    self.run_case(ids, n, corrupt=0, args=("--mtp-k", k))
+            for at in (5, 6, 9):
+                for c in (0, 3):
+                    with self.subTest(k=k, stop_at=at, corrupt=c):
+                        self.run_case(ids, 40, corrupt=c, args=("--mtp-k", k), stop=(plain[at - 1],))
+        for n in (150, 600):
+            for c in (None, 0, 3):
+                with self.subTest(n=n, corrupt=c):
+                    self.run_case(prompt(n, 260 + n), 24, corrupt=c,
+                                  args=("--mtp-k", 4, "--prefill-chunk", 64, "--chunk-min", 8))
+        eng = self.eng()   # --mtp-k 1; requests ask for 4, the default, and none (plain decoding)
+        try:
+            for mk, want_k in (("mtp_k=4", 4), ("", 1), ("mtp_k=0", 0)):
+                a = prompt(20, 270 + want_k)
+                r = eng.gen(a, 16, mk)
+                self.same(r, ref("tame", a, 16), f"key {mk!r}")
+                last = [x for x in eng.log_text().splitlines() if "ds4_serve: prompt" in x][-1]
+                if want_k == 0:
+                    self.assertEqual(int(r.done[7]), 0, "mtp_k=0 drafted")
+                    self.assertIn("drafts off", last)
+                else:
+                    self.assertEqual(int(r.done[7]) % want_k, 0)
+                    self.assertIn(f"(K={want_k},", last, f"key {mk!r}: the log line's K")
+        finally:
+            self.assertEqual(eng.close(), 0)
 
     def test_reuse(self):
         """append and the next turn's checkpoint restore with the MTP head on: each request == the same one fresh"""

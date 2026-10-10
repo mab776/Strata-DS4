@@ -50,7 +50,7 @@ namespace strata::ds4 {
 namespace {
 
 constexpr int kMaxParts = 8;   ///< the grouped kernel's group/entry cap; top-k 6 needs no more
-constexpr int kMaxTok = 4;     ///< tokens one run_multi call takes (draft verify: last token + up to 3 drafts)
+constexpr int kMaxTok = 8;     ///< tokens one run_multi call takes (draft verify: last token + up to 7 drafts, M7c)
 constexpr int kMaxEnt = kMaxTok * 8;   ///< (expert, token) entries and distinct experts of one run_multi call
 constexpr int kBatch = 512;    ///< a `ds4routes.bin` ubatch, in tokens (what route_probe tokenises)
 
