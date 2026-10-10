@@ -27,7 +27,7 @@ import json
 import time
 import uuid
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _join_texts, _late_system_to_user, _parts_of, effort_kwargs
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -54,8 +54,9 @@ def new_id(prefix: str) -> str:
 
 
 # ------------------------------------------------------------------------------------------------ request -> chat
-def _content(content, param):
-    """A message's (or a tool output's) content -> the template's form: a string, or text and image parts."""
+def _content(content, param, joiner=""):
+    """A message's (or a tool output's) content -> the template's form: a string, or text and image parts.  `joiner`:
+    see frontend._join_texts (mab776: DeepSeek's "\\n")."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -82,7 +83,7 @@ def _content(content, param):
         else:
             raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
-    return _parts_of(parts)
+    return _parts_of(parts, joiner)
 
 
 def _reasoning_text(item, param) -> str:
@@ -118,19 +119,21 @@ def _arguments(raw, param) -> dict:
     return value if isinstance(value, dict) else {"arguments": value}
 
 
-def _tool_output(item, param):
+def _tool_output(item, param, joiner=""):
     out = item.get("output")
     if isinstance(out, dict):                        # some clients send a JSON result as an object
         return json.dumps(out, ensure_ascii=False)
-    return out if isinstance(out, str) else _content(out, param + ".output")
+    return out if isinstance(out, str) else _content(out, param + ".output", joiner)
 
 
-def input_messages(req: dict) -> list[dict]:
-    """`instructions` + `input` -> the chat template's messages."""
+def input_messages(req: dict, template=None) -> list[dict]:
+    """`instructions` + `input` -> the chat template's messages.  mab776 (M4) `template`: a model family's text-part
+    joiner and late-system rule (frontend._family)."""
+    joiner = getattr(template, "part_joiner", "")
     messages = []
     instructions = req.get("instructions")
     if instructions not in (None, ""):
-        messages.append({"role": "system", "content": _content(instructions, "instructions")
+        messages.append({"role": "system", "content": _content(instructions, "instructions", joiner)
                          if not isinstance(instructions, str) else instructions})
     items = req.get("input")
     if items is None:
@@ -160,10 +163,10 @@ def input_messages(req: dict) -> list[dict]:
             role = item.get("role")
             if role not in ("user", "assistant", "system", "developer"):
                 raise ResponsesError(f"unknown message role {role!r}", param + ".role")
-            content = _content(item.get("content"), param + ".content")
+            content = _content(item.get("content"), param + ".content", joiner)
             if role == "assistant":
-                turn(content if isinstance(content, str) else "".join(
-                    p.get("text", "") for p in content if p.get("type") == "text"))
+                turn(content if isinstance(content, str) else _join_texts(
+                    [p.get("text", "") for p in content if p.get("type") == "text"], joiner))
             else:
                 open_turn = None
                 thinking.clear()
@@ -188,7 +191,8 @@ def input_messages(req: dict) -> list[dict]:
             target.setdefault("tool_calls", []).append({"function": {"name": name, "arguments": args},
                                                         "_call_id": item.get("call_id")})
         elif kind in ("function_call_output", "custom_tool_call_output"):
-            messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            messages.append({"role": "tool", "content": _tool_output(item, param, joiner),
+                             "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
         elif kind == "additional_tools":
@@ -207,7 +211,7 @@ def input_messages(req: dict) -> list[dict]:
         lead += 1
     if lead > 1:
         messages[:lead] = [{"role": "system", "content": "\n\n".join(m["content"] for m in messages[:lead])}]
-    return _late_system_to_user(messages)
+    return _late_system_to_user(messages) if getattr(template, "late_system_to_user", True) else messages
 
 
 def _order_tool_results(messages):
@@ -454,12 +458,12 @@ def check_request(req: dict) -> None:
         raise ResponsesError("reasoning must be an object", "reasoning")
 
 
-def template_kwargs(req: dict, shared: dict) -> dict:
+def template_kwargs(req: dict, shared: dict, template=None) -> dict:
     effort = (req.get("reasoning") or {}).get("effort")
     if effort is None:
         effort = shared.get("reasoning_effort")      # the Chat settings shared with apps, as on the chat path
     try:
-        return effort_kwargs(effort)
+        return effort_kwargs(effort, getattr(template, "effort_table", None))   # mab776: a family's own map
     except ValueError as e:
         raise ResponsesError(str(e), "reasoning.effort") from None
 

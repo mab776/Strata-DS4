@@ -63,6 +63,7 @@ from serve.winjob import contain  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
+from serve import deepseek  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -147,6 +148,8 @@ REPEAT_STOP_TOKENS = 256
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# mab776 (M4): seconds between keep-alives while the parser holds a tool call it sends only once whole (DeepSeek)
+HOLD_PING_S = 10.0
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -264,6 +267,9 @@ class MockEngine:
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
         end = tokenizer.encode(IM_END, parse_special=True)
+        eos = (getattr(tokenizer, "special_ids", None) or {}).get("tokenizer.ggml.eos_token_id")
+        if len(end) != 1 and eos is not None:          # mab776: a vocabulary without <|im_end|> (DeepSeek): its eos
+            end = [eos]
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
@@ -581,6 +587,7 @@ class StrataEngine:
     gpu_busy = None                      # #1317: () -> bool, "the GPU is working" (the telemetry's reading); a GPU at work is not frozen
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
+    BATCH_FLAGS = ("--batch", "--slots")  # the engine args that ask for batch slots (--slots: --batch's other name)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -702,7 +709,7 @@ class StrataEngine:
         self.lines: queue.Queue = queue.Queue()
         # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
         # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+        asked = next((int(args[args.index(k) + 1]) for k in self.BATCH_FLAGS if k in args), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
             print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
@@ -1779,6 +1786,12 @@ class StrataEngine:
                 self.progress_ms, self.reused = 0, 0
 
 
+class DeepSeekEngine(StrataEngine):
+    """mab776 (M4): the DeepSeek-V4-Flash engine (tools/ds4 ds4_serve, M5) - the same line protocol.  Its `--slots`
+    are VRAM expert slots, not batch slots (read as batch slots, `--slots auto` ended the start in int("auto"))."""
+    BATCH_FLAGS = ("--batch",)
+
+
 IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app attaches pictures of up to 20 MB)
 
 
@@ -2162,11 +2175,14 @@ def layer_split_of(cfg: dict) -> bool:
     return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
 
 
-def engine_args(cfg: dict) -> list[str]:
+def engine_args(cfg: dict, passthrough: bool = False) -> list[str]:
     """The engine's arguments: the config's, and with several GPUs the layer split across them ("layer_split" in the
     config: "auto" by default, or the first layer of each later GPU's share, e.g. "18" or "16,32"; see
-    layer_split_value)."""
+    layer_split_value).  mab776 `passthrough` (DeepSeek, as jackwwg83's ds41 serve): the config's own, nothing
+    added - the DeepSeek engine places the model itself and has none of the flags added below."""
     args = list(cfg["args"])
+    if passthrough:
+        return args
     # #1322: a config with a "vision" section but without --vision in its args (written by an older setup run, or edited by
     # hand) advertised images and then refused every picture ("this engine was started without --vision").  The section
     # says images are wanted: start the engine with them, and keep the encoder's VRAM free as setup does for a GPU encoder
@@ -2587,6 +2603,32 @@ def slot_save_dir(value, base: str | None = None) -> str:
         raise ValueError(f"slot_save_path {path} is not a directory")
     return path
 
+
+def stop_ids_of(tokenizer, template=None) -> set[int]:
+    """The ids that end a reply.  mab776 (M4): a model family's template names its stop tokens by the tokenizer's
+    special ids (`stop_token_keys`; DeepSeek-V4: eos = 1); a missing one is a ValueError.  Otherwise <|im_end|> and
+    <|endoftext|> as before - each only where it is ONE token: in a vocabulary without them their pieces ('<', 'im',
+    '_end', ...) were stop ids and cut every reply at the first '<'.  Without either, the tokenizer's special eos."""
+    special = getattr(tokenizer, "special_ids", None) or {}
+    keys = getattr(template, "stop_token_keys", None)
+    if keys:
+        ids = {int(special[k]) for k in keys if k in special}
+        if not ids:
+            raise ValueError(f"the tokenizer names none of the stop tokens this chat template needs ({', '.join(keys)}"
+                             " in tokenizer.json's special_ids); run setup again")
+        return ids
+    ids = set()
+    for text in (IM_END, "<|endoftext|>"):
+        got = tokenizer.encode(text, parse_special=True)
+        if len(got) == 1:
+            ids.update(got)
+    if not ids and "tokenizer.ggml.eos_token_id" in special:
+        ids.add(int(special["tokenizer.ggml.eos_token_id"]))
+    if not ids:                                        # nothing better is known: as before
+        ids = set(tokenizer.encode(IM_END, parse_special=True) + tokenizer.encode("<|endoftext|>", parse_special=True))
+    return ids
+
+
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
@@ -2655,8 +2697,7 @@ class Service:
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
         self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
-        self.stop_ids = set(tokenizer.encode(IM_END, parse_special=True) +
-                            tokenizer.encode("<|endoftext|>", parse_special=True))
+        self.stop_ids = stop_ids_of(tokenizer, template)  # mab776: never ordinary pieces (DeepSeek: {1})
 
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
@@ -2846,8 +2887,8 @@ class Service:
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
         An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
-        if not hasattr(self.engine, "vram"):
-            raise ValueError("this engine cannot resize its VRAM use")
+        if not hasattr(self.engine, "vram") or getattr(self.template, "vram_command", True) is False:
+            raise ValueError("this engine cannot resize its VRAM use")     # mab776: DeepSeek's has no VRAM command
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
@@ -3170,11 +3211,11 @@ class Service:
         message's text is encoded as the text it is, not as the model's reasoning markers (the template's own are).
         A control token's text (<|im_start|>, <|im_end|>, <|endoftext|>, ...) inside a message is text as well: only
         the control tokens the template writes are control tokens."""
-        marked, marked_tools, changed = mark_think_literals(messages, tools, self.literals)
+        marked, marked_tools, marks = mark_think_literals(messages, tools, self.literals)
         prompt = self.render_prompt(marked, marked_tools, kwargs)
-        if not changed:
+        if not marks:
             return self.tok.encode(prompt, parse_special=True)
-        prompt, plain = unmark_think_literals(prompt, self.literals)
+        prompt, plain = unmark_think_literals(prompt, marks)        # mab776: this request's marks only
         return self.tok.encode(prompt, parse_special=True, plain=plain)
 
     def _note_unreadable_tool_images(self, messages):
@@ -3212,7 +3253,11 @@ class Service:
         prompt; with thinking, Service.run writes it once the thinking is over."""
         fetched = self._note_unreadable_tool_images(messages)
         ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
+        # does the prompt end inside the thinking?  mab776: a family's template may decide (DeepSeek: a continued
+        # assistant turn); the parser and the forced opening below must agree with the prompt
+        thinking_of = getattr(self.template, "thinking_of", None)
+        thinking = thinking_of(messages, kwargs) if thinking_of else kwargs.get("enable_thinking", True) is not False
+        if force and not thinking:
             ids = ids + self.tok.encode(force, parse_special=True)
         self.embeddings.path = None
         images = images_of(messages)
@@ -3283,7 +3328,7 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        return ids, thinking, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -3319,7 +3364,7 @@ class Service:
 
         def head_ids(msgs):
             """The ids the rendered `msgs` start with (a message's trailing marker cut at PREFIX_END when it is there)."""
-            marked, marked_tools, changed = mark_think_literals(msgs, tools, self.literals)
+            marked, marked_tools, marks = mark_think_literals(msgs, tools, self.literals)
             effort = kwargs.get("reasoning_effort")
             off = kwargs.get("enable_thinking") is False        # render_prompt's rule for #458's effort_end
             kw = ({k: v for k, v in kwargs.items() if k not in ("reasoning_effort", "enable_thinking")}
@@ -3329,8 +3374,8 @@ class Service:
             cut = text.find(self.PREFIX_END)
             if cut >= 0:
                 text = text[:cut]
-            if changed:
-                text, plain = unmark_think_literals(text, self.literals)
+            if marks:
+                text, plain = unmark_think_literals(text, marks)
                 return self.tok.encode(text, parse_special=True, plain=plain)
             return self.tok.encode(text, parse_special=True)
 
@@ -3412,7 +3457,12 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        # mab776 (M4): a model family's own output parser and texts (DeepSeek: DSML calls, "</think>" closes)
+        parser = (getattr(self.template, "output_parser", None) or OutputParser)(
+            thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
+        close_text = getattr(self.template, "reasoning_close", REASONING_CLOSE)
+        wrap_text = getattr(self.template, "reasoning_wrap_up", REASONING_WRAP_UP)
+        held_since = None                               # a call block the parser holds whole (nothing streams)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
@@ -3528,6 +3578,15 @@ class Service:
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = True
                                     yield "event", ev
+                                # mab776: a parser that holds a call until it is whole (DeepSeek's DSML) sends
+                                # nothing while a long one is written: keep the client's connection alive
+                                if evs or not getattr(parser, "holding", False):
+                                    held_since = None
+                                elif held_since is None:
+                                    held_since = time.monotonic()
+                                elif time.monotonic() - held_since >= HOLD_PING_S:
+                                    held_since = time.monotonic()
+                                    yield "ping", None
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
@@ -3606,7 +3665,7 @@ class Service:
                             # #1053: the model wrote its reasoning and stopped before </think>: the client would get
                             # an empty answer.  Close the thinking once and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(close_text, parse_special=True)
                             if max_new - n - len(extra) >= 1:
                                 print("[strata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
@@ -3630,9 +3689,10 @@ class Service:
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
                             budget = None
-                            text = REASONING_WRAP_UP + (force or "")
-                        else:
-                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
+                            text = wrap_text + (force or "")
+                        else:                           # the blank line before a call is written here (mab776:
+                            #                             an opening's own leading newlines - DeepSeek's - are not)
+                            text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force.lstrip("\n")
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
@@ -4757,6 +4817,9 @@ def make_handler(svc: Service):
                      "chat_template_caps": svc.template.caps,
                      "modalities": {"vision": svc.vision is not None}, "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded()}
+            for k in ("bos_token", "eos_token"):        # mab776: a family's template passes them (llama.cpp's keys)
+                if isinstance(getattr(svc.template, k, None), str):
+                    props[k] = getattr(svc.template, k)
             if getattr(svc.engine, "model_path", None):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
@@ -4939,11 +5002,11 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
-            messages, tools, kw = openai_to_messages(req)
+            messages, tools, kw = openai_to_messages(req, svc.template)    # mab776: the family's rules (M4)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)      # a bad value is a 400 before anything is sent
+            force = forced_call(req.get("tool_choice"), tools, svc.template)   # a bad value: a 400 before anything
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
                 raise ValueError("structured response_format with tools/MCP is not supported")
@@ -5105,9 +5168,9 @@ def make_handler(svc: Service):
 
         def _responses_prepare(self, req):
             responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
+            messages = responses_api.input_messages(req, svc.template)
             tools, names, skipped = responses_api.request_tools(req)
-            kw = responses_api.template_kwargs(req, svc.shared)
+            kw = responses_api.template_kwargs(req, svc.shared, svc.template)
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
@@ -5161,18 +5224,18 @@ def make_handler(svc: Service):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.template)
             stop_strings(req)                                 # the same 400 as the request itself would get
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
-            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked, svc.template)
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools)        # "any" / {"type": "tool", "name": N}
+            force = forced_call(req.get("tool_choice"), tools, svc.template)  # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -5608,6 +5671,39 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     return out
 
 
+def load_template(path, tok, cfg: dict, slot_save_path=None) -> ChatTemplate:
+    """mab776 (M4): the chat template at `path` - serve/deepseek.py's DeepSeekTemplate when it is DeepSeek-V4's
+    (llama.cpp's own test, no config key needed), else a ChatTemplate as always.  For DeepSeek the tokenizer must
+    match it and the config must ask for nothing the DeepSeek engine lacks (SystemExit, before the minutes of
+    loading).  The config's optional "architecture": "deepseek4" asserts the family."""
+    arch = cfg.get("architecture")
+    if arch not in (None, deepseek.FAMILY):
+        raise SystemExit(f'[strata] config "architecture" must be "{deepseek.FAMILY}" (or left out: the model\'s chat '
+                         f"template decides), not {arch!r}")
+    try:
+        is_ds = deepseek.detect(Path(path).read_text(encoding="utf-8"))
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}")
+    if not is_ds:
+        if arch:
+            raise SystemExit(f'[strata] config "architecture": "{arch}", but {path} is not DeepSeek-V4\'s chat '
+                             "template")
+        return ChatTemplate(path)
+    problems = deepseek.tokenizer_problems(tok)
+    if problems:
+        raise SystemExit("[strata] DeepSeek-V4's chat template, but the tokenizer does not fit it: " +
+                         "; ".join(problems))
+    errors, notes = deepseek.config_problems(cfg, slot_save_path)
+    if errors:
+        raise SystemExit("\n".join(f"[strata] config {e}" for e in errors))
+    for note in notes:
+        print(f"[strata] config {note}", flush=True)
+    template = deepseek.DeepSeekTemplate(path, tok)
+    print(f"[strata] DeepSeek-V4 chat format (serve/deepseek.py): DSML tool calls, stop ids "
+          f"{sorted(stop_ids_of(tok, template))}", flush=True)
+    return template
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -5670,6 +5766,11 @@ def main() -> int:
         # mab776: the pre-tokenizer + special ids the dir's tokenizer.json names (DeepSeek-V4: joyai-llm). Built as
         # Tokenizer(tokens, merges, types) every model got Qwen's qwen35 split - Project Maya #27's GLM bug.
         tok = ST.Tokenizer.from_dir(tpath)
+    # the model's own chat template (exported with its tokenizer), else the original model's.  mab776 (M4): read before
+    # the engine starts - DeepSeek-V4's selects serve/deepseek.py, and its config is checked before minutes of loading
+    tpl = tpath / "chat_template.jinja"
+    template = load_template(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja", tok, cfg, a.slot_save_path)
+    ds = getattr(template, "family", None) == deepseek.FAMILY
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
         if not cfg:
@@ -5692,8 +5793,11 @@ def main() -> int:
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
-        warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
-        if layer_split_of(cfg):
+        warn_budget_over_ram(engine_args(cfg, ds) if "args" in cfg else [])      # #1080
+        if ds:                                          # mab776: its args go to the engine as they are
+            if len(gpu_list(cfg)) > 1:
+                print(f"[strata] GPUs {gpu_list(cfg)}: the DeepSeek engine places the model on them itself", flush=True)
+        elif layer_split_of(cfg):
             try:
                 split = layer_split_value(cfg)          # #644: before the (minutes-long) start
             except ValueError as e:
@@ -5710,11 +5814,11 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         try:
-            effort_end = effort_end_args(cfg, exe, tok)  # #458
+            effort_end = None if ds else effort_end_args(cfg, exe, tok)  # #458 (mab776: ChatML only)
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+        engine = (DeepSeekEngine if ds else StrataEngine)(exe, engine_args(cfg, ds) + (effort_end or []),
+                                                          cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -5725,10 +5829,8 @@ def main() -> int:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's
-    tpl = tpath / "chat_template.jinja"
-    svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
+    svc = Service(engine, tok, template,
+                  model_name=cfg.get("model_name", "deepseek-v4-flash" if ds else "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
@@ -5793,7 +5895,7 @@ def main() -> int:
     recovery = cfg.get("tool_call_recovery", False)     # opt-in: see OutputParser's recover
     if not isinstance(recovery, bool):
         raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
-    svc.tool_call_recovery = recovery
+    svc.tool_call_recovery = recovery and not ds       # mab776: Qwen's call forms (load_template said so)
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
