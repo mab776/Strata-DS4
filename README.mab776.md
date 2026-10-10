@@ -17,7 +17,7 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
 - `MODEL=<gguf> SLOTS=5300 ARENA=40 MEM=54g ./mab776-run.sh --ids 0,… -n 64` — GPU 0 only, RAM-capped container
   `ds4-run` (cgroup OOM-kills it instead of freezing the box; replaces upstream's memguard.sh). devel image = libnccl.
 - Engine = `build-ds4-gpu/ds4_generate`: token ids in, token ids out (no server yet). Tokenize/decode with
-  `tools/strata_tokenizer.py` (needs `regex`: run it in a `python:3.12-slim` container + `pip install regex`; the
+  `mab776-tok.py` (wraps tools/strata_tokenizer.py; needs `regex`: run it in a `python:3.12-slim` container + `pip install regex`; the
   encoder does not parse special tokens — BOS is id 0, prepend it yourself).
 
 ## Models (do NOT download upstream's 81 GB Q2 — Marc 10-09: make OUR files work)
