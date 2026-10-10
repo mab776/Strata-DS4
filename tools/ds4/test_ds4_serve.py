@@ -403,6 +403,9 @@ class Case(unittest.TestCase):
         self.assertEqual(r.reused, r.resume)
         if r.finish != "cancel":
             self.assertEqual(r.prompt_read, len(ids) - r.resume)
+            steps = r.gen - 1   # decode steps: the last token is never fed
+            self.assertEqual((int(r.done[9]), int(r.done[10]), int(r.done[12])), (0, 4 * steps, 4 * steps),
+                             f"{what}: DONE hits/lookups/file_tier are not this request's")
         if compare:
             self.same(r, ref(eng.fx, ids, max_new, stop=stop), what or f"GEN #{eng.seq}")
         spec.update(ids, choice, r, ckpt)
@@ -471,9 +474,9 @@ class T2Reuse(Case):
                 self.step(eng, spec, ids, 10, what=f"rewind {k}")
             live = spec.live   # 5 positions back: beyond the rings' slack -> the newest checkpoint below it
             ids = live[:len(live) - 5] + [other(live[len(live) - 5])] + prompt(3, 30)
-            self.assertEqual(spec.choose(ids)[0], "checkpoint")
             r7 = ids
             self.step(eng, spec, ids, 24, what="drop 5 -> checkpoint")
+            self.assertEqual(eng.decision(eng.seq)[0], "checkpoint")
             self.step(eng, spec, r7, 24, what="regenerate -> turn checkpoint at n-1")
             ids = r7[:len(r7) - 1] + [other(r7[-1])] + prompt(6, 31)   # H12: the template's </think> for <think>
             self.assertEqual(spec.choose(ids)[:2], ("checkpoint", len(r7) - 1))
@@ -522,8 +525,8 @@ class T2Reuse(Case):
             self.assertIn("last", spec.ck)
             self.step(eng, spec, prompt(310, 62), 6, what="B (reset)")
             a3 = a2 + prompt(1, 64) + prompt(4, 63)
-            self.assertEqual(spec.choose(a3)[0], "reset")
             self.step(eng, spec, a3, 8, what="A3 after B")
+            self.assertEqual(eng.decision(eng.seq)[0], "reset")   # after the logits: a mutant must fail on them
         finally:
             self.assertEqual(eng.close(), 0)
 
@@ -776,6 +779,7 @@ class T3Twenty(Case):
             self.assertEqual(n, 20)
             self.assertEqual(eng.p.pid, pid)
             self.assertIsNone(eng.p.poll())
+            print(f"\n20 requests: pid {pid}, RSS after #5 / #20 = {rss[5]} / {rss[20]} KiB, fds {fds}", file=sys.stderr)
             self.assertLessEqual(rss[20], rss[5] * 1.02 + 8 * 1024, f"RSS grew: {rss}")
             self.assertEqual(fds[20], fds[5], f"open files: {fds}")
         finally:
@@ -802,6 +806,7 @@ class T4Stop(Case):
             r = eng.result(on_line=on)
             self.assertEqual(r.finish, "cancel")
             self.assertLess(r.t_done - seen[0], 1.0)
+            print(f"\nSTOP during decode -> DONE in {1000 * (r.t_done - seen[0]):.1f} ms", file=sys.stderr)
             self.assertLess(r.gen, 400)
             self.assertEqual(r.prompt_read, len(p))
             # every emitted token was fed: the continuation appends to all of them
@@ -830,6 +835,8 @@ class T4Stop(Case):
             self.assertEqual(r.finish, "cancel")
             self.assertEqual(r.gen, 0)
             self.assertLess(r.t_done - sent[0], 1.0)
+            print(f"\nSTOP during the prompt read {args or '(decode loop)'} -> DONE in "
+                  f"{1000 * (r.t_done - sent[0]):.1f} ms, {r.prompt_read} of {n} read", file=sys.stderr)
             self.assertLess(r.prompt_read, n - r.resume)
             self.assertGreater(r.prompt_read, 0)
             if args:   # chunks: the stop is seen right after the chunk the last PP reported
@@ -883,6 +890,49 @@ class T4Stop(Case):
         finally:
             self.assertEqual(eng.close(), 0)
 
+    def test_stop_storm(self):
+        """60 requests with STOPs at random moments - none, at once, inside the prompt read, inside the decode, after
+        DONE (stale) - over 3 conversations and their continuations: every request is one terminal line, RESUME and the
+        decision follow the spec, and every output (a cancelled one too) is the fresh run's, or a prefix of it."""
+        rng = random.Random(20261010)
+        eng, spec = Serve("tame", "--prefill-chunk", 16, "--chunk-min", 4,
+                          env={"DS4_SERVE_TEST_DELAY_MS": "2"}), Spec()
+        stats = {"cancel": 0, "stop": 0, "length": 0}
+        try:
+            convs = [prompt(rng.randrange(20, 160), 900 + i) for i in range(3)]
+            for i in range(60):
+                base = spec.live if spec.live and rng.random() < 0.5 else rng.choice(convs)
+                cut = rng.randrange(max(1, len(base) - 6), len(base) + 1)
+                ids = base[:cut] + prompt(rng.randrange(1, 40), 1000 + i)
+                max_new = rng.randrange(1, 30)
+                choice = spec.choose(ids)
+                when = rng.choice([None, None, 0.0, 0.002, 0.01, 0.03, 0.08])
+                eng.send(eng.gen_line(ids, max_new) + ("\nSTOP" if when == 0.0 else ""))
+                eng.seq += 1
+                if when:
+                    time.sleep(when)
+                    eng.send("STOP")
+                r = eng.result()
+                self.assertIsNone(r.err, f"#{i}")
+                kind, slot, R = eng.decision(eng.seq)
+                self.assertEqual((r.resume, kind, slot), (choice[1], choice[0], choice[2]), f"#{i} decision")
+                toks, rows = ref("tame", ids, max_new)
+                if r.finish == "cancel":
+                    self.assertEqual(r.tokens, toks[:len(r.tokens)], f"#{i} cancelled tokens")
+                    self.assertEqual(r.rows, rows[:len(r.rows)], f"#{i} cancelled rows")
+                else:
+                    self.assertEqual(r.tokens, toks, f"#{i}")
+                    self.assertEqual(r.rows, rows, f"#{i} rows")
+                stats[r.finish] += 1
+                spec.update(ids, choice, r)
+                if rng.random() < 0.3:
+                    eng.send("STOP")   # stale: after DONE, before the next GEN
+            self.assertGreater(stats["cancel"], 5, stats)
+            self.assertGreater(stats["length"], 5, stats)
+            print(f"\nstop storm: {stats}", file=sys.stderr)
+        finally:
+            self.assertEqual(eng.close(), 0)
+
     def _exit_during(self, how, phase):
         args = ("--prefill-chunk", 16, "--chunk-min", 1) if phase == "prefill" else ()
         eng = Serve("tame", *args, env={"DS4_SERVE_TEST_DELAY_MS": "200" if phase == "prefill" else "30"})
@@ -901,6 +951,7 @@ class T4Stop(Case):
         dt = time.monotonic() - t0
         self.assertEqual(rc, 0)
         self.assertLess(dt, 2.0, f"{how} during {phase}: exit took {dt:.2f} s")
+        print(f"\n{how} during {phase}: exit in {1000 * dt:.0f} ms", file=sys.stderr)
         eng.logf.close()
         self.assertFalse(eng.bad)
         shutil.rmtree(eng.dir, ignore_errors=True)
@@ -1010,6 +1061,20 @@ class TErrors(Case):
             self.assertNotIn("batch_slots", e.info)
         finally:
             self.assertEqual(e.close(), 0)
+        # --vram-reserve-mib (serve/server.py's Settings page appends it): the margin, or ignored beside --vram-margin
+        for args, want in ((("--vram-reserve-mib", 700), "--vram-reserve-mib 700 -> --vram-margin 0.68 GiB"),
+                           (("--vram-reserve-mib", 700, "--vram-margin", 1.5),
+                            "--vram-reserve-mib 700 ignored: --vram-margin 1.50 GiB is given"),
+                           (("--vram-margin", 1.5, "--vram-reserve-mib", 700),
+                            "--vram-reserve-mib 700 ignored: --vram-margin 1.50 GiB is given")):
+            with self.subTest(args=args):
+                e = Serve("tame", *args)
+                try:
+                    self.assertEqual(e.ctx, CTX)
+                    self.assertIn(want, e.log_text())
+                    self.same(e.gen(prompt(12, 420), 4), ref("tame", prompt(12, 420), 4))
+                finally:
+                    self.assertEqual(e.close(), 0)
         for args, want in ((("--slots", "auto"), "--expert-slots"), (("--mtp", "x.gguf"), "MTP"),
                            (("--verify",), "MTP"), (("--temp", "0.7"), "greedy"), (("--ids", "1,2"), "one-shot"),
                            (("--bogus",), "unknown argument --bogus"), (("--prefill-chunk", "9000"), "--prefill-chunk")):

@@ -85,6 +85,7 @@ struct Args {
     int64_t slots = 0;               // --expert-slots: <= 0 = auto (ds4_generate's --slots auto, M1)
     double vram_margin_gib = 0.9;
     bool vram_margin_set = false;    // an explicit --vram-margin wins over the long-context default
+    int64_t vram_reserve_mib = -1;   // --vram-reserve-mib (serve/server.py's Settings page may append it): the margin
     double pcie = 0.25, pf_b = 1.43, arena_gib = 60.0;
     int threads = 0;
     int64_t ctx = 0;                 // --ctx / --max-context (required)
@@ -144,7 +145,8 @@ bool to_csv(const std::string & s, std::vector<int> & out) {
 void usage() {
     std::fprintf(stderr,
         "usage: ds4_serve [--serve] -m model.gguf --ctx N [--backend cuda|cpu] [--experts gpu|cpu]\n"
-        "       [--expert-slots auto|N] [--vram-margin GiB] [--pcie 0.25] [--pf-b 1.43] [--profile ds4routes.bin]\n"
+        "       [--expert-slots auto|N] [--vram-margin GiB | --vram-reserve-mib MiB] [--pcie 0.25] [--pf-b 1.43]\n"
+        "       [--profile ds4routes.bin]\n"
         "       [--arena-gib 60] [--threads N] [--prefill-chunk N [--chunk-min 32] [--chunk-mmq] [--chunk-prestage]]\n"
         "       [--comp-type f32|q8_0|q5_0|q4_0|iq4_nl] [--comp-q8] [--comp-rot 0|1] [--icomp-q8] [--comp-host]\n"
         "       [--f16-q8] [--dense-requant q4_k|q5_k|q6_k] [--route-bias F] [--vram-lru] [--arena-adapt]\n"
@@ -192,6 +194,7 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
             return false;
         }
         else if (k == "--vram-margin") { if (!num_f(fv)) return false; a.vram_margin_gib = fv; a.vram_margin_set = true; }
+        else if (k == "--vram-reserve-mib") { if (!num_i(0, (int64_t) 1 << 20, iv)) return false; a.vram_reserve_mib = iv; }
         else if (k == "--pcie") { if (!num_f(fv)) return false; a.pcie = fv; }
         else if (k == "--pf-b") { if (!num_f(fv)) return false; a.pf_b = fv; }
         else if (k == "--profile") { if (!next()) return false; a.profile = v; }
@@ -244,6 +247,18 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
             return false;
         }
         else { why = "unknown argument " + k; return false; }
+    }
+    // Strata's own name for the VRAM left free beside the expert cache: the margin, unless --vram-margin says it
+    if (a.vram_reserve_mib >= 0) {
+        if (a.vram_margin_set) {
+            std::fprintf(stderr, "ds4_serve: --vram-reserve-mib %lld ignored: --vram-margin %.2f GiB is given\n",
+                         (long long) a.vram_reserve_mib, a.vram_margin_gib);
+        } else {
+            a.vram_margin_gib = (double) a.vram_reserve_mib / 1024.0;
+            a.vram_margin_set = true;
+            std::fprintf(stderr, "ds4_serve: --vram-reserve-mib %lld -> --vram-margin %.2f GiB\n",
+                         (long long) a.vram_reserve_mib, a.vram_margin_gib);
+        }
     }
     if (a.model.empty()) { why = "-m model.gguf is required"; return false; }
     if (a.ctx <= 0) { why = "--ctx N (or --max-context N) is required"; return false; }
