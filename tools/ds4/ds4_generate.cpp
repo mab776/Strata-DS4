@@ -250,10 +250,6 @@ int main(int argc, char** argv) {
     dc.comp_rot = a.comp_rot;
     dc.icomp_q8 = a.icomp_q8;
     dc.comp_host = a.comp_host;
-    if (a.prefill_chunk > 0 && !a.mtp.empty()) {
-        std::fprintf(stderr, "ds4_generate: --prefill-chunk does not fill the MTP window yet; drop --mtp or the chunk\n");
-        return 2;
-    }
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     std::string err;
     if (!dense.init(a.model, dc, err)) { std::fprintf(stderr, "ds4_generate: dense init: %s\n", err.c_str()); return 1; }
@@ -312,6 +308,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "ds4_generate: --vram-grow needs mixed expert sizes and G < --vram-margin\n");
                 return 2;
             }
+            // the decode graphs the MTP head / verify add are captured after the grow: keep their headroom free too
+            // (the same extras the margin above gets; a 0.9 GiB margin OOMed in cudaGraphInstantiate with --mtp)
+            a.vram_grow += (a.mtp.empty() ? 0.0 : 0.25) + (a.verify ? 0.75 : 0.0);
             slot_gib_max_auto = std::max(0.0, (double) fr - a.vram_grow * 1073741824.0) / 1073741824.0;
             std::fprintf(stderr, "vram grow: the prompt on %.2f GiB of slots, then up to %.2f GiB (leaving %.2f GiB)\n",
                          slot_gib_auto, slot_gib_max_auto, a.vram_grow);
@@ -524,8 +523,21 @@ int main(int argc, char** argv) {
         double t_dense = 0, t_exp = 0, t_attn = 0, t_head = 0;
         static const bool vtrace_pf = std::getenv("DS4_VRAM_TRACE") != nullptr;   // mab776: free VRAM per chunk
         auto vfree_pf = [&]() { size_t fr = 0, tot = 0; ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot); return fr / 1048576.0; };
-        for (size_t c0 = 0; c0 < prompt.size(); c0 += (size_t) NP) {
-            const int n = (int) std::min<size_t>((size_t) NP, prompt.size() - c0);
+        // the chunks; mab776 M7b: with an MTP head the LAST chunk must hold the head's sliding window (SWA positions
+        // + the last), whose trunk states it reads after the chunks - a short tail is taken from the chunk before it
+        std::vector<std::pair<size_t, int>> chunks;
+        for (size_t c0 = 0; c0 < prompt.size(); c0 += (size_t) NP)
+            chunks.push_back({c0, (int) std::min<size_t>((size_t) NP, prompt.size() - c0)});
+        const int mtp_win = (int) std::min<int64_t>((int64_t) prompt.size(), dense.geom().n_swa + 1);
+        if (il_mtp >= 0 && chunks.size() > 1 && chunks.back().second < mtp_win) {
+            const int mv = mtp_win - chunks.back().second;
+            chunks[chunks.size() - 2].second -= mv;
+            chunks.back().first -= (size_t) mv;
+            chunks.back().second += mv;
+        }
+        for (const auto& ch : chunks) {
+            const size_t c0 = ch.first;
+            const int n = ch.second;
             if (vtrace_pf) std::fprintf(stderr, "[vram] chunk at %zu: %.0f MiB free before prefill_begin\n", c0, vfree_pf());
             if (!dense.prefill_begin(prompt.data() + c0, n, (int) c0)) {
                 std::fprintf(stderr, "ds4_generate: %s\n", dense.last_error().c_str());
@@ -587,6 +599,27 @@ int main(int argc, char** argv) {
             t_head += now_ms() - th;
             dense.prefill_end();
         }
+        // mab776 M7b: the MTP head's sliding window over the prompt's last positions [N-1-SWA, N-1) (decode runs N-1
+        // itself with the sampled token), from the last chunk's trunk states - what the decode-loop prefill does at
+        // every position, here only where the window can still see it
+        double t_mtp_fill = 0;
+        if (il_mtp >= 0 && prompt.size() > 1) {
+            const double tm0 = now_ms();
+            const int N = (int) prompt.size(), c0l = (int) chunks.back().first;
+            int p = std::max(c0l, N - 1 - (int) dense.geom().n_swa);
+            while (p < N - 1) {
+                const int cnt = std::min(NT, N - 1 - p);
+                if (!dense.prefill_state_to_decode(p - c0l, cnt) || !mtp_draft_n(prompt.data() + p + 1, cnt, p, nullptr)) {
+                    std::fprintf(stderr, "ds4_generate: MTP window after the chunks failed at %d: %s\n", p,
+                                 dense.last_error().c_str());
+                    return 1;
+                }
+                p += cnt;
+            }
+            t_mtp_fill = now_ms() - tm0;
+            n_mtp = 0;
+            t_mtp = t_mtp_x = 0;   // the decode report counts the decode's drafts only
+        }
         tier.release_chunk();
         dense.prefill_release();
         const double t_seed = now_ms();
@@ -599,8 +632,9 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::fprintf(stderr, "prefill chunks of %d: dense %.0f ms (attention+router %.0f, finish %.0f), experts %.0f ms, "
-                             "head/ppl %.0f ms, cache seed %.0f ms -> %lld resident slots\n", NP, t_dense, t_attn,
-                     t_dense - t_attn, t_exp, t_head, now_ms() - t_seed, (long long) tier.resident());
+                             "head/ppl %.0f ms, cache seed %.0f ms -> %lld resident slots%s\n", NP, t_dense, t_attn,
+                     t_dense - t_attn, t_exp, t_head, now_ms() - t_seed, (long long) tier.resident(),
+                     il_mtp >= 0 ? (", MTP window " + std::to_string((int) t_mtp_fill) + " ms").c_str() : "");
     }
     for (size_t i = 0; a.prefill_chunk <= 0 && i < prompt.size(); ++i) {
         if (!step(prompt[i], (int) i)) {
@@ -682,9 +716,10 @@ int main(int argc, char** argv) {
             if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) draft = (draft + 1) % n_vocab;
         };
         const double th0 = now_ms();
-        if (!dense.logits(&lg, &n_vocab)) return 1;
+        if (!first_logits.empty()) { lg = first_logits.data(); n_vocab = (int) first_logits.size(); }   // chunked prefill
+        else if (!dense.logits(&lg, &n_vocab)) return 1;
         t_ph[4] += now_ms() - th0;
-        int cur = argmax(lg, n_vocab);   // (--verify needs --mtp: never after chunked prefill)
+        int cur = argmax(lg, n_vocab);
         dump_row(lg, n_vocab);
         emit(cur);
         if (!done && !mtp_draft(cur, pos - 1, &draft)) {

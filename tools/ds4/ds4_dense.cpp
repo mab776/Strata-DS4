@@ -2253,7 +2253,6 @@ static bool pf_run(Ds4Dense::Impl & im, Ds4Dense::Impl::Layer * L, Build build, 
 bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
     Impl & im = *p_;
     if (im.pf_cap <= 0) { im.err = "prefill: Ds4DenseConfig::prefill_chunk is 0"; return false; }
-    if (im.il_mtp >= 0) { im.err = "prefill: chunked prefill does not fill the MTP window (not implemented)"; return false; }
     if (n < 1 || n > im.pf_cap || pos0 < 0) { im.err = "prefill: chunk size/position out of range"; return false; }
     if (!im.pf_ctx && !pf_alloc(im)) return false;
     auto& P = im.P;
@@ -2390,6 +2389,20 @@ bool Ds4Dense::prefill_logits(int row0, int nrows, float * out) {
         ggml_backend_tensor_get(im.pf_logits, out, 0, (size_t) (im.g.vocab_size * nrows) * 4);
         return true;
     }, "prefill_logits");
+}
+
+bool Ds4Dense::prefill_state_to_decode(int row0, int n) {
+    Impl & im = *p_;
+    if (!im.pf_ctx || !im.P.x_state || n < 1 || n > kNtMax || row0 < 0 || row0 + n > (int) im.P.x_state->ne[2]) {
+        im.err = "prefill_state_to_decode: rows out of range";
+        return false;
+    }
+    if (!im.ensure_n(n)) return false;
+    const size_t row = (size_t) (im.D * im.HC) * sizeof(float);   // one position's hc streams
+    std::vector<uint8_t> buf(row * (size_t) n);
+    ggml_backend_tensor_get(im.P.x_state, buf.data(), row * (size_t) row0, buf.size());
+    ggml_backend_tensor_set(im.x_state, buf.data(), 0, buf.size());
+    return true;
 }
 
 bool Ds4Dense::prefill_end() {

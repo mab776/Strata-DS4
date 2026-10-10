@@ -34,11 +34,12 @@ if [ "${G1:-0}" = 1 ]; then
 fi
 [ -n "${GROW:-}" ] && G1A+=(--vram-grow "$GROW")
 XE=(); for kv in ${XENV:-}; do XE+=(-e "$kv"); done   # extra container env, e.g. XENV="DS4_CHECK_G1=1 DS4_TIER_PROF=1"
+MTPDIR=${MTPDIR:-"/media/mab776/nvme 2To/models/deepseek-v4-draft/mtp"}   # M7b: mounted at /mtp (--mtp /mtp/<file>)
 docker rm -f ds4-m2 >/dev/null 2>&1
 echo "== $L: $(date '+%F %T') MEM ${MEM}g ARENA ${ARENA} SKIP ${SKIP:-1} CHUNK $CH PCIE ${PCIE:-0.55} G1 ${G1:-0} GROW ${GROW:--} MARGIN ${MARGIN:-2.0} $BUILD $*" | tee "$OUT/$L.log"
 docker run -d --name ds4-m2 --gpus "$GPUS" "${GENV[@]}" "${XE[@]}" -e MIMO_CHUNK_PROF=1 -e GGML_NO_BACKTRACE=1 ${SEED_FIRST:+-e DS4_SEED_FIRST=1} ${MMQ_FP4:+-e STRATA_MMQ_FP4=$MMQ_FP4} \
   --ipc host --memory "${MEM}g" --memory-swap "${MEM}g" --ulimit memlock=-1 \
-  -v "$R":/src:ro -v "$BLOBDIR":/m:ro -v "$IDSD":/w:ro -w /src "$IMAGE" \
+  -v "$R":/src:ro -v "$BLOBDIR":/m:ro -v "$IDSD":/w:ro -v "$MTPDIR":/mtp:ro -w /src "$IMAGE" \
   "$BUILD/ds4_generate" -m "/m/$BLOBF" --ids-file "/w/$IDSF" -n "$N" --temp 0 --stop 1 \
     --ctx 262144 --comp-type iq4_nl --icomp-q8 --slots auto --vram-margin "${MARGIN:-2.0}" \
     --pcie "${PCIE:-0.55}" --vram-lru --pf-b 0.7 --arena-gib "$ARENA" "${SK[@]}" "${PF[@]}" \
@@ -58,5 +59,5 @@ done
 docker logs ds4-m2 > "$OUT/$L.ids" 2>> "$OUT/$L.log"
 echo "exit=$(docker inspect -f '{{.State.ExitCode}}' ds4-m2) oom=$(docker inspect -f '{{.State.OOMKilled}}' ds4-m2) wall=$(( $(date +%s) - t0 ))s" >> "$OUT/$L.log"
 docker rm ds4-m2 >/dev/null
-grep -E '^(prefill|decode :|experts/token|decode ms/token|tier moves|VRAM free|slots auto|tier:|prefill chunks|ppl:|chunk prof|tier ms|context cap|exit=|gpu1|vram grow|grow_cache|\[g1-chk\] GPU)|error|failed|refused|abort|DIFFER' "$OUT/$L.log"
+grep -E '^(prefill|decode :|experts/token|decode ms/token|tier moves|VRAM free|slots auto|tier:|prefill chunks|ppl:|chunk prof|tier ms|context cap|exit=|gpu1|vram grow|grow_cache|\[g1-chk\] GPU|MTP|verify)|error|failed|refused|abort|DIFFER' "$OUT/$L.log"
 awk 'NF>=5 && $4>0 {if($2>h)h=$2; if($3>p)p=$3; if(m==""||$4<m)m=$4; if($5>v)v=$5; if(NF>=6 && $6>v1)v1=$6} END{printf "peak VmHWM %.1f GiB, cgroup peak %.1f GiB, min host avail %.1f GiB, peak VRAM %d MiB (GPU 1 %d MiB)\n",h/1048576,p/2^30,m/1048576,v,v1}' "$OUT/$L.mem" | tee -a "$OUT/$L.log"

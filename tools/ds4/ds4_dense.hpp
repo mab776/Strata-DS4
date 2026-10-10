@@ -166,6 +166,10 @@ public:
     bool prefill_finish(int il, const float * routed_sum);
     /// Logits of rows row0 .. row0+nrows-1 of the chunk into `out` (nrows * n_vocab floats, row-major).
     bool prefill_logits(int row0, int nrows, float * out);
+    /// mab776 M7b: rows [row0, row0 + n) (n <= max_tokens()) of the last chunk's final hc state into the decode state,
+    /// so the MTP head can run over the prompt's last positions after a chunked prefill (mtp_begin reads it).  Valid
+    /// until prefill_release, after the chunk's last layer.
+    bool prefill_state_to_decode(int row0, int n);
     bool prefill_end();
     /// Frees the chunk tensors and the shared graph buffer (VRAM back for the expert cache).
     void prefill_release();

@@ -1,0 +1,23 @@
+== B7-needle-d50: 2026-10-10 00:09:38 MEM 44g ARENA 39 SKIP 1 CHUNK 2048 PCIE 0.55 build-ds4-cu13 
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 48403 MiB):
+  Device 0: NVIDIA RTX PRO 5000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 48403 MiB
+dense backend: CUDA0
+context cap 262144 tokens
+dense compute buffers: one shared arena 48.8 MiB for every decode graph
+slots auto: 38.99 GiB free after the dense half -> 29.99 GiB of expert slots (margin 9.00 GiB; expert 7.19-9.38 MiB -> 3275-4272 experts)
+tier: gpu, 4227 resident slots, arena 39.0 GiB (5503 experts), file tier 1198; load 48.8 s
+strata: prompt kernels: mxfp4 is FP4 x FP4 in llama.cpp's MMQ on this GPU: non-MMQ path (q8_1); STRATA_MMQ_FP4=1 for MMQ
+ds4_moe: run_chunk: layer 26 stays on MMVQ (types 22/22/39)
+ds4_moe: run_chunk: layer 42 stays on MMVQ (types 16/16/39)
+chunk prof: 5289 calls, 13647 launches: wall 390328 ms = waits on reads 355661 + wave/copy waits 0 + final sync 24936 + other host 9731; reader wall 361693 ms; GPU grouped kernels 201307 ms (resident 175012); file tier 865.2 GB read in 360598 ms of reader time = 2.40 GB/s
+prefill chunks of 2048: dense 547402 ms (attention+router 543689, finish 3714), experts 390363 ms, head/ppl 23 ms, cache seed 0 ms -> 4227 resident slots
+
+prefill: 251199 tokens in 940.05 s = 267.22 tok/s (chunked)
+decode : 91 tokens, 90 forward passes in 6.68 s = 13.47 tok/s
+experts/token: hit 77.4% (prefetched-useful 14.2/token of 28.0 issued), cpu 12.6%, pcie 10.0%, file tier 1031
+tier moves: vram_lru swaps 9.96/pass (demoted 896), arena swaps 0, file reads 43.11 ms/pass
+decode ms/token: predict+prefetch 1.58, attention+router 16.11, experts 54.74, finish 1.21, head 0.50
+tier ms/token: wall 54.73 (gpu hits 2.16, pcie 5.93, cpu pool 43.37)
+VRAM free at the end: 8.35 GiB (calibrates --vram-margin)
+exit=0 oom=false wall=997s
+peak VmHWM 44.4 GiB, cgroup peak 44.0 GiB, min host avail 8.7 GiB, peak VRAM 46295 MiB
