@@ -699,6 +699,7 @@ struct B {
 static bool sparse_on();   // DS4_SPARSE, defined with the other switches below
 static bool sparse_n_off();   // mab776 DS4_SPARSE_N=0: multi-token decode passes back on the masked path
 static bool vis_dev_on();  // DS4_VIS_DEV, ditto
+static bool pf_argsort_on();   // mab776 M10 DS4_PF_ARGSORT=1: prompt chunks back on the full-row argsort for the top-k
 static int64_t idx_block_n(int64_t n);   // DS4_IDX_BLOCK, ditto
 static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
 static bool pf_sparse_on();   // mab776 DS4_PF_SPARSE, ditto
@@ -950,11 +951,12 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 
             // mask = -inf everywhere, 0 at each query's top-k rows, then ANDed with visibility
             const int64_t ntk = std::min<int64_t>(cap, im.IDXTOPK);
-            // chunk off-CPU: one batched argsort for every query row (ggml-cuda's top_k launches cub once per row: 3
+            // chunk off-CPU: one batched argsort for every query row (ggml-cuda's top_k launched cub once per row: 3
             // kernels x n rows x 21 CSA layers, ~63k launches for a 3K-token chunk).  The same top-k set except among
             // exact ties (ReLU zeros), which cub breaks arbitrarily too; the CPU keeps top_k (no launch cost) so its
-            // chunk gate stays bit-exact against the decode loop
-            const bool batched_tk = im.pf && !ggml_backend_is_cpu(im.backend);
+            // chunk gate stays bit-exact against the decode loop.  mab776 M10: with the radix-select patch ggml-cuda's
+            // top_k is ONE launch for all rows (and needs no [cap, n] index buffer) - DS4_PF_ARGSORT=1 = the argsort
+            const bool batched_tk = im.pf && !ggml_backend_is_cpu(im.backend) && pf_argsort_on();
             ggml_tensor * tk = ggml_cont(gc, batched_tk ? ggml_argsort_top_k(gc, sc, (int) ntk)
                                                         : ggml_top_k(gc, sc, (int) ntk));   // [ntk, n]
             if (n == 1 && !im.pf && sparse_on()) {
@@ -1757,6 +1759,14 @@ static bool sparse_n_off() {
 
 static bool sparse_on() {
     static const bool on = [] { const char * e = std::getenv("DS4_SPARSE"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+
+// mab776 M10, DS4_PF_ARGSORT (default off): a prompt chunk's indexer top-k is ggml_top_k - ggml-cuda's TOP_K is one
+// radix-select launch for every row with tools/ds4/patches/ggml-topk-radix-select.patch.  =1: the full-row argsort it
+// replaced (one batched cub sort of [cap, n] plus that whole index buffer), for an A/B.
+static bool pf_argsort_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_ARGSORT"); return e && std::atoi(e) != 0; }();
     return on;
 }
 
