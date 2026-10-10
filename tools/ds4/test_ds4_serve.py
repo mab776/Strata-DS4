@@ -527,6 +527,23 @@ class T2Reuse(Case):
         finally:
             self.assertEqual(eng.close(), 0)
 
+    def test_continuation_keeps_the_turn_checkpoint(self):
+        """The DeepSeek turn pattern: turn 1 ends inside its thinking, a #1053 close-retry pass continues it (append),
+        then turn 2 renders turn 1's `<think>` as `</think>`: it diverges at n1 - 1 and must resume there - from the
+        `turn` checkpoint, which the continuation pass (role `last`) did not overwrite."""
+        eng, spec = Serve("tame", "--prefill-chunk", 16, "--chunk-min", 4), Spec()
+        try:
+            p1 = prompt(70, 145)
+            self.step(eng, spec, p1, 12, what="turn 1")
+            retry = spec.live + prompt(3, 146)                 # + "\n</think>\n\n"
+            self.step(eng, spec, retry, 12, what="#1053 continuation")
+            self.step(eng, spec, spec.live + prompt(2, 147), 12, what="a second continuation")
+            turn2 = p1[:69] + [other(p1[69])] + prompt(20, 148)
+            self.assertEqual(spec.choose(turn2)[:3], ("checkpoint", 69, "turn"))
+            self.step(eng, spec, turn2, 12, what="turn 2")
+        finally:
+            self.assertEqual(eng.close(), 0)
+
     def test_stale_checkpoint_dropped(self):
         """A continuation leaves `last` above an edit's resume point; the edit rewrites those positions, so a later
         resend of the continuation must NOT restore `last` (its compressed rows now hold the edit's tokens)."""

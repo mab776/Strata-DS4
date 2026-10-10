@@ -17,6 +17,9 @@ cd "$(dirname "$0")/../.."
 WT="$PWD"
 LCPP="${LCPP:-$WT/third_party/llama.cpp}"
 CAPS="-e NVIDIA_VISIBLE_DEVICES=none --cpu-shares 64 -u $(id -u):$(id -g) -e HOME=/tmp"
+# the test knobs reach the container when they are set here (binaries, fixtures, the mutation runs' spec overrides)
+FWD="-e DS4_SERVE_BIN -e DS4_GEN_BIN -e DS4_SAMPLER_BIN -e DS4_FX -e DS4_TEST_SPEC_K -e DS4_TEST_SPEC_KEEP_ABOVE \
+     -e DS4_TEST_SPEC_KEEP_RESET"
 case "${1:-test}" in
 build)
     if [ -n "${TOOLS:-}" ]; then
@@ -35,7 +38,7 @@ build)
 test)
     shift || true
     # shellcheck disable=SC2086
-    docker run --rm --name ds4-m5-test --network none $CAPS --memory 4g --memory-swap 4g --cpus 4 -v "$WT":/src \
+    docker run --rm --name ds4-m5-test --network none $CAPS $FWD --memory 4g --memory-swap 4g --cpus 4 -v "$WT":/src \
         -v "$LCPP":/src/third_party/llama.cpp:ro -w /src "${PYTEST_IMAGE:-strata-ds4-pytest:py312}" \
         python3 -W ignore::ResourceWarning tools/ds4/test_ds4_serve.py -v "$@"
     ;;
