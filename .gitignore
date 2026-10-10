@@ -67,3 +67,4 @@ build-vision-cuda12.bat
 
 # mab776: M2 prompt ids / scratch (regenerable with make_prompts.py)
 bench/mab776-m2/work/
+bench/mab776-m2/out/*.mem
