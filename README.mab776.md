@@ -111,3 +111,17 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
 - Order after M2 (Marc, M7 first): M7a = GPU 1 (16 GB) as an extra expert tier to remove the disk reads (re-measure the M2
   table), then M7b DSpark drafter on GPU 1, then prefill attention; M4 (serve/deepseek.py) and M5 (tools/ds4/ds4_serve.cpp)
   on CPU in parallel. Still ask Marc before M8 (Portainer/mode page) and anything public beyond pushing mab776-main.
+
+## Session end 2026-10-10 ~00:45 (usage limit) - where to pick up
+- M2: needles 10 % + 50 % FOUND at 251k (server-mode prefill); 90 % and the 250k one-shot decode run were still running
+  in the background chain (`bench/mab776-m2/work/chain-b7b6.sh`, log `bench/mab776-m2/out/chain-b7b6.log`; check
+  `out/B7-needle-d90.*` with `detok.py ... --word willow-cobalt-696` and `out/B6-250k-code1-oneshot.log`), then finish
+  `bench/mab776-m2/M2-REPORT.md` (verdict: GO if d90 FOUND, per Marc) and commit it with `out/*.log`.
+- UNCOMMITTED, verified (1 of 2 verifiers done: 10.8M new oracle ids, 0 diffs): the Unicode-table tokenizer fix =
+  tools/strata_tokenizer.py + tools/llama_unicode_classes.py + tools/gen_llama_unicode_classes.py +
+  tools/ds4/test_tokenizer_unicode.py + tests/ds4/tokenizer_unicode_golden.json - commit the 5 files TOGETHER (import).
+  Then the two M3-verify minors: from_dir must require token_type.json; qwen35 single-pattern fast path.
+- M4 / M5 / M7a workflows were STOPPED at the design stage (designs partly done; M7a has 2 designs in its journal).
+  Relaunch from the scripts under ~/.claude/projects/*/6a7c0663-*/workflows/scripts/ (m4-deepseek-module, m5-ds4-serve,
+  m7a-gpu1-tier-design). M4 must also fix: literal-tag protection cost with 1,283 marks (range-class regex), the
+  private-use collision, stop ids {1}, bos_token. M5: /slots SAVE/RESTORE not in the engine (gate in config).
