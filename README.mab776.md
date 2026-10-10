@@ -127,3 +127,25 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   private-use collision, stop ids {1}, bos_token. M5: /slots SAVE/RESTORE not in the engine (gate in config).
 
 - 00:43: needle 90 % FOUND ("willow-cobalt-696", prefill 256 tok/s) -> needles 3/3 at 251k -> **M2 = GO** (Marc's rule). The 250k one-shot decode run (B6) started 00:43; its log: bench/mab776-m2/out/B6-250k-code1-oneshot.log.
+
+## M4 - DeepSeek-V4 in Strata's server (branch m4-deepseek, spec bench/mab776-m2/work/m4/DESIGN.md)
+- `serve/deepseek.py` = the family: `DeepSeekTemplate` (the GGUF's chat template with bos_token, thinking on by default,
+  effort none/low/medium/high/xhigh/max -> off/-/-/high/high/max, tools re-wrapped as type=function, tool results in
+  call order, text parts joined with "\n", a trailing assistant continued) + `DeepSeekOutputParser` (reasoning_content,
+  DSML tool calls whole once valid, malformed DSML = its text, a call inside the thinking only when the output ends
+  with it). Selected by the chat template itself (llama.cpp's test); `"architecture": "deepseek4"` only asserts it.
+- Server hooks read the family from the template (`getattr`), so Qwen takes the same path as before (checked: 53
+  Qwen-visible outputs identical to mab776-main, stop ids still 248044/248046). Fixes for every family: stop ids never
+  ordinary pieces (DS4: {1} from special_ids), literal tags marked per request (DS4 1,283 literals: encode_prompt
+  683 -> 80 ms at 100k tokens, 1,660 -> 214 ms at 250k, same ids) and a private-use character of the request is never
+  rewritten; `--slots` is not read as batch slots for DeepSeek (int("auto") ended the start).
+- Config: `tools/ds4/ds4-server.json.example` (refused for DeepSeek: vision, parallel, slot_save_path, vram_elastic,
+  expert_profile_save; ignored: effort_position end, tool_call_recovery). Args go to the engine unchanged.
+- Tests: `serve/test_deepseek.py` (14 stack-73 captures byte-equal but c06b xhigh by design, parser at every split +
+  fuzz, mock-engine calls/#1053/budget/forced tool_choice/Anthropic/Responses, literal tags vs v0.1.41, main() with a
+  fake DS4 engine). Real-vocabulary tests: `STRATA_DS4_TOKENIZER=<pack tokenizer dir>`.
+- By design vs stack 73: xhigh = high preamble; response_format adds Strata's directive (llama.cpp: grammar); #843
+  drops completed empty assistant turns; quoted <think>/control text is text (#537); forced tool_choice = a written
+  DSML opening; whole tool calls only (SSE keep-alive every 10 s while one is held).
+- DeepSeek serving pieces adapted from Jackwwg83/Strata-DS (MIT) and Aleks-Che/Strata (MIT); tool-result ordering,
+  prefill continuation and part joining from ggml-org/llama.cpp (MIT).

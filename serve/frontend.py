@@ -15,6 +15,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -47,10 +48,15 @@ class ChatTemplate:
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
+        env.filters.update(self.extra_filters())
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
+
+    def extra_filters(self) -> dict:
+        """mab776: filters a model family's template uses beyond transformers' (DeepSeek-V4: from_json).  None here."""
+        return {}
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -112,13 +118,26 @@ class ChatTemplate:
 
 
 # ------------------------------------------------------------------------------------------------ requests
-def _text_of(content) -> str:
+def _join_texts(texts, joiner: str = "") -> str:
+    """Text parts as one string.  joiner "" (Qwen, as always): plain concatenation.  mab776: a joiner (DeepSeek: "\\n")
+    goes before a part only when the text so far is not empty (llama.cpp's concat_content_parts: ["", "b"] is "b")."""
+    if not joiner:
+        return "".join(texts)
+    out = ""
+    for t in texts:
+        if out:
+            out += joiner
+        out += t
+    return out
+
+
+def _text_of(content, joiner: str = "") -> str:
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    return "".join(part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
-                   ("text", "input_text", None))
+    return _join_texts([part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") in
+                        ("text", "input_text", None)], joiner)
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
@@ -129,26 +148,31 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
-def effort_kwargs(value) -> dict:
-    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
+def effort_kwargs(value, table: dict | None = None) -> dict:
+    """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash.
+    mab776: `table` is a model family's own map (the template's `effort_table`; DeepSeek keeps high and max apart),
+    EFFORT when None."""
+    table = EFFORT if table is None else table
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
-    if key not in EFFORT:
+    if key not in table:
         raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
-    level = EFFORT[key]
+    level = table[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
 
-def budget_effort(tokens) -> dict:
-    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high."""
+def budget_effort(tokens, table: dict | None = None) -> dict:
+    """Anthropic's thinking budget (budget_tokens) -> a level: under 2K low, under 8K medium, else high (each as the
+    family's `table` names it; EFFORT when None)."""
+    table = EFFORT if table is None else table
     try:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": table["low"] if n < 2048 else table["medium"] if n < 8192 else table["high"]}
 
 
 def _has_image(content) -> bool:
@@ -171,11 +195,11 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
-def _parts_of(content):
+def _parts_of(content, joiner: str = ""):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
     template's list form - text items and image items, in order - whose image items carry their source."""
     if not _has_image(content):
-        return _text_of(content)
+        return _text_of(content, joiner)
     items = []
     for part in content:
         if not isinstance(part, dict):
@@ -204,9 +228,63 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
-LITERAL_TAGS = {**THINK_TAGS, **VISION_TAGS}
-THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
+SPARE_MARK0 = 0x100000       # mab776: a tag whose usual mark the request itself contains takes one from here (plane 16)
+_PRIVATE_USE = re.compile("[\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]")
+
+
+def _overlap_free(texts) -> bool:
+    """No proper suffix of a literal is a proper prefix of one (itself included).  Then one left-to-right scan that
+    takes the longest literal at each position finds exactly the literals the longest-first str.replace passes of
+    _mark replace (a literal inside a longer one is either found on its own or removed with the longer one)."""
+    heads = {t[:k] for t in texts for k in range(1, len(t))}
+    return not any(t[k:] in heads for t in texts for k in range(1, len(t)))
+
+
+def _trie_regex(texts) -> re.Pattern:
+    """One pattern matching exactly `texts`, the longest one at each position (common prefixes factored)."""
+    trie: dict = {}
+    for s in texts:
+        node = trie
+        for ch in s:
+            node = node.setdefault(ch, {})
+        node[""] = {}
+
+    def emit(node):
+        kids = [re.escape(ch) + emit(sub) for ch, sub in sorted(node.items()) if ch]
+        if not kids:
+            return ""
+        body = kids[0] if len(kids) == 1 else "(?:" + "|".join(kids) + ")"
+        return "(?:" + body + ")?" if "" in node else body          # greedy: the longer literal first
+    return re.compile(emit(trie))
+
+
+class LiteralTags(dict):
+    """literal_tags()'s {literal: its private-use mark}, in the order _mark replaces them - a plain dict, as before -
+    that also finds them fast.  mab776 (M4): DeepSeek-V4 has 1,283 literals (1,277 control tokens, most of them
+    place-holders); one `in` scan and one str.replace pass per literal cost 126 / 272 ms a request at 100K / 250K
+    tokens, and the old unmark (an alternation of 1,283 marks) 484 / 1,191 ms (now 4 / 9 and 2 / 7 ms, same ids).  An
+    overlap-free set (Qwen's 29 and DeepSeek's 1,283 are) is found by one trie regex; any other by the exact scan."""
+
+    @functools.cached_property
+    def _finder(self):
+        texts = [t for t in self if t]
+        return _trie_regex(texts) if texts and _overlap_free(texts) else None
+
+    def present(self, strings) -> list[str]:
+        """The literals that occur in `strings`, in this dict's order."""
+        finder = self._finder
+        if finder is None:
+            return [t for t in self if t and any(t in s for s in strings)]
+        found = set()
+        for s in strings:
+            if s:
+                found.update(finder.findall(s))
+        return [t for t in self if t in found] if found else []
+
+
+LITERAL_TAGS = LiteralTags({**THINK_TAGS, **VISION_TAGS})
+THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 
 
 def literal_tags(controls) -> dict[str, str]:
@@ -216,7 +294,49 @@ def literal_tags(controls) -> dict[str, str]:
     first, as the tokenizer matches them: a literal inside a longer one is not marked before it."""
     tags = {**LITERAL_TAGS, **{c: chr(CONTROL_MARK0 + k) for k, c in enumerate(c for c in controls
                                                                                 if c not in LITERAL_TAGS)}}
-    return dict(sorted(tags.items(), key=lambda t: -len(t[0])))
+    return LiteralTags(sorted(tags.items(), key=lambda t: -len(t[0])))
+
+
+def _strings(v, out: list) -> list:
+    """Every string inside `v` (dict values, list items), in order."""
+    if isinstance(v, str):
+        out.append(v)
+    elif isinstance(v, dict):
+        for x in v.values():
+            _strings(x, out)
+    elif isinstance(v, list):
+        for x in v:
+            _strings(x, out)
+    return out
+
+
+def _request_marks(present: list[str], tags: dict[str, str], strings: list[str]) -> dict[str, str]:
+    """{literal: mark} for the literals this request holds: each keeps its usual mark unless the request's own text
+    contains that private-use character (a Nerd Font icon, U+F0001-U+F1AF0, overlaps DeepSeek's U+F0E01-U+F130C), which
+    unmarking would otherwise have turned into the literal; such a literal takes a code point the request does not
+    use.  Only these marks are unmarked, so no other private-use character of the request is ever touched."""
+    used = set()
+    for s in strings:
+        if s:
+            used.update(_PRIVATE_USE.findall(s))
+    marks, spare = {}, []
+    for t in present:
+        if tags[t] in used:
+            spare.append(t)
+        marks[t] = tags[t]
+    if spare:
+        taken = used | set(marks.values())
+        cp = SPARE_MARK0
+        for t in spare:
+            while chr(cp) in taken:
+                cp += 1
+            if cp > 0x10FFFD:
+                raise ValueError("the request uses every private-use character: its literal special-token texts "
+                                 "cannot be told apart from it")
+            marks[t] = chr(cp)
+            taken.add(marks[t])
+            cp += 1
+    return marks
 
 
 def _mark(text: str, tags: dict[str, str] = LITERAL_TAGS) -> str:
@@ -247,12 +367,21 @@ def _has_tag(v, tags: dict[str, str] = LITERAL_TAGS) -> bool:
 
 def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str, str] = LITERAL_TAGS):
     """#537: (messages, tools) with every literal <think> / </think> (#554: and vision marker) in their text swapped for
-    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and
-    whether there was one (None: no change, the same objects back - a prompt without them renders as it always did).
+    LITERAL_TAGS' marks (or `tags`': literal_tags() adds the control tokens' texts), and the marks used ({} - falsy -
+    when there was none: the same objects back, a prompt without them renders as it always did).
     An assistant message whose content opens with a whole <think>...</think> block (clients that send the reasoning
-    inline) keeps that one block as the model's markers, as before."""
-    if not _has_tag(messages, tags) and not _has_tag(tools, tags):
-        return messages, tools, False
+    inline) keeps that one block as the model's markers, as before.
+    mab776 (M4): only the literals the request holds are marked, each with its usual mark unless the request's text
+    contains that character (_request_marks); give the returned marks to unmark_think_literals.  The strings come out
+    as before: a literal the request does not hold cannot appear after the replacements (a mark is one private-use
+    character), and the replacements run in the same order."""
+    if not isinstance(tags, LiteralTags):
+        tags = LiteralTags(tags)
+    strings = _strings([{k: v for k, v in m.items() if k != "role"} for m in messages], []) + _strings(tools, [])
+    present = tags.present(strings)
+    if not present:
+        return messages, tools, {}
+    tags = _request_marks(present, tags, strings)
     out = []
     for m in messages:
         m = dict(m)
@@ -266,17 +395,31 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
             m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
                             _mark(content[j + len("</think>"):], tags))
         out.append(m)
-    return out, _mark_deep(tools, tags), True
+    return out, _mark_deep(tools, tags), tags
 
 
-_THINK_MARK_RE = re.compile("|".join(THINK_MARKS))
+@functools.lru_cache(maxsize=256)
+def _mark_class(marks: frozenset) -> re.Pattern:
+    """One character class matching `marks`, consecutive code points as ranges.  mab776 (M4): an alternation of 1,283
+    marks (non-BMP characters) is tried one by one at every character of the prompt - 0.5 s at 104K tokens."""
+    cps, out, i = sorted(ord(m) for m in marks), [], 0
+    while i < len(cps):
+        j = i
+        while j + 1 < len(cps) and cps[j + 1] == cps[j] + 1:
+            j += 1
+        out.append(re.escape(chr(cps[i])) + ("" if i == j else "-" + re.escape(chr(cps[j]))))
+        i = j + 1
+    return re.compile("[" + "".join(out) + "]")
 
 
 def unmark_think_literals(prompt: str, tags: dict[str, str] = LITERAL_TAGS) -> tuple[str, list[tuple[int, int]]]:
     """The rendered prompt with THINK_TAGS' marks turned back into the tags' text, and the (start, end) spans of those
-    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans)."""
-    marks = THINK_MARKS if tags is LITERAL_TAGS else {v: k for k, v in tags.items()}
-    mark_re = _THINK_MARK_RE if tags is LITERAL_TAGS else re.compile("|".join(map(re.escape, marks)))
+    tags in it: the server encodes them as ordinary text (the tokenizer's encode_plain_spans).  `tags`: the marks
+    mark_think_literals returned (or a whole literal_tags() map)."""
+    marks = {v: k for k, v in tags.items()}
+    if not marks:
+        return prompt, []
+    mark_re = _mark_class(frozenset(marks))
     out, spans, pos, n = [], [], 0, 0
     for m in mark_re.finditer(prompt):
         out.append(prompt[pos:m.start()])
@@ -362,14 +505,24 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
-def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
-    """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+def _family(template) -> tuple[str, bool, bool, dict | None]:
+    """mab776 (M4): what a model family's template (serve/deepseek.py) asks of the normalizers - the joiner of text
+    parts, whether call ids are kept (the template orders tool results by them), whether late system messages become
+    user messages, its effort map.  A plain ChatTemplate (or None) gets today's behaviour."""
+    return (getattr(template, "part_joiner", ""), getattr(template, "keep_tool_ids", False),
+            getattr(template, "late_system_to_user", True), getattr(template, "effort_table", None))
+
+
+def openai_to_messages(req: dict, template=None) -> tuple[list[dict], list[dict] | None, dict]:
+    """OpenAI Chat Completions -> (template messages, template tools, template kwargs).  `template`: see _family."""
+    joiner, keep_ids, late_to_user, table = _family(template)
     messages = []
     for m in _object_list(req.get("messages"), "messages"):
         role = m.get("role")
         if role == "developer":
             role = "system"
-        out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
+        out = {"role": role, "content": _parts_of(m.get("content"), joiner) if role in ("user", "tool", "assistant")
+               else _text_of(m.get("content"), joiner)}
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
         if m.get("tool_calls"):
@@ -379,21 +532,25 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
                 calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                if keep_ids and isinstance(c.get("id"), str) and c["id"]:
+                    calls[-1]["id"] = c["id"]
             out["tool_calls"] = calls
+        if keep_ids and isinstance(m.get("tool_call_id"), str) and m["tool_call_id"]:
+            out["tool_call_id"] = m["tool_call_id"]
         messages.append(out)
     tools = [t.get("function", t) if t.get("type") == "function" else t
              for t in _tool_list(req.get("tools"), "function")] or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req.get("reasoning") if isinstance(req.get("reasoning"), dict) else {}
-    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort")))
+    kwargs.update(effort_kwargs(req.get("reasoning_effort") or reasoning.get("effort"), table))
     # the vLLM / llama.cpp convention: {"chat_template_kwargs": {"enable_thinking": false, "reasoning_effort": "low"}}
     for k, v in (req.get("chat_template_kwargs") or {}).items():
         if k == "enable_thinking" and not v:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
-            kwargs.update(effort_kwargs(v))
-    return _late_system_to_user(messages), tools, kwargs
+            kwargs.update(effort_kwargs(v, table))
+    return (_late_system_to_user(messages) if late_to_user else messages), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -425,14 +582,16 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
-def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
+def anthropic_to_messages(req: dict, think_unasked: bool = True, template=None) -> tuple[list[dict], list[dict] | None,
+                                                                                        dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    renders it without thinking (#278, the config's "anthropic_thinking": "on_request").  `template`: see _family."""
+    joiner, keep_ids, late_to_user, table = _family(template)
     messages = []
     system = req.get("system")
     if system:
-        messages.append({"role": "system", "content": pin_billing_stamp(_text_of(system))})
+        messages.append({"role": "system", "content": pin_billing_stamp(_text_of(system, joiner))})
     for m in _object_list(req.get("messages"), "messages"):
         content = m.get("content")
         if isinstance(content, str):
@@ -440,7 +599,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             continue
         if m.get("role") == "user" and _has_image(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
-            messages.append({"role": "user", "content": _parts_of(content)})
+            messages.append({"role": "user", "content": _parts_of(content, joiner)})
             continue
         text, reasoning, calls, parts = [], [], [], []
         for block in content or []:
@@ -454,13 +613,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                if keep_ids and isinstance(block.get("id"), str) and block["id"]:
+                    calls[-1]["id"] = block["id"]
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _parts_of(block.get("content"), joiner)})
+                if keep_ids and isinstance(block.get("tool_use_id"), str) and block["tool_use_id"]:
+                    messages[-1]["tool_call_id"] = block["tool_use_id"]
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
-            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
+            out = {"role": m["role"], "content": _parts_of(parts, joiner) if _has_image(parts)
+                   else _join_texts(text, joiner)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:
@@ -476,9 +640,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     if isinstance(thinking, dict) and thinking.get("type") == "disabled":
         kwargs["enable_thinking"] = False
     elif effort:
-        kwargs.update(effort_kwargs(effort))
+        kwargs.update(effort_kwargs(effort, table))
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
-        kwargs.update(budget_effort(thinking["budget_tokens"]))
+        kwargs.update(budget_effort(thinking["budget_tokens"], table))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
         # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
         # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
@@ -487,7 +651,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _late_system_to_user(messages), tools, kwargs
+    return (_late_system_to_user(messages) if late_to_user else messages), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -589,22 +753,24 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def forced_call(tool_choice, tools: list[dict] | None) -> str | None:
+def forced_call(tool_choice, tools: list[dict] | None, template=None) -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
     "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
     unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools).
+    mab776 (M4): a model family's template writes its own opening (`call_opening(name)`, DeepSeek's DSML)."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    opening = getattr(template, "call_opening", None)
     if kind in ("auto", "none"):
         return None
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START + "\n<function="
+        return opening(None) if opening else CALL_START + "\n<function="
     if kind == "named" and name in names:
-        return CALL_START + f"\n<function={name}>\n"
+        return opening(name) if opening else CALL_START + f"\n<function={name}>\n"
     print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
           "request): the model decides, as with \"auto\"", flush=True)
     return None
