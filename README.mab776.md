@@ -125,3 +125,5 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   Relaunch from the scripts under ~/.claude/projects/*/6a7c0663-*/workflows/scripts/ (m4-deepseek-module, m5-ds4-serve,
   m7a-gpu1-tier-design). M4 must also fix: literal-tag protection cost with 1,283 marks (range-class regex), the
   private-use collision, stop ids {1}, bos_token. M5: /slots SAVE/RESTORE not in the engine (gate in config).
+
+- 00:43: needle 90 % FOUND ("willow-cobalt-696", prefill 256 tok/s) -> needles 3/3 at 251k -> **M2 = GO** (Marc's rule). The 250k one-shot decode run (B6) started 00:43; its log: bench/mab776-m2/out/B6-250k-code1-oneshot.log.
