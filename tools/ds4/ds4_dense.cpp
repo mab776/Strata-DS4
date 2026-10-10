@@ -1074,10 +1074,18 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     // qualifies (keys >= max(4096, 2 x nqb x n_kv_max)); shallower chunks keep the blocked path.  Same keys, same
     // masked set: only the summation order of the softmax differs.  DS4_PF_SPARSE=0: the blocked path everywhere.
     int64_t nqb = 0;
+    bool dense1 = false;   // a shallow CSA chunk: the same layout, one DENSE call (no n_kv_max)
     const int64_t nkv_q = SWA + (csa ? std::min<int64_t>(cap, im.IDXTOPK) : 0);
-    if (im.pf && csa && k_cmp && m_cmp && RB < n && !ggml_backend_is_cpu(im.backend) && pf_sparse_on())   // (chunk mode never gathers: `sel` is one-token decode)
+    if (im.pf && csa && k_cmp && m_cmp && RB < n && !ggml_backend_is_cpu(im.backend) && pf_sparse_on()) {   // (chunk mode never gathers: `sel` is one-token decode)
         for (int64_t c : { (int64_t) 64, (int64_t) 32, (int64_t) 16, (int64_t) 8 })
             if (cap >= std::max<int64_t>(4096, 2 * c * nkv_q)) { nqb = c; break; }
+        // below the sparse threshold (cap < ~10k): all n queries in ONE dense call over [compressed | raw | pad]
+        // instead of RB-blocks that each concat + cast + pad the compressed K (~32 of them a layer-chunk); with the
+        // compressed rows first, ggml-cuda's tile skip (n >= 1024) stops each query tile at its window's end.
+        // DS4_PF_DENSE1=0: the blocked path for these (A/B).
+        static const bool d1 = [] { const char * e = std::getenv("DS4_PF_DENSE1"); return !e || std::atoi(e) != 0; }();
+        if (nqb == 0 && d1) { nqb = n; dense1 = true; }
+    }
     if (nqb > 0) {
         const int64_t nk = cap + n_raw, T = (nk + 255) / 256 * 256;
         ggml_tensor * kall = ggml_concat(gc, k_cmp, k_raw, 2);                      // [DH, 1, nk]
@@ -1110,7 +1118,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                                             (size_t) t0 * row);                     // contiguous rows of the mask
             ggml_tensor * o = ggml_flash_attn_ext(gc, qp, k4, k4, m4, scale, 0.0f, 0.0f);
             ggml_flash_attn_ext_add_sinks(o, sinks);
-            ggml_flash_attn_ext_set_n_kv_max(o, (int32_t) nkv_q);
+            if (!dense1) ggml_flash_attn_ext_set_n_kv_max(o, (int32_t) nkv_q);
             return ggml_reshape_3d(gc, o, DH, NH, nq * nblk);                       // [DH, NH, nq * nblk]
         };
         const int64_t nblk = n / nqb, rem = n - nblk * nqb;
