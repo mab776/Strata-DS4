@@ -239,6 +239,13 @@ struct Gpu1 {
     void* c_hmeta = nullptr;
     float* c_hrows = nullptr;          ///< the compact entry rows of one layer-chunk (pinned, mapped: GPU 0 reads it)
     cudaEvent_t c_ev = nullptr;        ///< the rows of the layer-chunk in flight are in c_hrows
+    /// prompt chunks on MMQ (Ds4MoeConfig::chunk_mmq): <= m_rows entries and <= m_ge whole experts a launch, the
+    /// experts gathered into m_stage at the MMQ stride first (their slots are not strided)
+    int64_t m_rows = 0, m_ge = 0, m_slot = 0;
+    void *m_gu = nullptr, *m_h = nullptr, *m_xg = nullptr, *m_xu = nullptr, *m_xd = nullptr, *m_stage = nullptr;
+#if defined(DS4_MOE_MMQ)
+    strata::prefill::mmq::Context* m_ctx = nullptr;   ///< bound to GPU 1; never deleted (see Gpu::m_ctx)
+#endif
     uint64_t budget = 0;               ///< bytes for expert slots (measured at init, after every buffer above)
     std::vector<std::pair<int32_t, int32_t>> set;   ///< its experts, the walk's GPU-1 share (ranked order)
     bool seeded = false;
@@ -251,7 +258,8 @@ struct Gpu1 {
             On on(dev);
             if (s) cudaStreamSynchronize(s);
             cache.reset();
-            for (void* p : {d_x, d_xq, d_parts, d_meta, d_scratch, c_x, c_xq, c_parts, c_scratch, c_meta, c_iota})
+            for (void* p : {d_x, d_xq, d_parts, d_meta, d_scratch, c_x, c_xq, c_parts, c_scratch, c_meta, c_iota,
+                            m_gu, m_h, m_xg, m_xu, m_xd, m_stage})
                 if (p) cudaFree(p);
             for (void* p : {h_meta, (void*) h_parts, c_hmeta, (void*) c_hrows})
                 if (p) cudaFreeHost(p);
@@ -529,7 +537,8 @@ bool open_gpu1(Ds4MoeImpl& im, std::string& err) {
         if (good && ct > 0) {
             g.c_tok = ct;
             g.c_cap = ct;                  // entries per launch; a group may be split between two launches
-            g.c_nl = im.g.top_k + 2;       // launches per layer-chunk: its entries <= c_tok * top_k
+            g.c_nl = 16;                   // launches a layer-chunk: entries <= c_tok * top_k (MMVQ: <= top_k + 1),
+                                           // MMQ also ends one every m_ge experts (<= 8 + top_k + 1 with 32)
             g.c_rows = ct * im.g.top_k;
             const size_t mb = g1_cmeta_bytes(im.g.n_experts, g.c_cap);
             good = ok(cudaMalloc(&g.c_x, (size_t) ct * H4), "c_x") &&
@@ -546,6 +555,24 @@ bool open_gpu1(Ds4MoeImpl& im, std::string& err) {
                 for (size_t i = 0; i < io.size(); ++i) io[i] = (int32_t) i;
                 good = ok(cudaMemcpy(g.c_iota, io.data(), io.size() * 4, cudaMemcpyHostToDevice), "c_iota");
             }
+#if defined(DS4_MOE_MMQ)
+            // prompt chunks on MMQ: GPU 1's share was its grouped MMVQ (~12 ms a layer-chunk) - the expert phase's
+            // critical path once GPU 0's resident experts moved to MMQ.  ~0.4 GiB, taken before the budget below.
+            namespace mq = strata::prefill::mmq;
+            if (good && im.cfg.chunk_mmq && mq::built() && !std::getenv("DS4_G1_MMVQ")) {
+                g.m_rows = g.c_cap;
+                g.m_ge = 32;
+                g.m_slot = im.blob + 1048576;   // the MMQ stride rounds a blob up by <= ~0.3 MiB; MMQ reads <= 4 KiB past
+                good = ok(cudaMalloc(&g.m_gu, (size_t) g.m_rows * (size_t) (2 * FF) * 4), "m_gu") &&
+                       ok(cudaMalloc(&g.m_h, (size_t) g.m_rows * (size_t) FF * 4), "m_h") &&
+                       ok(cudaMalloc(&g.m_xg, mq::q8_bytes(g.m_rows, H)), "m_xg") &&
+                       ok(cudaMalloc(&g.m_xu, mq::q8_bytes(g.m_rows, H)), "m_xu") &&
+                       ok(cudaMalloc(&g.m_xd, mq::q8_bytes(g.m_rows, FF)), "m_xd") &&
+                       ok(cudaMalloc(&g.m_stage, (size_t) g.m_ge * (size_t) g.m_slot + 1048576), "m_stage") &&
+                       ok(cudaMemset(g.m_stage, 0, (size_t) g.m_ge * (size_t) g.m_slot + 1048576), "m_stage zero");
+                if (good) g.m_ctx = new mq::Context();   // on GPU 1 (the On guard above): its own cuda context
+            }
+#endif
         }
         size_t fr = 0, tot = 0;
         if (good) good = ok(cudaMemGetInfo(&fr, &tot), "cudaMemGetInfo");
@@ -759,7 +786,32 @@ void g1_wait(Ds4MoeImpl& im, Ds4MoeStats& st) {
 /// expert e's entries at [first[e], first[e] + cnt[e]), tokens `tok`).  The chunk's `n` rows go over (x_host is the
 /// dense half's pinned buffer), launches of <= c_cap entries compute them, the compact rows land in c_hrows and
 /// c_ev is recorded: GPU 0 waits on it (device side) and scatters the rows into its c_parts before the mix.
-void g1_chunk_launch(Ds4MoeImpl& im, int64_t layer, int n, const float* x_host, const std::vector<int32_t>& g1e,
+#if defined(DS4_MOE_MMQ)
+/// Whether `layer`'s products run on MMQ (gpu_run_chunk's rule: every type covered, offsets even), and the stride SL
+/// a blob then needs (BL rounded up to whole blocks of every type, <= 1 MiB - 4 KiB more).
+bool mmq_layer(const Ds4MoeImpl& im, int64_t layer, int64_t& SL) {
+    namespace mmq = strata::prefill::mmq;
+    const int64_t BL = im.bl[(size_t) layer];
+    SL = BL;
+    if (!im.cfg.chunk_mmq || !mmq::built() || !im.gpu) return false;
+    const strata::kernels::NativeExpertLayout& GL = im.gpu->gll[(size_t) layer];
+    const int gt = GL.gu_type, ut = GL.up_type >= 0 ? GL.up_type : GL.gu_type, dt = GL.d_type;
+    if (!(mmq::fits(gt, GL.n_ff) && mmq::fits(ut, GL.n_ff) && mmq::fits(dt, GL.n_embd) && GL.up_off % 2 == 0 &&
+          GL.down_off % 2 == 0))
+        return false;
+    int64_t lcm = 16;
+    auto gcd = [](int64_t a, int64_t b) { while (b) { const int64_t t = a % b; a = b; b = t; } return a; };
+    for (int t : {gt, ut, dt}) {
+        const int64_t tsz = (int64_t) mmq::matrix_bytes(t, 1, 256);
+        lcm = lcm / gcd(lcm, tsz) * tsz;
+    }
+    SL = (BL + lcm - 1) / lcm * lcm;
+    if (SL - BL > 1048576 - 4096) { SL = BL; return false; }
+    return true;
+}
+#endif
+
+bool g1_chunk_launch(Ds4MoeImpl& im, int64_t layer, int n, const float* x_host, const std::vector<int32_t>& g1e,
                      const std::vector<int32_t>& first, const std::vector<int32_t>& cnt, const std::vector<int32_t>& tok,
                      int64_t n1) {
     Gpu1& g = *im.g1;
@@ -767,6 +819,90 @@ void g1_chunk_launch(Ds4MoeImpl& im, int64_t layer, int n, const float* x_host, 
     const size_t mb = g1_cmeta_bytes(NX, g.c_cap), G = (size_t) NX + 1;
     On on(g.dev);
     ck(cudaMemcpyAsync(g.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, g.s), "gpu1 c_x");
+#if defined(DS4_MOE_MMQ)
+    // mab776: GPU 1's share on MMQ - whole experts a launch (<= m_ge of them, <= m_rows entries; an expert has <= n
+    // <= c_cap entries, so one always fits), gathered into m_stage at the stride SL by SM copies on GPU 1, then the same
+    // gate / up / clamped SwiGLU / down products as GPU 0's streamed blobs.  Rows land compact, as the MMVQ path's.
+    int64_t SL = 0;
+    if (g.m_ctx && mmq_layer(im, layer, SL) && SL <= g.m_slot) {
+        namespace mq = strata::prefill::mmq;
+        const strata::kernels::NativeExpertLayout& GL = im.gpu->gll[(size_t) layer];
+        const int gt = GL.gu_type, ut = GL.up_type >= 0 ? GL.up_type : GL.gu_type, dt = GL.d_type;
+        const int64_t FF = GL.n_ff, BL = im.bl[(size_t) layer];
+        const bool same_halves = (GL.up_type < 0 || GL.up_type == GL.gu_type) && GL.down_off == 2 * GL.up_off;
+        size_t q0 = 0;
+        int li = 0;
+        while (q0 < g1e.size()) {
+            size_t q1 = q0;
+            int64_t rows = 0, maxr = 0;
+            while (q1 < g1e.size() && (int64_t) (q1 - q0) < g.m_ge && rows + cnt[(size_t) g1e[q1]] <= g.m_rows) {
+                rows += cnt[(size_t) g1e[q1]];
+                maxr = std::max<int64_t>(maxr, cnt[(size_t) g1e[q1]]);
+                ++q1;
+            }
+            if (li >= g.c_nl) {   // cannot happen with c_nl = 16 (see open_gpu1)
+                std::fprintf(stderr, "ds4_moe: gpu1 chunk: more than %lld MMQ launches\n", (long long) g.c_nl);
+                std::abort();
+            }
+            const int64_t r0 = first[(size_t) g1e[q0]], R = rows;
+            uint8_t* hm = (uint8_t*) g.c_hmeta + (size_t) li * mb;
+            uint8_t* dmt = (uint8_t*) g.c_meta + (size_t) li * mb;
+            auto* start = (int32_t*) (hm + G * 8);   // the MMQ bounds: expert q's entries [start[q], start[q+1])
+            auto* tk = start + (G + 1) + 4;
+            for (size_t q = q0; q < q1; ++q) start[q - q0] = (int32_t) (first[(size_t) g1e[q]] - r0);
+            start[q1 - q0] = (int32_t) R;
+            std::memcpy(tk, tok.data() + r0, (size_t) R * 4);
+            ck(cudaMemcpyAsync(dmt, hm, mb, cudaMemcpyHostToDevice, g.s), "gpu1 mmq meta");
+            const auto* dbnd = (const int32_t*) (dmt + G * 8);
+            const int32_t* dtk = dbnd + (G + 1) + 4;
+            // the experts into the stage, SL apart (16 a launch; a blob that cannot be gathered: the copy engine)
+            for (size_t a = q0; a < q1; a += mq::kGatherGroupMax) {
+                const size_t b = std::min(q1, a + (size_t) mq::kGatherGroupMax);
+                uint8_t* base = (uint8_t*) g.m_stage + (a - q0) * (size_t) SL;
+                bool done = false;
+                if (same_halves) {
+                    mq::GatherGroup gg;
+                    gg.first = 0;
+                    gg.n = (int) (b - a);
+                    for (size_t q = a; q < b; ++q) gg.blob[q - a] = g.cache->device_slot(g.cache->slot_of(layer, g1e[q]));
+                    done = mq::gather_native_group(gg, GL.up_off, GL.up_off, GL.down_off, (size_t) BL - GL.down_off, base,
+                                                   (size_t) SL, base + GL.down_off, (size_t) SL, g.s);
+                }
+                for (size_t q = a; !done && q < b; ++q)
+                    ck(cudaMemcpyAsync(base + (q - a) * (size_t) SL, g.cache->device_slot(g.cache->slot_of(layer, g1e[q])),
+                                       (size_t) BL, cudaMemcpyDeviceToDevice, g.s), "gpu1 stage copy");
+            }
+            mq::quantize((const float*) g.c_x, dtk, g.m_xg, gt, H, H, R, g.s);
+            if (ut != gt) mq::quantize((const float*) g.c_x, dtk, g.m_xu, ut, H, H, R, g.s);
+            mq::Product p;
+            p.n = (int) (q1 - q0);
+            p.expert_bytes = (size_t) SL;
+            p.bounds = dbnd;
+            p.total_rows = R;
+            p.max_rows = maxr;
+            p.w = g.m_stage; p.type = gt; p.w_rows = FF; p.w_cols = H; p.xq = g.m_xg;
+            p.ids = (const int32_t*) g.c_iota; p.dst = (float*) g.m_gu; p.ld_dst = 2 * FF;
+            g.m_ctx->run(p, g.s);
+            p.w = (const uint8_t*) g.m_stage + GL.up_off; p.type = ut; p.xq = ut != gt ? g.m_xu : g.m_xg;
+            p.dst = (float*) g.m_gu + FF;
+            g.m_ctx->run(p, g.s);
+            if (std::isfinite(GL.swiglu_limit))
+                mq::swiglu_clamp((const float*) g.m_gu, (float*) g.m_h, R, FF, false, GL.swiglu_limit, g.s);
+            else
+                mq::swiglu((const float*) g.m_gu, (float*) g.m_h, R, FF, false, g.s);
+            mq::quantize((const float*) g.m_h, nullptr, g.m_xd, dt, FF, FF, R, g.s);
+            p.w = (const uint8_t*) g.m_stage + GL.down_off; p.type = dt; p.w_rows = H; p.w_cols = FF; p.xq = g.m_xd;
+            p.ids = (const int32_t*) g.c_iota; p.dst = (float*) g.c_parts; p.ld_dst = H;
+            g.m_ctx->run(p, g.s);
+            ck(cudaMemcpyAsync(g.c_hrows + (size_t) r0 * (size_t) H, g.c_parts, (size_t) R * (size_t) H * 4,
+                               cudaMemcpyDeviceToHost, g.s), "gpu1 mmq rows");
+            q0 = q1;
+            ++li;
+        }
+        ck(cudaEventRecord(g.c_ev, g.s), "gpu1 chunk record");
+        return true;
+    }
+#endif
     const size_t col = strata::kernels::native_q8_1_bytes((int) H, 1);
     for (int c0 = 0; c0 < n; c0 += 8)   // the same quantizer, in the same 8-column steps, as GPU 0's chunk path
         strata::kernels::native_quantize_q8_1((const float*) g.c_x + (size_t) c0 * (size_t) H,
@@ -809,6 +945,7 @@ void g1_chunk_launch(Ds4MoeImpl& im, int64_t layer, int n, const float* x_host, 
                            cudaMemcpyDeviceToHost, g.s), "gpu1 chunk rows");
     }
     ck(cudaEventRecord(g.c_ev, g.s), "gpu1 chunk record");
+    return false;
 }
 
 #endif  // DS4_MOE_CUDA
@@ -2558,7 +2695,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         dst[(size_t) p] = (int32_t) j;
         tok[(size_t) p] = (int32_t) (j / K);
     }
-    if (n1 > 0) g1_chunk_launch(im, layer, n, x_host, g1e, first, cnt, tok, n1);   // queued first: the slow link
+    const bool g1_mmq = n1 > 0 && g1_chunk_launch(im, layer, n, x_host, g1e, first, cnt, tok, n1);   // queued first
     // entry arrays sorted by expert: uploaded once; each launch passes its groups' slices via grp_start offsets
     ck(cudaMemcpyAsync(gp.c_dst, dst.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_dst");
     ck(cudaMemcpyAsync(gp.c_tokv, tok.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_tok");
@@ -2897,8 +3034,12 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         const int64_t c0 = cnt[(size_t) e0];   // its entries are the sorted [0, c0)
         std::vector<uint8_t> blob((size_t) im.blob);
         im.blobs->read(layer, e0, blob.data());
-        ck(cudaMemcpy(gp.c_stage[0], blob.data(), (size_t) BL, cudaMemcpyHostToDevice), "g1 chk blob");
-        const unsigned long long p = (unsigned long long) gp.c_stage[0];
+        // its own buffer: a stage half may already hold the NEXT layer's prestaged experts (borrowing c_stage[0]
+        // here corrupted them -> NaN, 10-10)
+        static void* chk_blob = nullptr;
+        if (!chk_blob) ck(cudaMalloc(&chk_blob, (size_t) im.blob), "g1 chk buffer");
+        ck(cudaMemcpy(chk_blob, blob.data(), (size_t) BL, cudaMemcpyHostToDevice), "g1 chk blob");
+        const unsigned long long p = (unsigned long long) chk_blob;
         const int32_t stv[2] = {0, (int32_t) c0}, one = 1;
         ck(cudaMemcpy(gp.c_ptr, &p, sizeof p, cudaMemcpyHostToDevice), "g1 chk");
         ck(cudaMemcpy(gp.c_start, stv, sizeof stv, cudaMemcpyHostToDevice), "g1 chk");
@@ -2909,16 +3050,32 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
                                               (float*) gp.c_parts, gp.s, 1);
         std::vector<float> ref((size_t) H);
         int64_t bad = 0;
+        double worst = 0;
         for (int64_t q = 0; q < c0; ++q) {
             ck(cudaMemcpyAsync(ref.data(), (const float*) gp.c_parts + (size_t) dst[(size_t) q] * (size_t) H,
                                (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "g1 chk row");
             ck(cudaStreamSynchronize(gp.s), "g1 chk sync");
-            bad += std::memcmp(ref.data(), im.g1->c_hrows + (size_t) q * (size_t) H, (size_t) H * 4) != 0;
+            const float* g1r = im.g1->c_hrows + (size_t) q * (size_t) H;
+            if (!g1_mmq) {   // MMVQ on both cards: the same bytes
+                bad += std::memcmp(ref.data(), g1r, (size_t) H * 4) != 0;
+                continue;
+            }
+            double num = 0, den = 0;   // GPU 1 on MMQ vs GPU 0's MMVQ: the 8-bit activation rounding differs
+            for (int64_t i = 0; i < H; ++i) { const double d = (double) g1r[i] - ref[(size_t) i]; num += d * d; den += (double) ref[(size_t) i] * ref[(size_t) i]; }
+            const double rel = std::sqrt(num / std::max(den, 1e-30));
+            worst = std::max(worst, rel);
+            bad += !(rel < 5e-2);
         }
         g_g1chk[2] += c0;
         g_g1chk[3] += c0 - bad;
-        if (bad) std::fprintf(stderr, "[g1-chk] L%lld e%d: %lld of %lld prompt rows DIFFER from GPU 0's\n",
-                              (long long) layer, e0, (long long) bad, (long long) c0);
+        static double g1_mmq_worst = 0;
+        if (g1_mmq && worst > g1_mmq_worst) {
+            g1_mmq_worst = worst;
+            std::fprintf(stderr, "[g1-chk] GPU 1 MMQ rows vs GPU 0 MMVQ: worst rel %.3e so far (L%lld)\n", worst,
+                         (long long) layer);
+        }
+        if (bad) std::fprintf(stderr, "[g1-chk] L%lld e%d: %lld of %lld prompt rows DIFFER from GPU 0's%s\n",
+                              (long long) layer, e0, (long long) bad, (long long) c0, g1_mmq ? " (rel >= 5e-2)" : "");
     }
     if (prof) {
         g_cprof.sync += now_ms() - ts;
