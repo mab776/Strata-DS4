@@ -16,7 +16,9 @@ BLOBF=sha256-a79d3b8c742f240dc947758bbeb46d266e9328ace6a3b71704ab4bf2a8610d68
 used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | awk '{s+=$1} END{print s}')
 if [ "$used" -gt 2000 ]; then echo "GPUs busy ($used MiB used) - not starting"; exit 3; fi
 AV=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-MEM=${MEM:-$((AV - 9))}; ARENA=${ARENA:-$((MEM - 6))}
+MEM=${MEM:-$((AV - 10))}; ARENA=${ARENA:-$((MEM - 6))}
+# keep >= 8 GiB free on the host even if the caller asked for more (other jobs share the box)
+[ "$MEM" -gt $((AV - 10)) ] && MEM=$((AV - 10)); [ "$ARENA" -gt $((MEM - 5)) ] && ARENA=$((MEM - 5))
 CH=${CHUNK:-4096}; PF=(--prefill-chunk "$CH"); [ "${MMQ:-1}" = 1 ] && PF+=(--chunk-mmq); [ "${PRESTAGE:-1}" = 1 ] && PF+=(--chunk-prestage)
 [ "$CH" = 0 ] && PF=()
 SK=(); [ "${SKIP:-1}" = 1 ] && SK=(--arena-skip-resident)
@@ -38,10 +40,13 @@ while [ "$(docker inspect -f '{{.State.Running}}' ds4-m2 2>/dev/null)" = true ];
   echo "$(( $(date +%s) - t0 )) $(awk '/VmHWM/{print $2}' /proc/$PID/status 2>/dev/null || echo 0) $(cat $CG/memory.peak 2>/dev/null || echo 0)" \
        "$(awk '/MemAvailable/{print $2}' /proc/meminfo) $(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)" \
        >> "$OUT/$L.mem"
+  a=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+  if [ "$a" -lt 6 ]; then low=$((${low:-0} + 1)); else low=0; fi
+  if [ "${low:-0}" -ge 3 ]; then echo "host MemAvailable ${a} GiB < 6 for 6 s - stopping ds4-m2" | tee -a "$OUT/$L.log"; docker stop -t 5 ds4-m2 >/dev/null; fi
   sleep 2
 done
 docker logs ds4-m2 > "$OUT/$L.ids" 2>> "$OUT/$L.log"
 echo "exit=$(docker inspect -f '{{.State.ExitCode}}' ds4-m2) oom=$(docker inspect -f '{{.State.OOMKilled}}' ds4-m2) wall=$(( $(date +%s) - t0 ))s" >> "$OUT/$L.log"
 docker rm ds4-m2 >/dev/null
 grep -E '^(prefill|decode :|experts/token|decode ms/token|tier moves|VRAM free|slots auto|tier:|prefill chunks|ppl:|chunk prof|tier ms|context cap|exit=)|error|failed|refused|abort' "$OUT/$L.log"
-awk '{if($2>h)h=$2; if($3>p)p=$3; if(m==""||$4<m)m=$4; if($5>v)v=$5} END{printf "peak VmHWM %.1f GiB, cgroup peak %.1f GiB, min host avail %.1f GiB, peak VRAM %d MiB\n",h/1048576,p/2^30,m/1048576,v}' "$OUT/$L.mem" | tee -a "$OUT/$L.log"
+awk 'NF==5 && $4>0 {if($2>h)h=$2; if($3>p)p=$3; if(m==""||$4<m)m=$4; if($5>v)v=$5} END{printf "peak VmHWM %.1f GiB, cgroup peak %.1f GiB, min host avail %.1f GiB, peak VRAM %d MiB\n",h/1048576,p/2^30,m/1048576,v}' "$OUT/$L.mem" | tee -a "$OUT/$L.log"

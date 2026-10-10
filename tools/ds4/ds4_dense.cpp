@@ -1014,7 +1014,18 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
         if (!ggml_backend_is_cpu(im.backend)) {
             const int64_t n_kv = kb->ne[2], pad = (256 - n_kv % 256) % 256;
             if (pad) {
-                kb = ggml_pad(gc, kb, 0, 0, (int) pad, 0);
+                // mab776: ggml-cuda's pad kernel puts ne1 / ne2*ne3 in gridDim.y / gridDim.z (max 65535), and here
+                // ne2 is the key count: a 250k prompt has ~67.8k keys (cap 65536 + the raw window) -> "PAD failed:
+                // invalid argument" mid-prefill.  Past that, pad the flat buffer instead: the same zeros, the launch
+                // then spans gridDim.x.
+                if (n_kv + pad > 65535) {
+                    ggml_tensor * k1 = ggml_is_contiguous(kb) ? kb : ggml_cont(gc, kb);
+                    k1 = ggml_reshape_1d(gc, k1, ggml_nelements(kb));
+                    k1 = ggml_pad(gc, k1, (int) (pad * kb->ne[0] * kb->ne[1]), 0, 0, 0);
+                    kb = ggml_reshape_3d(gc, k1, kb->ne[0], kb->ne[1], n_kv + pad);
+                } else {
+                    kb = ggml_pad(gc, kb, 0, 0, (int) pad, 0);
+                }
                 mb = ggml_concat(gc, mb, ggml_cast(gc, b.fill_f32({ pad, nq }, NEG_INF), GGML_TYPE_F16), 0);
             }
         }
