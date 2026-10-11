@@ -1526,6 +1526,11 @@ class SamplingKeys(unittest.TestCase):
         self.assertIn("mtp_k=0", self.keys(temperature=0, strata_tune={"mtp_k": 0}))   # no drafts
         for mk in (-1, 8, True, 2.0, "3"):
             self.assertFalse([x for x in self.keys(strata_tune={"mtp_k": mk}) if x.startswith("mtp_k=")], mk)
+        # mab776 M11: prompt-lookup drafts per pass, the same bounds
+        self.assertIn("lookup=7", self.keys(temperature=0, strata_tune={"lookup": 7}))
+        self.assertIn("lookup=0", self.keys(temperature=0, strata_tune={"lookup": 0}))
+        for lk in (-1, 8, True, 2.0, "3"):
+            self.assertFalse([x for x in self.keys(strata_tune={"lookup": lk}) if x.startswith("lookup=")], lk)
 
     def test_checkpoint_key(self):
         self.assertIn("ckpt=0", self.keys(temperature=0, strata_checkpoint=False))

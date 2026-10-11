@@ -65,6 +65,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <unistd.h>
@@ -130,6 +131,11 @@ struct Args {
     // mab776 M7c (Marc 10-10): greedy (temperature 0) requests that set no mtp_k draft --mtp-k-greedy (default 1):
     // greedy needle runs at 240k looped more often with 2 chained drafts (11/106 vs 3/95), sampled ones never did
     int mtp_k_greedy = 1;
+    // mab776 M11: --lookup L = prompt-lookup drafts (Server::Lookup): up to L tokens copied from the context when its
+    // last --lookup-ngram G tokens occurred earlier, verified in the same pass instead of the MTP head's chain
+    // (0 = off).  A request's `lookup` key overrides L.
+    int lookup = 0;
+    int lookup_ngram = 3;
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -280,6 +286,8 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--mtp-device") { if (!num_i(-1, 64, iv)) return false; a.mtp_device = (int) iv; }
         else if (k == "--mtp-k") { if (!num_i(1, 7, iv)) return false; a.mtp_k = (int) iv; }
         else if (k == "--mtp-k-greedy") { if (!num_i(1, 7, iv)) return false; a.mtp_k_greedy = (int) iv; }
+        else if (k == "--lookup") { if (!num_i(0, 7, iv)) return false; a.lookup = (int) iv; }
+        else if (k == "--lookup-ngram") { if (!num_i(1, 16, iv)) return false; a.lookup_ngram = (int) iv; }
         else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
@@ -402,6 +410,7 @@ struct Gen {
     unsigned long long seed = 0;   // 0 = none given
     bool ckpt = true;
     int mtp_k = -1;                // mab776 M7c: this request's chained drafts per pass (-1 = --mtp-k, 0 = none)
+    int lookup = -1;               // mab776 M11: this request's prompt-lookup drafts per pass (-1 = --lookup, 0 = none)
 };
 
 // upstream generate.cpp's parse_i64_list: commas and blanks separate, every id an int32 >= 0
@@ -466,6 +475,7 @@ std::string parse_gen(const std::string & line, Gen & g, int n_vocab, int64_t ct
         else if (key == "seed") g.seed = std::strtoull(val, nullptr, 10);   // a 30-digit seed saturates
         else if (key == "ckpt") g.ckpt = std::strtoll(val, nullptr, 10) != 0;
         else if (key == "mtp_k") { long long v = 0; ival(v); g.mtp_k = (int) std::clamp<long long>(v, 0, 64); }
+        else if (key == "lookup") { long long v = 0; ival(v); g.lookup = (int) std::clamp<long long>(v, 0, 64); }
     }
     std::string pe;
     if (g.max_new < 1 || !parse_ids(endp, g.ids, pe)) return "bad request: " + (pe.empty() ? std::string("max_new") : pe);
@@ -539,6 +549,49 @@ Choice best_reuse(const std::vector<int> & live, const Ckpt * ck, int slots, con
     return best;
 }
 
+// mab776 M11: prompt-lookup drafting (--lookup).  The context (the request's prompt, then every token it emits) is
+// indexed by its G-grams; propose() finds the most recent EARLIER occurrence of the context's last G tokens and returns
+// the tokens that followed it there.  An agent's output copies its context a lot (code edits, file rewrites, quoted
+// tool results), and those runs are free drafts.  The hash is checked against the tokens (a collision proposes nothing).
+struct Lookup {
+    int G = 0;
+    std::vector<int> seq;
+    std::unordered_map<uint64_t, int> last;   // G-gram ending at e (with seq[e + 1] known) -> the latest such e
+
+    uint64_t key(int e) const {
+        uint64_t h = 0x84222325cbf29ce4ull;
+        for (int i = e - G + 1; i <= e; ++i) h = (h ^ (uint64_t) (uint32_t) seq[(size_t) i]) * 0x100000001b3ull;
+        return h;
+    }
+    void reset(int g, const std::vector<int> & ids) {
+        G = g;
+        seq.clear();
+        last.clear();
+        if (G <= 0) return;
+        seq.reserve(ids.size() + 8192);
+        last.reserve(ids.size());
+        for (int t : ids) push(t);
+    }
+    void push(int t) {   // the G-gram that ended just before t now has a continuation
+        if (G <= 0) return;
+        seq.push_back(t);
+        const int e = (int) seq.size() - 2;
+        if (e >= G - 1) last[key(e)] = e;
+    }
+    int propose(int L, int * out) const {
+        const int n = (int) seq.size();
+        if (G <= 0 || L <= 0 || n < G) return 0;
+        const auto it = last.find(key(n - 1));
+        if (it == last.end()) return 0;
+        const int e = it->second;
+        for (int i = 0; i < G; ++i)
+            if (seq[(size_t) (e - i)] != seq[(size_t) (n - 1 - i)]) return 0;
+        int m = 0;
+        while (m < L && e + 1 + m < n) { out[m] = seq[(size_t) (e + 1 + m)]; ++m; }
+        return m;
+    }
+};
+
 struct Server {
     Args a;
     Proto & proto;
@@ -575,6 +628,8 @@ struct Server {
     std::vector<int64_t> d_off, d_acc;
     int64_t passes = 0;
     double t_pass = 0;
+    int64_t lk_passes = 0, lk_drafts = 0, lk_acc = 0;   // mab776 M11: this request's prompt-lookup passes / drafts / accepted
+    Lookup lk;                          // mab776 M11: the prompt-lookup index of the request being decoded
     // DS4_SERVE_TEST_ORACLE=<file> (re-read per request): drafts from a plain greedy run's tokens (the draft for the
     // n-th emitted token = line n), DS4_SERVE_TEST_CORRUPT=k spoils every k-th - the mini MTP's random weights never
     // draft right, so without this only the reject path would run (= ds4_generate's DS4_VERIFY_ORACLE)
@@ -686,7 +741,7 @@ bool Server::init(std::string & why) {
     dc.snapshot_slots = slots_ck;
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     if (!dense.init(a.model, dc, err)) { why = "dense init: " + err; return false; }
-    if (!dense.reserve_graphs(a.verify ? a.mtp_k + 1 : 1)) { why = dense.last_error(); return false; }
+    if (!dense.reserve_graphs(a.verify ? std::max(a.mtp_k, a.lookup) + 1 : 1)) { why = dense.last_error(); return false; }
     // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's routed experts - on the CPU, or on GPU --mtp-device.
     // On a GPU they go in NOW, before GPU 0's cache is sized from its free VRAM and before GPU 1's tier is filled, so
     // the tier that card holds is what gives the room up (Marc's placement sweep: 1 = GPU 1, 0 = GPU 0)
@@ -1240,6 +1295,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
     drafts = accepted = 0;
     d_off.clear();
     d_acc.clear();
+    lk_passes = lk_drafts = lk_acc = 0;
     passes = 0;
     t_pass = 0;
     auto pp = [&](int pos) {
@@ -1315,12 +1371,18 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             const int keep = std::min(n, ds4serve::kPenaltyWindowCap);
             hist.assign(ids.end() - keep, ids.end());
         }
+        // mab776 M11: this request's prompt-lookup drafts per pass (its `lookup` key, else --lookup; never with the
+        // test oracle, whose drafts must stay the MTP path's)
+        const int LK = il_mtp >= 0 && a.verify && g.mtp_k != 0 && std::getenv("DS4_SERVE_TEST_ORACLE") == nullptr
+                           ? std::clamp(g.lookup >= 0 ? g.lookup : a.lookup, 0, NT - 1) : 0;
+        lk.reset(LK > 0 ? a.lookup_ngram : 0, ids);
         const double td0 = now_ms();
         int pos = n;   // the position the next generated token is fed at
         // emits one token; true when the request ends with it (a stop id, or max_new)
         auto emit = [&](int tok, const float * row, int nv) -> bool {
             if (tokl) std::fwrite(row, 4, (size_t) nv, tokl);
             proto.line("T %d", tok);
+            lk.push(tok);   // the lookup's context (no-op unless this request drafts from it)
             ++gen;
             if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end()) { finish = "stop"; return true; }
             if (gen >= g.max_new) { finish = "length"; return true; }
@@ -1353,7 +1415,10 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             int nv = 0;
             bool done = false;
             int cur = -1;
-            std::vector<int> dr((size_t) K), toks((size_t) K + 1), nxt((size_t) K + 1);
+            std::vector<int> dr((size_t) NT), toks((size_t) NT + 1), nxt((size_t) NT + 1);
+            int nd = K;           // the next pass's drafts: dr[0 .. nd-1]
+            bool lkp = false;     // ... copied by the lookup (else the MTP head's chain)
+            int lk_skip = 0, lk_fail = 0;   // passes the lookup sits out after drafting nothing right (1, 2, 4 .. 64)
             auto fix_draft = [&](int j) {   // dr[j] guesses the token emitted at index gen + j
                 if (oracle.empty() || gen + j >= (int) oracle.size()) return;
                 dr[(size_t) j] = oracle[(size_t) (gen + j)];
@@ -1370,6 +1435,24 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 }
                 return true;
             };
+            // mab776 M11: the next pass's drafts after the verified positions p0 .. p0+nn-1 (tokens next[]): when the
+            // context's last G tokens occurred before, the (up to LK) tokens that followed them - the MTP block still
+            // runs over the verified positions (its cache; no head, no chain) - else the MTP head's chain of K
+            auto next_drafts = [&](const int * next, int nn, int p0) -> bool {
+                int m = 0;
+                if (LK > 0) {
+                    if (lk_skip > 0) --lk_skip;
+                    else if ((m = lk.propose(LK, &dr[0])) < 2) m = 0;   // one copied token is not worth a pass of its own
+                }
+                if (m > 0) {
+                    nd = m;
+                    lkp = true;
+                    return mtp_draft_n(next, nn, p0, nullptr);
+                }
+                nd = K;
+                lkp = false;
+                return draft_chain(next, nn, p0);
+            };
             d_off.assign((size_t) K, 0);
             d_acc.assign((size_t) K, 0);
             passes = 0;
@@ -1379,30 +1462,31 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 cur = forced(ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch));
                 done = emit(cur, lg, nv);
                 if (g.sp.penalty_last_n > 0) hist.push_back(cur);
-                if (!done && !draft_chain(&cur, 1, n - 1)) { failed = true; ferr = "MTP draft failed: " + err; }
+                if (!done && !next_drafts(&cur, 1, n - 1)) { failed = true; ferr = "MTP draft failed: " + err; }
             }
             while (!failed && !done) {
                 if (stopped()) { finish = "cancel"; break; }
                 toks[0] = cur;
-                for (int j = 0; j < K; ++j) toks[(size_t) j + 1] = dr[(size_t) j];
+                for (int j = 0; j < nd; ++j) toks[(size_t) j + 1] = dr[(size_t) j];
                 const double tp = now_ms();
-                if (!step_n(toks.data(), K + 1, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
-                if (!dense.logits_n(K + 1, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
+                if (!step_n(toks.data(), nd + 1, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
+                if (!dense.logits_n(nd + 1, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
                 t_pass += now_ms() - tp;
                 ++passes;
                 live.push_back(cur);   // position pos holds `cur` now
-                drafts += K;
+                drafts += nd;
+                if (lkp) { ++lk_passes; lk_drafts += nd; }
                 int A = 0;             // drafts accepted: positions pos + 1 .. pos + A hold them
                 int last = -1;         // the token after them (emitted, not fed): the next pass's `cur`
-                for (int j = 0; j < K && !done; ++j) {
-                    ++d_off[(size_t) j];
+                for (int j = 0; j < nd && !done; ++j) {
+                    if (!lkp) ++d_off[(size_t) j];
                     bool acc = false;
                     const float * row = lg + (size_t) j * nv;
                     last = ds4serve::verify_row(row, nv, g.sp, (uint64_t) (pos + j), hist.data(), hist.size(), scratch,
                                                 dr[(size_t) j], &acc);
                     if (force && gen < (int) oracle.size()) { last = oracle[(size_t) gen]; acc = last == dr[(size_t) j]; }
                     if (acc) {
-                        ++d_acc[(size_t) j];
+                        if (lkp) ++lk_acc; else ++d_acc[(size_t) j];
                         ++accepted;
                         ++A;
                         live.push_back(last);   // position pos + 1 + j holds the draft, which is `last`
@@ -1412,15 +1496,19 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                     if (!acc) break;   // positions above pos + A hold rejected drafts: later passes rewrite them
                 }
                 if (done) break;
-                if (A == K) {          // every draft passed: row K's token for free
-                    const float * row = lg + (size_t) K * nv;
-                    last = forced(ds4serve::sample_row(row, nv, g.sp, (uint64_t) (pos + K), hist.data(), hist.size(), scratch));
+                if (A == nd) {         // every draft passed: row nd's token for free
+                    const float * row = lg + (size_t) nd * nv;
+                    last = forced(ds4serve::sample_row(row, nv, g.sp, (uint64_t) (pos + nd), hist.data(), hist.size(), scratch));
                     if ((done = emit(last, row, nv))) break;
                     if (g.sp.penalty_last_n > 0) hist.push_back(last);
                 }
+                if (lkp) {             // a lookup that drafted nothing right sits out 1, 2, 4 .. 64 passes (fresh text)
+                    if (A == 0) lk_skip = 1 << std::min(lk_fail++, 6);
+                    else lk_fail = 0;
+                }
                 for (int j = 0; j < A; ++j) nxt[(size_t) j] = dr[(size_t) j];
                 nxt[(size_t) A] = last;
-                if (!draft_chain(nxt.data(), A + 1, pos)) { failed = true; ferr = "MTP draft failed: " + err; break; }
+                if (!next_drafts(nxt.data(), A + 1, pos)) { failed = true; ferr = "MTP draft failed: " + err; break; }
                 cur = last;
                 pos += A + 1;
                 delay(stopped);
@@ -1470,7 +1558,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         std::snprintf(htxt, sizeof htxt, "; experts GPU0 %.1f%% GPU1 %.1f%% CPU %.1f%% PCIe %.1f%%", 100.0 * st.hits / L,
                       100.0 * st.hits1 / L, 100.0 * st.cpu / L, 100.0 * st.pcie / L);
     }
-    char dtxt[384] = "";
+    char dtxt[512] = "";
     if (il_mtp >= 0 && d_off.empty()) {
         std::snprintf(dtxt, sizeof dtxt, "; drafts off (mtp_k=0)");
     } else if (il_mtp >= 0) {
@@ -1486,7 +1574,12 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                                          "%.2f tokens each), MTP window %.0f ms, %.2f ms/draft",
                       (long long) accepted, (long long) drafts, d_off.size(), by.c_str(), (long long) passes,
                       passes > 0 ? t_pass / (double) passes : 0.0, passes > 0 ? (double) gen / (double) passes : 0.0,
-                      t_mtp_win, drafts > 0 ? (t_mtp_all - t_mtp_win) / (double) drafts : 0.0);
+                      t_mtp_win, drafts > lk_drafts ? (t_mtp_all - t_mtp_win) / (double) (drafts - lk_drafts) : 0.0);
+        if (lk_passes > 0) {   // mab776 M11: the prompt-lookup passes' share (their drafts are counted above too)
+            const size_t l = std::strlen(dtxt);
+            std::snprintf(dtxt + l, sizeof dtxt - l, "; lookup %lld/%lld accepted in %lld passes",
+                          (long long) lk_acc, (long long) lk_drafts, (long long) lk_passes);
+        }
     }
     std::fprintf(stderr, "ds4_serve: prompt %d tokens = %d reused + %s read in %.0f ms (%.1f tok/s; cache shrink %.0f + "
                          "grow %.0f ms), %d generated in %.0f ms (%.1f tok/s), %s%s%s; live %zu, %d checkpoints [last %d, "

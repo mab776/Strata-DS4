@@ -978,6 +978,10 @@ class StrataEngine:
             mk = tune.get("mtp_k")
             if isinstance(mk, int) and not isinstance(mk, bool) and 0 <= mk <= 7:
                 keys += f" mtp_k={mk}"
+            # mab776 M11: prompt-lookup drafts per verify pass (ds4_serve --lookup) for this request; 0 = MTP drafts only
+            lk = tune.get("lookup")
+            if isinstance(lk, int) and not isinstance(lk, bool) and 0 <= lk <= 7:
+                keys += f" lookup={lk}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
