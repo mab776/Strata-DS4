@@ -22,7 +22,8 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   (conversation parking) `--arena-gib 41` + env `GGML_LI_I8=1` (the lightning indexer on int8 tensor cores, 10-10
   night; drop the line for the fp16 kernel, no rebuild) + `--lookup 7` (prompt-lookup drafts, sampled requests); the
   engine's own defaults since 10-10/11 night: emit-only compressors + batched HCA (prefill), async decode hand-offs +
-  the fused hc gates op (decode) - env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 / DS4_ASYNC=0 / DS4_HC_GATES=0 = the old paths.
+  the fused hc gates op + the verify passes' expert mix on the card (decode) - env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 /
+  DS4_ASYNC=0 / DS4_HC_GATES=0 / DS4_DEV_SUM=0 = the old paths.
   ~42 GiB container RAM, mem_limit 50g.
 - **Measured through the server (10-10 late: int8 indexer + emit-only compressors + batched HCA)**: prefill
   1,100-1,250 / **1,530** / **1,428** tok/s at 8k / 127k / 250k (morning: 1,297 / 1,192; stack 73: 1011 / 843 / 693);
@@ -429,6 +430,18 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   version synced a backend ds4_generate had already freed: exit code 139 at exit, fixed (own_backend only).
   Plain decode probe @127k: 43.0 -> 44.25 tok/s.  Through the server (2 rounds, same session, verify pass ms):
   127k K=1 28.05 -> 27.45, K=2 31.4 -> 30.65; 250k K=1 29.2 -> 28.8, K=2 33.05 -> 32.6 = **-1.4 to -2.4 %**.
+- **Fused hc gates (6de3a4c8, `DS4_HC_GATES`)**: ggml op GGML_OP_DSV4_HC_GATES (patch ggml-zz-dsv4-hc-gates.patch)
+  replaces each hc_pre's 8 gate kernels with one, rounded as those ops (same bits: ppl768 identical on / off).
+  -22 decode nodes a layer; plain decode probe +1.2 %; in the server inside one round's noise.
+- **Verify passes mix their experts on the card (d9ea28b6, `DS4_DEV_SUM`)**: production decode is verify passes,
+  and the tier ended each layer of one by downloading all NE x H expert rows, summing per token in double on the host
+  and uploading the sums.  Now the CPU pool's and GPU 1's rows go up into their entry rows, and
+  weighted_rows_sum_f64 (double, k order, no FMA, round-to-nearest - the host loop's arithmetic) writes the routed-sum
+  tensor directly.  DS4_CHECK_DEVSUM: 77,825 of 77,825 token rows identical.  Server, 2 rounds, verify pass ms off ->
+  on: 127k K=1 26.75 -> 26.45, K=2 30.2 -> 29.1 (-3.6 %); 250k K=1 28.25 -> 27.4, K=2 31.85 -> 30.5 (-4.2 %).
+- **Lesson**: production decode is VERIFY passes (n = 3 at K=2, up to 8 with lookup) - a one-token gain is worth
+  little unless the multi-token path gets it too (a predict -> attention hc_pre reuse was written and reverted for
+  that reason: predict only covers token 0).
 - **Early PCIe DMAs (`DS4_PCIE_EARLY=1`, opt-in)**: the PCIe share's DMAs (+ LRU admissions) first on their own copy
   stream, under the activation upload / hits kernel / LRU copies (gpu_run and gpu_run_n).  No gain @127k (40.58 /
   40.40 -> 40.61 / 40.63): they then share VRAM bandwidth with the hits kernel.  DS4_CHECK_GPU (1,082 PCIe experts),
