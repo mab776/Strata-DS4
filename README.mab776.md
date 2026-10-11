@@ -23,13 +23,14 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   night; drop the line for the fp16 kernel, no rebuild) + `--lookup 7` (prompt-lookup drafts, sampled requests); the
   engine's own defaults since 10-10/11 night: emit-only compressors + batched HCA (prefill), async decode hand-offs +
   the fused hc gates op + the verify passes' expert mix on the card + the predict/tier overlap (decode) - env
-  DS4_PF_EMIT=0 / DS4_PF_HCAB=0 / DS4_ASYNC=0 / DS4_HC_GATES=0 / DS4_DEV_SUM=0 / DS4_OVL=0 = the old paths - and env
-  `GGML_MMVF_F16_MAX=8` (verify passes keep ggml's F16 vector kernel; drop the line for the tensor-core tiles).
+  DS4_PF_EMIT=0 / DS4_PF_HCAB=0 / DS4_ASYNC=0 / DS4_HC_GATES=0 / DS4_DEV_SUM=0 / DS4_OVL=0 / DS4_PF_HASH=0 /
+  DS4_F16_ACC32=0 = the old paths - and env `GGML_MMVF_F16_MAX=8` (verify passes keep ggml's F16 vector kernel; drop the
+  line for the tensor-core tiles) + `DS4_DEV_ROUTE=1` (M12b: the hits routed from the card; drop it to revert).
   ~42 GiB container RAM, mem_limit 50g.
 - **Measured through the server (prefill 10-10 late: int8 indexer + emit-only compressors + batched HCA; decode 10-11)**: prefill
   1,100-1,250 / **1,530** / **1,428** tok/s at 8k / 127k / 250k (morning: 1,297 / 1,192; stack 73: 1011 / 843 / 693);
-  decode after M11 (10-11 morning, greedy K=2, fresh code, mean of 4) **73.0 / 71.4 / 67.7** (before M11 65.0 / 62.5 /
-  60.3; verify pass 27.1 / 27.7 / 28.6 ms vs 31.3 / 32.1 / 32.8), K=1 ~70 / ~68 / ~67, copy-heavy edits ~100-110
+  decode after M12 (10-11 day, greedy K=2, fresh code, mean of 6) **76.0 / 73.0 / 71.3** (verify pass 25.8 / 26.7 /
+  28.0 ms; after M11 73.0 / 71.4 / 67.7; before M11 65.0 / 62.5 / 60.3 at 31.3 / 32.1 / 32.8 ms), K=1 72 / 70 / 68, copy-heavy edits ~100-110
   (prompt lookup), plain 47 / 45 / 43 (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k; parked
   chat back in 0.6-1.3 s; agent turns read only what they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
@@ -578,3 +579,14 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   loaded 7 logit dumps (7 x 198 MB) and did log-softmax in float64 next to the ~42 GiB server with ~9 GiB free.  The
   server and the box survived, the live config was left in test mode (DS4_DUMP_TOKLOGITS) for 30 min.  Fixed: the
   analysis is row by row now (forced_test.py), heavy host-side analysis runs in a memory-capped container / scope.
+- **M12 before / after (10-11 10:34-11:04, final_m12.sh, out/M12-final-before-after.log)**: the live server, all three
+  M12 switches off vs the deployed config, ABBA, same prompts, greedy, mean of 6 K=2 / 2 K=1 decodes:
+
+  | | 8k | 127k | 250k |
+  |---|---:|---:|---:|
+  | K=2 decode tok/s before -> after | 75.4 -> **76.0** | 70.5 -> **73.0** | 67.7 -> **71.3** |
+  | K=2 verify pass ms | 26.57 -> 25.75 (-3.1 %) | 27.57 -> 26.67 (-3.3 %) | 28.53 -> 27.98 (-1.9 %) |
+  | K=1 verify pass ms | 23.75 -> 23.15 (-2.5 %) | 24.40 -> 23.80 (-2.5 %) | 25.45 -> 24.70 (-2.9 %) |
+
+  tok/s moves with each run's draft acceptance (tok/pass 2.02-2.30, restarts are not deterministic); the pass time is
+  the engine's own change.

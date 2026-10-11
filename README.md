@@ -35,6 +35,11 @@ at long context:
   vector kernel in verify passes of 2-8 tokens (env `GGML_MMVF_F16_MAX=8`,
   `tools/ds4/patches/ggml-zz-mmvf-f16-batch.patch`). Together these make a two-draft verify pass ~13 % faster
   (31.3-32.8 ms -> 27.1-28.6 ms from 8k to 250k).
+- **Expert routing on the GPU** (env `DS4_DEV_ROUTE=1`). While the host still waits for a verify layer's routing, the
+  GPU already builds the groups of experts its VRAM cache holds and runs them, so the host's classification overlaps
+  the expert kernels. It is exact (the same kernel on the same rows) and takes another 2-3 % off a verify pass.
+  The hash-routed layers now get a correct prefetch hint, and the decode graphs' F16-weight matmuls accumulate in
+  fp32 (llama.cpp computes these in F32) at no cost (25.8 / 26.7 / 28.0 ms a pass at 8k / 127k / 250k).
 - **Prompt-lookup drafts** beside the MTP head. When the output starts copying its context (a code edit, a file
   rewrite, a quoted tool result), the copied tokens become up to 7 drafts per pass. That makes file and config edits
   40-45 % faster to decode; fresh text is unchanged. A copy is drafted only when its first token matches the MTP head's
@@ -65,9 +70,9 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 
 | context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
-| 8k   | 1,100-1,250 | 1,011 | 73 / ~70 | 40.8 |
-| 127k | **1,530**   | 843   | **71** / ~68 | 39.0 |
-| 250k | **1,428**   | 693   | **68** / ~67 | ~36 |
+| 8k   | 1,100-1,250 | 1,011 | 76 / 72 | 40.8 |
+| 127k | **1,530**   | 843   | **73** / 70 | 39.0 |
+| 250k | **1,428**   | 693   | **71** / 68 | ~36 |
 
 - **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
   tokens on average.
