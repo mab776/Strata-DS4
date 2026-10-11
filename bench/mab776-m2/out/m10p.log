@@ -1,0 +1,27 @@
+== HC-chk-250k (GGML_LI_I8=1 DS4_CHECK_HCAB=1)
+prefill: 251199 tokens in 201.15 s = 1248.81 tok/s (chunked)
+exit=0 oom=false wall=244s
+   check lines: 2460
+   rel err max over all layer-chunks: 0.00323  median: 0.00121
+check-hcab: layer 7 pos0 247808 n 2048: rel err max 0.00319 (row 761, block 11) mean 0.00214 | per block max: 2.7e-03 2.9e-03 2.9e-03 3.1e-03 2.8e-03 3.0e-03 2.9e-03 2.7e-03 3.0e-03 2.9e-03 2.6e-03 3.
+check-hcab: layer 7 pos0 239616 n 2048: rel err max 0.00323 (row 1513, block 23) mean 0.00202 | per block max: 2.5e-03 2.8e-03 2.8e-03 2.9e-03 2.7e-03 2.8e-03 2.8e-03 2.7e-03 2.7e-03 2.5e-03 2.8e-03 2
+== G128c (GGML_LI_I8=1)
+ppl: 131071 positions, mean NLL 1.64974, perplexity 5.2056
+prefill: 131072 tokens in 165.69 s = 791.06 tok/s (chunked)
+exit=0 oom=false wall=209s
+== GN2-d10 (GGML_LI_I8=1)
+prefill: 251198 tokens in 175.97 s = 1427.49 tok/s (chunked)
+exit=0 oom=false wall=221s
+80 ids, reasoning 296 chars, content 36 chars, closed think: True
+FOUND | word 'meadow-copper-504' in reasoning: True
+== GN2-d50 (GGML_LI_I8=1)
+prefill: 251199 tokens in 176.25 s = 1425.22 tok/s (chunked)
+exit=0 oom=false wall=223s
+135 ids, reasoning 538 chars, content 36 chars, closed think: True
+FOUND | word 'falcon-quartz-940' in reasoning: True
+== GN2-d90 (GGML_LI_I8=1)
+prefill: 251198 tokens in 175.58 s = 1430.64 tok/s (chunked)
+exit=0 oom=false wall=223s
+123 ids, reasoning 459 chars, content 36 chars, closed think: True
+FOUND | word 'willow-cobalt-696' in reasoning: True
+stack 74 restarted 22:39:24: running, health healthy

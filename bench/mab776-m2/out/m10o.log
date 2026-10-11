@@ -1,0 +1,22 @@
+== HC-chk-ppl768 (GGML_LI_I8=1 DS4_CHECK_HCAB=1)
+ppl: 767 positions, mean NLL 2.29288, perplexity 9.9034
+prefill: 768 tokens in 3.00 s = 255.61 tok/s (chunked)
+exit=0 oom=false wall=45s
+   check lines: 20
+check-hcab: layer 19 pos0 0 n 768: rel err max 0.000365 (row 384, block 6) mean 0.000249 | per block max: 2.1e-04 2.7e-04 3.2e-04 3.3e-04 3.2e-04 3.5e-04 3.7e-04 3.2e-04 3.3e-04 3.2e-04 3.1e-04 3.5e-04
+check-hcab: layer 31 pos0 0 n 768: rel err max 0.000368 (row 124, block 1) mean 0.000262 | per block max: 2.6e-04 3.7e-04 3.3e-04 3.3e-04 3.4e-04 3.3e-04 3.3e-04 3.3e-04 3.3e-04 3.1e-04 3.1e-04 3.4e-04
+check-hcab: layer 37 pos0 0 n 768: rel err max 0.000368 (row 406, block 6) mean 0.000255 | per block max: 2.3e-04 3.2e-04 3.1e-04 3.3e-04 3.2e-04 3.4e-04 3.7e-04 3.3e-04 3.1e-04 3.2e-04 3.0e-04 3.3e-04
+check-hcab: layer 29 pos0 0 n 768: rel err max 0.000373 (row 477, block 7) mean 0.000265 | per block max: 1.9e-04 3.1e-04 3.3e-04 3.4e-04 3.3e-04 3.5e-04 3.6e-04 3.7e-04 3.2e-04 3.3e-04 3.2e-04 3.3e-04
+check-hcab: layer 17 pos0 0 n 768: rel err max 0.000381 (row 343, block 5) mean 0.00025 | per block max: 2.1e-04 2.9e-04 3.2e-04 3.1e-04 3.4e-04 3.8e-04 3.4e-04 3.2e-04 3.3e-04 3.2e-04 3.4e-04 3.4e-04
+check-hcab: layer 25 pos0 0 n 768: rel err max 0.000383 (row 343, block 5) mean 0.000276 | per block max: 2.3e-04 3.4e-04 3.4e-04 3.4e-04 3.4e-04 3.8e-04 3.6e-04 3.6e-04 3.4e-04 3.5e-04 3.3e-04 3.4e-04
+== HC-chk-8k (GGML_LI_I8=1 DS4_CHECK_HCAB=1)
+prefill: 8234 tokens in 7.78 s = 1058.51 tok/s (chunked)
+exit=0 oom=false wall=52s
+   check lines: 80
+check-hcab: layer 25 pos0 6144 n 2048: rel err max 0.000435 (row 793, block 12) mean 0.000333 | per block max: 3.9e-04 3.8e-04 3.8e-04 3.8e-04 4.0e-04 3.9e-04 3.8e-04 3.8e-04 3.8e-04 4.1e-04 4.2e-04 3.9e-04 4.4e-04 3.9e-04 3.8e-04 3.9e-04 4.0e-04 4.0e-04 4.3e-04 4.1e-04 4.0e-04 4.1e-04 3.8e-04 3.8e-04 4.1e-04 3.9e-04 4.2e-04 4.1e-04 4.0e-04 4.1e-04 4.1e-04 3.8e-04
+check-hcab: layer 31 pos0 2048 n 2048: rel err max 0.000445 (row 1621, block 25) mean 0.000337 | per block max: 4.0e-04 3.9e-04 3.9e-04 4.1e-04 4.2e-04 4.4e-04 4.3e-04 4.2e-04 4.2e-04 4.1e-04 4.2e-04 4.2e-04 4.0e-04 4.2e-04 4.3e-04 4.3e-04 4.3e-04 4.2e-04 4.2e-04 4.2e-04 4.2e-04 4.3e-04 4.3e-04 4.4e-04 4.2e-04 4.4e-04 4.0e-04 4.0e-04 4.1e-04 3.9e-04 4.3e-04 4.4e-04
+check-hcab: layer 27 pos0 6144 n 2048: rel err max 0.000451 (row 1245, block 19) mean 0.000356 | per block max: 4.2e-04 4.0e-04 4.0e-04 3.9e-04 4.3e-04 4.2e-04 4.2e-04 4.0e-04 4.0e-04 4.2e-04 4.3e-04 4.1e-04 4.3e-04 4.1e-04 4.1e-04 4.3e-04 4.1e-04 4.2e-04 4.4e-04 4.5e-04 4.4e-04 4.4e-04 4.1e-04 4.3e-04 4.2e-04 4.1e-04 4.4e-04 4.3e-04 4.2e-04 4.3e-04 4.2e-04 4.2e-04
+check-hcab: layer 31 pos0 0 n 2048: rel err max 0.000454 (row 321, block 5) mean 0.000317 | per block max: 2.3e-04 3.3e-04 3.8e-04 4.1e-04 4.1e-04 4.5e-04 4.2e-04 4.1e-04 4.5e-04 4.0e-04 4.2e-04 4.3e-04 4.4e-04 4.1e-04 4.1e-04 4.1e-04 4.1e-04 4.0e-04 3.9e-04 4.1e-04 4.0e-04 4.3e-04 3.9e-04 4.0e-04 3.8e-04 4.0e-04 4.1e-04 3.9e-04 3.9e-04 4.0e-04 3.8e-04 3.7e-04
+check-hcab: layer 31 pos0 4096 n 2048: rel err max 0.000458 (row 535, block 8) mean 0.000352 | per block max: 4.1e-04 4.0e-04 4.2e-04 4.0e-04 4.2e-04 4.3e-04 4.2e-04 4.1e-04 4.6e-04 4.2e-04 4.2e-04 4.1e-04 4.3e-04 4.3e-04 4.2e-04 4.2e-04 4.5e-04 4.1e-04 4.3e-04 4.2e-04 4.4e-04 4.3e-04 4.2e-04 4.1e-04 4.4e-04 4.3e-04 4.2e-04 4.2e-04 4.3e-04 4.2e-04 4.4e-04 4.3e-04
+check-hcab: layer 31 pos0 6144 n 2048: rel err max 0.000472 (row 663, block 10) mean 0.000364 | per block max: 4.0e-04 4.1e-04 4.2e-04 4.2e-04 4.4e-04 4.1e-04 4.3e-04 4.3e-04 4.4e-04 4.4e-04 4.7e-04 4.4e-04 4.4e-04 4.2e-04 4.2e-04 4.4e-04 4.3e-04 4.3e-04 4.5e-04 4.2e-04 4.6e-04 4.7e-04 4.5e-04 4.3e-04 4.3e-04 4.4e-04 4.5e-04 4.7e-04 4.3e-04 4.4e-04 4.1e-04 4.4e-04
+stack 74 restarted 22:19:12: running, health healthy

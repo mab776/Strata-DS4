@@ -1,0 +1,25 @@
+== G128d (GGML_LI_I8=1)
+== G128e (GGML_LI_I8=1 DS4_PF_HCAB=0)
+ppl: 131071 positions, mean NLL 1.64854, perplexity 5.1994
+prefill: 131072 tokens in 170.77 s = 767.55 tok/s (chunked)
+exit=0 oom=false wall=215s
+== G128d (GGML_LI_I8=1)
+ppl: 131071 positions, mean NLL 1.64854, perplexity 5.1994
+prefill: 131072 tokens in 170.77 s = 767.55 tok/s (chunked)
+exit=0 oom=false wall=215s
+== G128e (GGML_LI_I8=1 DS4_PF_HCAB=0)
+== G250-blk (GGML_LI_I8=1 DS4_PF_HCAB=0)
+ppl: 251198 positions, mean NLL 1.13807, perplexity 3.1207
+prefill: 251199 tokens in 338.79 s = 741.47 tok/s (chunked)
+ppl: 251198 positions, mean NLL 1.13807, perplexity 3.1207
+== G250-blk (GGML_LI_I8=1 DS4_PF_HCAB=0)
+ppl: 251198 positions, mean NLL 1.13807, perplexity 3.1207
+prefill: 251199 tokens in 338.79 s = 741.47 tok/s (chunked)
+ppl: 251198 positions, mean NLL 1.13807, perplexity 3.1207
+== G250-hcab (GGML_LI_I8=1)
+stack 74 restarted 22:56:52: exited, health unhealthy
+== G250-hcab (GGML_LI_I8=1)
+ppl: 251198 positions, mean NLL 1.13771, perplexity 3.1196
+prefill: 251199 tokens in 552.67 s = 454.52 tok/s (chunked)
+exit=0 oom=false wall=601s
+stack 74 restarted 23:00:53: running, health healthy

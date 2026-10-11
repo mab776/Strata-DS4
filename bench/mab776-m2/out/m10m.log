@@ -1,0 +1,9 @@
+== HC-chk-ppl768 (GGML_LI_I8=1 DS4_CHECK_HCAB=1)
+grep: bench/mab776-m2/out/HC-chk-ppl768.log: No such file or directory
+grep: bench/mab776-m2/out/HC-chk-ppl768.log: No such file or directory
+grep: bench/mab776-m2/out/HC-chk-ppl768.log: No such file or directory
+== HC-chk-8k (GGML_LI_I8=1 DS4_CHECK_HCAB=1)
+grep: bench/mab776-m2/out/HC-chk-8k.log: No such file or directory
+grep: bench/mab776-m2/out/HC-chk-8k.log: No such file or directory
+grep: bench/mab776-m2/out/HC-chk-8k.log: No such file or directory
+stack 74 restarted 21:51:34, healthy=unhealthy

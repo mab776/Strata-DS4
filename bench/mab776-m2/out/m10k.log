@@ -1,0 +1,21 @@
+== HC-base ()
+ppl: 767 positions, mean NLL 2.29288, perplexity 9.9034
+prefill: 768 tokens in 2.84 s = 270.64 tok/s (chunked)
+exit=0 oom=false wall=53s
+== HC-rb32 (DS4_RAW_BLOCK=32)
+ppl: 767 positions, mean NLL 2.29306, perplexity 9.9052
+prefill: 768 tokens in 2.85 s = 269.12 tok/s (chunked)
+exit=0 oom=false wall=52s
+== HC-rb128 (DS4_RAW_BLOCK=128)
+ppl: 767 positions, mean NLL 2.28986, perplexity 9.8735
+prefill: 768 tokens in 2.84 s = 270.72 tok/s (chunked)
+exit=0 oom=false wall=49s
+== HC-rb0 (DS4_RAW_BLOCK=0)
+ppl: 767 positions, mean NLL 2.29692, perplexity 9.9435
+prefill: 768 tokens in 2.93 s = 262.09 tok/s (chunked)
+exit=0 oom=false wall=51s
+== HC-hca1 (DS4_PF_HCA1=1)
+ppl: 767 positions, mean NLL 2.29769, perplexity 9.9512
+prefill: 768 tokens in 2.76 s = 278.04 tok/s (chunked)
+exit=0 oom=false wall=49s
+stack 74 restarted 21:32:52, healthy=starting

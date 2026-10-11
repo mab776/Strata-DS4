@@ -1,0 +1,19 @@
+== HC-chk-ppl768 (GGML_LI_I8=1 DS4_PF_EMIT=0 DS4_CHECK_HCAB=1)
+/src/third_party/llama.cpp/ggml/src/ggml-backend.cpp:353: GGML_ASSERT(buf != NULL && "tensor buffer not set") failed
+exit=139 oom=false wall=52s
+   check lines: 0
+== HC-chk-8k (GGML_LI_I8=1 DS4_PF_EMIT=0 DS4_CHECK_HCAB=1)
+/src/third_party/llama.cpp/ggml/src/ggml-backend.cpp:353: GGML_ASSERT(buf != NULL && "tensor buffer not set") failed
+exit=139 oom=false wall=47s
+   check lines: 0
+== EM-ppl768 (GGML_LI_I8=1 DS4_PF_HCAB=0)
+ppl: 767 positions, mean NLL 2.29288, perplexity 9.9034
+prefill: 768 tokens in 2.93 s = 262.48 tok/s (chunked)
+exit=0 oom=false wall=51s
+== EM-250k (GGML_LI_I8=1 DS4_PF_HCAB=0)
+prefill: 251199 tokens in 186.41 s = 1347.53 tok/s (chunked)
+exit=0 oom=false wall=233s
+== EMB-250k (GGML_LI_I8=1)
+prefill: 251199 tokens in 176.09 s = 1426.57 tok/s (chunked)
+exit=0 oom=false wall=221s
+stack 74 restarted 22:16:02: running, health healthy
