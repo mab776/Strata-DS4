@@ -136,6 +136,12 @@ struct Args {
     // (0 = off).  A request's `lookup` key overrides L.
     int lookup = 0;
     int lookup_ngram = 3;
+    // --lookup-agree 1 (default): copy only when the copy's first token is also the MTP head's first guess (a fresh
+    // code prompt's coincidental matches disagree with it; real copying agrees); 0 = copy whenever the lookup matches
+    int lookup_agree = 1;
+    // --lookup-greedy L: what greedy (temperature 0) requests that set no `lookup` key draft from the lookup (default 0,
+    // like --mtp-k-greedy: longer verify passes went with more greedy loops at 240k; sampled requests take --lookup)
+    int lookup_greedy = 0;
 };
 
 bool to_i64(const std::string & s, int64_t & out) {
@@ -288,6 +294,8 @@ bool parse_args(int argc, char ** argv, Args & a, std::string & why) {
         else if (k == "--mtp-k-greedy") { if (!num_i(1, 7, iv)) return false; a.mtp_k_greedy = (int) iv; }
         else if (k == "--lookup") { if (!num_i(0, 7, iv)) return false; a.lookup = (int) iv; }
         else if (k == "--lookup-ngram") { if (!num_i(1, 16, iv)) return false; a.lookup_ngram = (int) iv; }
+        else if (k == "--lookup-agree") { if (!num_i(0, 1, iv)) return false; a.lookup_agree = (int) iv; }
+        else if (k == "--lookup-greedy") { if (!num_i(0, 7, iv)) return false; a.lookup_greedy = (int) iv; }
         else if (k == "--verify") {}   // implied by --mtp: a server drafts only to verify
         else { why = "unknown argument " + k; return false; }
     }
@@ -578,6 +586,9 @@ struct Lookup {
         const int e = (int) seq.size() - 2;
         if (e >= G - 1) last[key(e)] = e;
     }
+    // as many tokens as the occurrence matches far back: it must match at least G + 1 tokens (a bare G-gram is too
+    // often a coincidence - fresh code repeats 3-grams with other continuations: lookup at G = 3 drafted 7 per hit
+    // there, 20 % accepted, decode -8 %), and a match of M tokens drafts M - G + 1 (a file being copied -> L)
     int propose(int L, int * out) const {
         const int n = (int) seq.size();
         if (G <= 0 || L <= 0 || n < G) return 0;
@@ -586,8 +597,12 @@ struct Lookup {
         const int e = it->second;
         for (int i = 0; i < G; ++i)
             if (seq[(size_t) (e - i)] != seq[(size_t) (n - 1 - i)]) return 0;
+        int M = G;
+        while (M < 64 && e - M >= 0 && seq[(size_t) (e - M)] == seq[(size_t) (n - 1 - M)]) ++M;
+        if (M < G + 1) return 0;
+        const int want = std::min(L, M - G + 1);
         int m = 0;
-        while (m < L && e + 1 + m < n) { out[m] = seq[(size_t) (e + 1 + m)]; ++m; }
+        while (m < want && e + 1 + m < n) { out[m] = seq[(size_t) (e + 1 + m)]; ++m; }
         return m;
     }
 };
@@ -741,7 +756,7 @@ bool Server::init(std::string & why) {
     dc.snapshot_slots = slots_ck;
     std::fprintf(stderr, "context cap %lld tokens\n", (long long) ctx);
     if (!dense.init(a.model, dc, err)) { why = "dense init: " + err; return false; }
-    if (!dense.reserve_graphs(a.verify ? std::max(a.mtp_k, a.lookup) + 1 : 1)) { why = dense.last_error(); return false; }
+    if (!dense.reserve_graphs(a.verify ? std::max({a.mtp_k, a.lookup, a.lookup_greedy}) + 1 : 1)) { why = dense.last_error(); return false; }
     // = ds4_generate.cpp:372-384 (mab776 M7b): the MTP head's routed experts - on the CPU, or on GPU --mtp-device.
     // On a GPU they go in NOW, before GPU 0's cache is sized from its free VRAM and before GPU 1's tier is filled, so
     // the tier that card holds is what gives the room up (Marc's placement sweep: 1 = GPU 1, 0 = GPU 0)
@@ -1371,10 +1386,11 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             const int keep = std::min(n, ds4serve::kPenaltyWindowCap);
             hist.assign(ids.end() - keep, ids.end());
         }
-        // mab776 M11: this request's prompt-lookup drafts per pass (its `lookup` key, else --lookup; never with the
-        // test oracle, whose drafts must stay the MTP path's)
+        // mab776 M11: this request's prompt-lookup drafts per pass (its `lookup` key, else --lookup for sampled
+        // requests and --lookup-greedy for greedy ones; never with the test oracle, whose drafts stay the MTP path's)
         const int LK = il_mtp >= 0 && a.verify && g.mtp_k != 0 && std::getenv("DS4_SERVE_TEST_ORACLE") == nullptr
-                           ? std::clamp(g.lookup >= 0 ? g.lookup : a.lookup, 0, NT - 1) : 0;
+                           ? std::clamp(g.lookup >= 0 ? g.lookup : g.sp.temperature <= 0.0f ? a.lookup_greedy : a.lookup,
+                                        0, NT - 1) : 0;
         lk.reset(LK > 0 ? a.lookup_ngram : 0, ids);
         const double td0 = now_ms();
         int pos = n;   // the position the next generated token is fed at
@@ -1415,43 +1431,47 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             int nv = 0;
             bool done = false;
             int cur = -1;
-            std::vector<int> dr((size_t) NT), toks((size_t) NT + 1), nxt((size_t) NT + 1);
+            std::vector<int> dr((size_t) NT), toks((size_t) NT + 1), nxt((size_t) NT + 1), lkd((size_t) NT);
             int nd = K;           // the next pass's drafts: dr[0 .. nd-1]
             bool lkp = false;     // ... copied by the lookup (else the MTP head's chain)
-            int lk_skip = 0, lk_fail = 0;   // passes the lookup sits out after drafting nothing right (1, 2, 4 .. 64)
+            int lk_skip = 0, lk_fail = 0;   // passes the lookup sits out after a pass with < half right (1, 2, 4 .. 64)
             auto fix_draft = [&](int j) {   // dr[j] guesses the token emitted at index gen + j
                 if (oracle.empty() || gen + j >= (int) oracle.size()) return;
                 dr[(size_t) j] = oracle[(size_t) (gen + j)];
                 if (corrupt_every > 0 && ++n_fixed % corrupt_every == 0) dr[(size_t) j] = (dr[(size_t) j] + 1) % n_vocab;
             };
-            // the MTP block at the verified positions p0 .. p0+nn-1 with the tokens after them (its last column guesses
-            // p0 + nn + 1), then K - 1 chained drafts at the positions after it
-            auto draft_chain = [&](const int * next, int nn, int p0) -> bool {
+            // the next pass's drafts after the verified positions p0 .. p0+nn-1 (tokens next[]): the MTP block over them
+            // (its last column guesses p0 + nn + 1), then K - 1 chained drafts at the positions after it - or, mab776
+            // M11, when the context's last G tokens occurred before, the (up to LK) tokens that followed them
+            auto next_drafts = [&](const int * next, int nn, int p0) -> bool {
+                int m = 0;
+                if (LK > 0) {
+                    if (lk_skip > 0) --lk_skip;
+                    else if ((m = lk.propose(LK, &lkd[0])) < 2) m = 0;   // one copied token is not worth a pass of its own
+                }
+                if (m > 0 && !a.lookup_agree) {
+                    for (int j = 0; j < m; ++j) dr[(size_t) j] = lkd[(size_t) j];
+                    nd = m;
+                    lkp = true;
+                    return mtp_draft_n(next, nn, p0, nullptr);
+                }
+                // the MTP block + its first guess; --lookup-agree: the copy goes ahead only when it starts with that guess,
+                // else the MTP chain continues from it (no pass lost)
                 if (!mtp_draft_n(next, nn, p0, &dr[0])) return false;
                 fix_draft(0);
+                if (m > 0 && lkd[0] == dr[0]) {
+                    for (int j = 0; j < m; ++j) dr[(size_t) j] = lkd[(size_t) j];
+                    nd = m;
+                    lkp = true;
+                    return true;
+                }
+                nd = K;
+                lkp = false;
                 for (int j = 1; j < K; ++j) {
                     if (!mtp_chain(dr[(size_t) j - 1], j == 1 ? nn - 1 : 0, p0 + nn - 1 + j, &dr[(size_t) j])) return false;
                     fix_draft(j);
                 }
                 return true;
-            };
-            // mab776 M11: the next pass's drafts after the verified positions p0 .. p0+nn-1 (tokens next[]): when the
-            // context's last G tokens occurred before, the (up to LK) tokens that followed them - the MTP block still
-            // runs over the verified positions (its cache; no head, no chain) - else the MTP head's chain of K
-            auto next_drafts = [&](const int * next, int nn, int p0) -> bool {
-                int m = 0;
-                if (LK > 0) {
-                    if (lk_skip > 0) --lk_skip;
-                    else if ((m = lk.propose(LK, &dr[0])) < 2) m = 0;   // one copied token is not worth a pass of its own
-                }
-                if (m > 0) {
-                    nd = m;
-                    lkp = true;
-                    return mtp_draft_n(next, nn, p0, nullptr);
-                }
-                nd = K;
-                lkp = false;
-                return draft_chain(next, nn, p0);
             };
             d_off.assign((size_t) K, 0);
             d_acc.assign((size_t) K, 0);
@@ -1502,8 +1522,8 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                     if ((done = emit(last, row, nv))) break;
                     if (g.sp.penalty_last_n > 0) hist.push_back(last);
                 }
-                if (lkp) {             // a lookup that drafted nothing right sits out 1, 2, 4 .. 64 passes (fresh text)
-                    if (A == 0) lk_skip = 1 << std::min(lk_fail++, 6);
+                if (lkp) {             // a lookup pass with less than half right sits the lookup out 1, 2, 4 .. 64 passes
+                    if (2 * A < nd) lk_skip = 1 << std::min(lk_fail++, 6);
                     else lk_fail = 0;
                 }
                 for (int j = 0; j < A; ++j) nxt[(size_t) j] = dr[(size_t) j];

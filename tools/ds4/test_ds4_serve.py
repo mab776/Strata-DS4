@@ -1500,11 +1500,14 @@ class T8Verify(Case):
         (G = 1 drafts after nearly every token: copies accepted and rejected at every length, the cooldown), with MTP
         chain passes between lookups, chunked prompts, and the request key (lookup=0 = the MTP chain only)."""
         rep = prompt(12, 290)
-        for args, ids, must in ((("--lookup", 7, "--lookup-ngram", 1), prompt(8, 291), True),
-                                (("--lookup", 7, "--lookup-ngram", 1, "--mtp-k", 2, "--mtp-k-greedy", 2), rep * 4, True),
-                                (("--lookup", 4, "--lookup-ngram", 2), rep * 6, False),
-                                (("--lookup", 7, "--lookup-ngram", 1, "--prefill-chunk", 64, "--chunk-min", 8),
-                                 prompt(150, 292), True)):
+        na = ("--lookup-agree", 0, "--lookup-greedy", 7)   # the mini MTP's guesses never agree with a copy: the copy path itself
+        for args, ids, must in ((("--lookup", 7, "--lookup-ngram", 1, *na), prompt(8, 291), True),
+                                (("--lookup", 7, "--lookup-ngram", 1, *na, "--mtp-k", 2, "--mtp-k-greedy", 2), rep * 4, True),
+                                (("--lookup", 4, "--lookup-ngram", 2, *na), rep * 6, False),
+                                (("--lookup", 7, "--lookup-ngram", 1, *na, "--prefill-chunk", 64, "--chunk-min", 8),
+                                 prompt(150, 292), True),
+                                (("--lookup", 7, "--lookup-ngram", 1, "--lookup-greedy", 7, "--mtp-k", 2, "--mtp-k-greedy", 2),
+                                 rep * 4, False)):
             with self.subTest(args=args, n=len(ids)):
                 eng = self.eng(*args)
                 try:
@@ -1515,13 +1518,19 @@ class T8Verify(Case):
                         self.assertIn("; lookup ", last, "the lookup never drafted")
                 finally:
                     self.assertEqual(eng.close(), 0)
-        eng = self.eng("--lookup", 7, "--lookup-ngram", 1)
+        eng = self.eng("--lookup", 7, "--lookup-ngram", 1, "--lookup-agree", 0)   # --lookup-greedy 0 (the default)
         try:
             a = prompt(20, 293)
             r = eng.gen(a, 16, "lookup=0")
             self.same(r, ref("tame", a, 16), "lookup=0")
             last = [x for x in eng.log_text().splitlines() if "ds4_serve: prompt" in x][-1]
             self.assertNotIn("; lookup ", last, "lookup=0 drafted from the lookup")
+            r = eng.gen(a, 16)   # greedy, no key: --lookup-greedy 0 = no lookup drafts
+            self.same(r, ref("tame", a, 16), "greedy default")
+            last = [x for x in eng.log_text().splitlines() if "ds4_serve: prompt" in x][-1]
+            self.assertNotIn("; lookup ", last, "a greedy request drafted from the lookup by default")
+            r = eng.gen(a, 16, "lookup=7")   # its own key wins
+            self.same(r, ref("tame", a, 16), "greedy lookup=7")
             r = eng.gen(a + [5], 16, "temperature=0.8 seed=3")   # sampled: no reference, it just has to work
             self.assertIsNone(r.err)
         finally:
