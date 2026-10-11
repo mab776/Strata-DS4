@@ -20,17 +20,19 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   `--mtp ... --mtp-device 1 --mtp-k 2` (speculative decoding with two chained drafts for sampled requests; greedy
   requests fall back to one, `--mtp-k-greedy` 1; a request's `strata_tune.mtp_k` wins, 0 = none) `--park-mib 4096`
   (conversation parking) `--arena-gib 41` + env `GGML_LI_I8=1` (the lightning indexer on int8 tensor cores, 10-10
-  night; drop the line for the fp16 kernel, no rebuild). ~42 GiB container RAM, mem_limit 50g.
-- **Measured through the server (10-10 night, int8 indexer)**: prefill 1,100-1,250 / **1,337** / **1,248** tok/s at
-  8k / 127k / 250k (fp16 indexer 1,297 / 1,192; stack 73: 1011 / 843 / 693); decode K=2 60-68 / **62** / **62**, K=1
-  56-63 / 54-57 / 55-57, plain 47 / 45 / 43 (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 251k;
-  parked chat back in 1.2-1.4 s; agent turns read only what they appended.
+  night; drop the line for the fp16 kernel, no rebuild); the engine's own defaults since 10-10 late: emit-only
+  compressors + batched HCA (env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 = the old paths). ~42 GiB container RAM, mem_limit 50g.
+- **Measured through the server (10-10 late: int8 indexer + emit-only compressors + batched HCA)**: prefill
+  1,100-1,250 / **1,530** / **1,428** tok/s at 8k / 127k / 250k (morning: 1,297 / 1,192; stack 73: 1011 / 843 / 693);
+  decode K=2 60-68 / **60** / **61**, K=1 56-63 / 53-57 / 55-57, plain 47 / 45 / 43 (stack 73 with its drafter 40.8 /
+  39.0 / ~36); needles 3/3 at 251k; parked chat back in 1.2-1.4 s; agent turns read only what they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
   WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
 - **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 next targets
-  (250k profile of the fp16-indexer build, bench/mab776-m2/work/prof/p250k-m10c; the indexer's 20 % is now int8, FP8
-  rejected): HCA chunk attention ~13 % with its per-block concats (DS4_PF_HCA1 cut it but moved ppl768
-  +0.48 % - find out why), expert MMQ ~15 %, dense Q8_0 7 %; serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
+  (250k profile of the fp16-indexer build, bench/mab776-m2/work/prof/p250k-m10c; done since: the indexer on int8,
+  emit-only compressors, batched HCA blocks): expert MMQ ~15 % + the Strata MMQ plumbing ~9 % (copy16 / scatter /
+  quantize), dense Q8_0 7 %; M11 (decode, Marc's plan for 10-10 night) = profile, prompt-lookup drafts (in, opt-in
+  --lookup), tree drafts, overlapped misses, GPU-side routing (design); serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
   #1624, #1601) = a rebase-picture change, ask Marc; after the RAM upgrade: Q3_K_M, the MTP Q2_K expert sweep again,
   the 0731-aligned head again.
 
@@ -348,4 +350,32 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   stream / tools / tool result) OK; prefill **1,337** at 127k (was 1,297) and **1,248** at 250k (was 1,192); decode
   unchanged (K=2 61.7 / 61.7, K=1 54.1 / 55.5); A-B-A: A2 reused 92,808 of 92,850, TTFT 1.21 s.  Rollback = drop
   GGML_LI_I8 from portainer/deepseek-strata/ds4-server.json, copy it to run/, restart.
+- **M10d emit-only compressors (8fe661c9, `DS4_PF_EMIT`, default on, EXACT)**: a prompt chunk's compressors made one
+  candidate compressed row per token and parked all but each block's last in the dummy slot `comp_max` - an HCA
+  layer-chunk gathered [DH, 128, 2048] twice (~512 MB each), transposed, softmaxed and reduced it to keep 16 rows (the
+  250k profile's 1,294 transposes, the 128-wide softmaxes, ~7 % of the GPU, per token = at every depth).
+  prefill_begin sends only the emitting rows (each block's last token in the chunk + the chunk's last token: its
+  partial block) and build_attn sizes the compressors by that count.  CPU gate 45/45 bit-exact incl. chunked prompts
+  (mutation: +1 on the emitted rows' RoPE position fails 88 parity subtests); ppl768 9.9034 unchanged on the GPU.
+  250k one-shot prefill 1,236 -> **1,348** tok/s (+9 %).
+- **M10c batched HCA blocks (8fe661c9, `DS4_PF_HCAB`, default on)**: an HCA chunk's 32 query blocks (each its own K =
+  [SWA + RB - 1 window rows | the compressed rows | pad] + mask: ~160 small ops a layer-chunk) are the sequences of ONE
+  flash-attn call - windows = an overlapping strided view of k_raw (made one window deep, ne/nb patched after: ggml
+  sizes views as if contiguous), the compressed rows (+ pad) repeated per block.  Same keys, masks and order, but not
+  bit-identical: ggml-cuda's MMA kernel accumulates V*P in half2 (`T_C_VKQ = tile<16,8,half2>` on Turing+); the
+  blocked launches were small enough to be split over CTAs (stream-k, partials combined in F32), the batched one runs
+  whole tiles, so a block's whole key range accumulates in fp16 - what llama.cpp's own HCA call does.
+  `DS4_CHECK_HCAB=1` (both paths in one run, the blocked output kept, per query row): rel diff 4e-4 at 8k, median
+  1.2e-3 / max 3.2e-3 at 250k, uniform over blocks and layers.  ppl768 9.9034 -> 10.0234 - and that is why ppl768 is
+  no gate for numerics changes: query blocks of 32 / 128 / one call (identical semantics) give 9.9052 / 9.8735 / 9.9435
+  (HCA1: 9.9512).  The gate (Marc's, set by the DeepSeek session): 128k real-text teacher-forced NLL 1.64804 / 1.64974
+  / 1.64854 (mean 1.64877; wider spread than the blocked pair 1.64891 / 1.64871, mean 1.64881); 251k (the needle
+  haystack, 251k positions) **1.13771 vs blocked 1.13807**; needles 3/3 at 251k (d10 / d50 answers token-identical to
+  the int8 runs).  250k one-shot prefill with both: **1,427** tok/s (+15.5 % over the deployed 1,236).  Deployed
+  10-10 23:04 (snapshot 2bed102c); post-deploy through the server: smoke OK; prefill **1,530** at 127k (was 1,337)
+  and **1,428** at 250k (was 1,248); decode unchanged (K=2 59.7 / 61.2, K=1 53.2 / 56.5); A-B-A: A2 reused 92,808 of
+  92,957, TTFT 1.27 s, a fresh 92.8k read 61.6 s (was 70.8).  Rollback: env DS4_PF_EMIT=0 / DS4_PF_HCAB=0.
+  Two lessons from the windows: a second, overlapping GPU window (an `&` waiter that `ps` didn't show) killed the
+  other's runs through the shared container name - gpuwin now holds a flock; and SIGTERM did not stop a window
+  script - windows stop through a STOP file checked between runs.
 

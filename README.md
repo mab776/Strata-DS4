@@ -35,7 +35,11 @@ at long context:
   - a radix-select top-k (`tools/ds4/patches/ggml-topk-radix-select.patch`). The radix select is 10× faster than
     sorting every row, and it also made verify passes almost flat in depth;
   - lean masks for the compressed layers: the indexer takes per-query visible counts
-    (`tools/ds4/patches/ggml-lightning-indexer-count-mask.patch`) instead of a dense 65k × 2k visibility mask.
+    (`tools/ds4/patches/ggml-lightning-indexer-count-mask.patch`) instead of a dense 65k × 2k visibility mask;
+  - compressors that build only the compressed rows a chunk keeps. They used to make one candidate per token and
+    throw away 99 % of them in the 128-token HCA layers. This change is exact and gives +9 % at 250k;
+  - the HCA layers' 32 query blocks run as one batched flash-attention call. It gives +6 %, and the long-context NLL
+    stays inside the noise.
 
 ## How fast is it?
 
@@ -50,8 +54,8 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 | context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
 | 8k   | 1,100-1,250 | 1,011 | 60-68 / 56-63 | 40.8 |
-| 127k | **1,337**   | 843   | **62** / 54-57 | 39.0 |
-| 250k | **1,248**   | 693   | **62** / 55-57 | ~36 |
+| 127k | **1,530**   | 843   | **60** / 53-57 | 39.0 |
+| 250k | **1,428**   | 693   | **61** / 55-57 | ~36 |
 
 - **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
   tokens on average.
