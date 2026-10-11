@@ -29,7 +29,9 @@ at long context:
   GPU 1.
 - **Prefill kernels for long prompts:**
   - chunked prefill (2,048 tokens) on MMQ, with FP4 MMQ for the MXFP4 layers;
-  - a tensor-core lightning indexer (`tools/ds4/patches/ggml-lightning-indexer-mma.patch`);
+  - a tensor-core lightning indexer (`tools/ds4/patches/ggml-lightning-indexer-mma.patch`). With env `GGML_LI_I8=1`
+    it runs on int8 tensor cores, which adds 3-5 % to prefill at 127k-250k. Over 128k tokens of real text, its
+    teacher-forced NLL matched the fp16 kernel (0.02 % lower);
   - a radix-select top-k (`tools/ds4/patches/ggml-topk-radix-select.patch`). The radix select is 10× faster than
     sorting every row, and it also made verify passes almost flat in depth;
   - lean masks for the compressed layers: the indexer takes per-query visible counts
@@ -48,8 +50,8 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 | context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
 | 8k   | 1,100-1,250 | 1,011 | 60-68 / 56-63 | 40.8 |
-| 127k | **1,297**   | 843   | **61** / 57    | 39.0 |
-| 250k | **1,192**   | 693   | **61** / 57    | ~36 |
+| 127k | **1,337**   | 843   | **62** / 54-57 | 39.0 |
+| 250k | **1,248**   | 693   | **62** / 55-57 | ~36 |
 
 - **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
   tokens on average.
@@ -92,7 +94,7 @@ The engine flags that matter are all in [tools/ds4/ds4-server.json.example](tool
 |---|---|
 | `--gpu1 1` | GPU 1 expert tier |
 | `--vram-margin 9 --vram-grow 2` | GPU 0's elastic cache |
-| `--prefill-chunk 2048 --chunk-mmq --chunk-prestage`, env `STRATA_MMQ_FP4=1` | prefill |
+| `--prefill-chunk 2048 --chunk-mmq --chunk-prestage`, env `STRATA_MMQ_FP4=1 GGML_LI_I8=1` | prefill (FP4 MMQ for the MXFP4 layers, int8 indexer) |
 | `--mtp DeepSeek-V4-Flash-MTP-bf16.gguf --mtp-device 1 --mtp-k 2` | speculative decoding (K drafts per pass; greedy requests: `--mtp-k-greedy`, default 1) |
 | `--park-mib 4096` | conversation parking |
 | `--comp-type iq4_nl --icomp-q8` | compressed KV cache |

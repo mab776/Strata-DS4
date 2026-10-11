@@ -10,7 +10,8 @@
   "--gpu1 1 = GPU 1 as a static expert tier, --mtp = speculative decoding, --park-mib = conversation parking in RAM;",
   "env STRATA_MMQ_FP4=1 = the 2 MXFP4 layers on FP4 MMQ. gpu [0, 1] + gpu_order as_given keep the dense half on GPU 0.",
   "Left out on purpose - the server refuses them for DeepSeek: vision, parallel, slot_save_path, vram_elastic.",
-  "Speculative decoding (10-10): --mtp-device 1 = the MTP head's MXFP4 experts on GPU 1 (--arena-gib 41 = room for the experts GPU 1's tier gives up); --mtp-k 2 = two chained drafts per verify pass for sampled requests, greedy ones draft --mtp-k-greedy (default 1). A request overrides it with strata_tune.mtp_k (0 = no drafts)."
+  "Speculative decoding (10-10): --mtp-device 1 = the MTP head's MXFP4 experts on GPU 1 (--arena-gib 41 = room for the experts GPU 1's tier gives up); --mtp-k 2 = two chained drafts per verify pass for sampled requests, greedy ones draft --mtp-k-greedy (default 1). A request overrides it with strata_tune.mtp_k (0 = no drafts).",
+  "Prefill (10-10 night): env GGML_LI_I8=1 = the lightning indexer on int8 tensor cores (one scale per 128-dim vector, tools/ds4/patches/ggml-lightning-indexer-mma.patch), +3-5 % prefill at 127k-250k; drop it for the fp16 kernel."
  ],
  "architecture": "deepseek4",
  "exe": "build/ds4_serve",
@@ -80,7 +81,8 @@
  ],
  "env": {
   "STRATA_MMQ_FP4": "1",
-  "GGML_NO_BACKTRACE": "1"
+  "GGML_NO_BACKTRACE": "1",
+  "GGML_LI_I8": "1"
  },
  "aliases": [
   "deepseek-v4-flash-strata"

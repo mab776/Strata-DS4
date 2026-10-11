@@ -1,0 +1,27 @@
+== M10-needle50: 2026-10-10 15:23:07 MEM 42g ARENA 36 SKIP 1 CHUNK 2048 PCIE 0.55 G1 1 GROW 2.0 MARGIN 9.0 build-ds4-cu13 
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 64244 MiB):
+  Device 0: NVIDIA RTX PRO 5000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 48403 MiB
+  Device 1: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, VMM: yes, VRAM: 15841 MiB
+dense backend: CUDA0
+context cap 262144 tokens
+dense compute buffers: one shared arena 48.8 MiB for every decode graph
+slots auto: 38.99 GiB free after the dense half -> 29.99 GiB of expert slots (margin 9.00 GiB; expert 7.19-9.38 MiB -> 3275-4272 experts)
+vram grow: the prompt on 29.99 GiB of slots, then up to 36.99 GiB (leaving 2.00 GiB)
+tier: gpu, 4228 resident slots, arena 34.0 GiB (4792 experts), file tier 0; load 50.5 s
+gpu1: device 1 holds 1990 experts (14.10 GiB, filled in 5.5 s; no arena copies)
+strata: prompt kernels: mxfp4 is FP4 x FP4 in llama.cpp's MMQ on this GPU: MMQ with FP4 activations (STRATA_MMQ_FP4=1)
+ds4_moe: run_chunk: prestage halves of 1.10 GiB (busiest layer: 138 arena experts)
+chunk prof: 5289 calls, 73547 launches: wall 65468 ms = waits on reads 0 + wave/copy waits 0 + final sync 59387 + other host 6081; reader wall 0 ms; GPU grouped kernels 40690 ms (resident 0); file tier 0.0 GB read in 0 ms of reader time = 0.00 GB/s
+grow_cache: 4228 -> 5122 slots (+894, 0 from the file tier) in 118 ms
+prefill chunks of 2048: dense 172936 ms (attention+router 169070, finish 3866), experts 65502 ms, head/ppl 19 ms, cache seed 124 ms -> 5122 resident slots
+
+prefill: 251199 tokens in 243.25 s = 1032.67 tok/s (chunked)
+decode : 93 tokens, 92 forward passes in 2.36 s = 39.06 tok/s
+experts/token: hit 75.5% (prefetched-useful 9.3/token of 27.4 issued), cpu 3.0%, pcie 3.7%, file tier 0
+gpu1: 17.8% of lookups (45.86/pass), host wait 0.029 ms/pass; prefill: 11.8% of entries
+tier moves: vram_lru swaps 5.00/pass (demoted 47), arena swaps 0, file reads 0.00 ms/pass
+decode ms/token: predict+prefetch 1.49, attention+router 15.85, experts 6.19, finish 1.09, head 0.50
+tier ms/token: wall 6.19 (gpu hits 2.05, pcie 1.77, cpu pool 1.31)
+VRAM free at the end: 2.03 GiB (calibrates --vram-margin)
+exit=0 oom=false wall=298s
+peak VmHWM 43.1 GiB, cgroup peak 40.2 GiB, min host avail 13.1 GiB, peak VRAM 46323 MiB (GPU 1 15333 MiB)

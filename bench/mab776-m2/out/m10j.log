@@ -1,0 +1,43 @@
+== G128-f16 ()
+ppl: 131071 positions, mean NLL 1.64916, perplexity 5.2026
+prefill: 131072 tokens in 181.22 s = 723.29 tok/s (chunked)
+decode : 1 tokens, 1 forward passes in 0.00 s = 18050.87 tok/s
+exit=0 oom=false wall=229s
+== G128-i8 (GGML_LI_I8=1)
+ppl: 131071 positions, mean NLL 1.64891, perplexity 5.2013
+prefill: 131072 tokens in 175.50 s = 746.83 tok/s (chunked)
+decode : 1 tokens, 1 forward passes in 0.00 s = 17860.33 tok/s
+exit=0 oom=false wall=225s
+== G128-f16b ()
+ppl: 131071 positions, mean NLL 1.64913, perplexity 5.2024
+prefill: 131072 tokens in 183.61 s = 713.86 tok/s (chunked)
+decode : 1 tokens, 1 forward passes in 0.00 s = 1042.52 tok/s
+exit=0 oom=false wall=231s
+== G128-i8b (GGML_LI_I8=1)
+ppl: 131071 positions, mean NLL 1.64871, perplexity 5.2003
+prefill: 131072 tokens in 179.21 s = 731.39 tok/s (chunked)
+decode : 1 tokens, 1 forward passes in 0.00 s = 17976.24 tok/s
+exit=0 oom=false wall=227s
+== GN-i8-d10 (GGML_LI_I8=1)
+prefill: 251198 tokens in 203.91 s = 1231.92 tok/s (chunked)
+decode : 80 tokens, 79 forward passes in 2.06 s = 38.37 tok/s
+exit=0 oom=false wall=258s
+80 ids, reasoning 296 chars, content 36 chars, closed think: True
+FOUND | word 'meadow-copper-504' in reasoning: True
+== GN-i8-d50 (GGML_LI_I8=1)
+prefill: 251199 tokens in 203.34 s = 1235.38 tok/s (chunked)
+decode : 135 tokens, 134 forward passes in 3.39 s = 39.56 tok/s
+exit=0 oom=false wall=256s
+135 ids, reasoning 538 chars, content 36 chars, closed think: True
+FOUND | word 'falcon-quartz-940' in reasoning: True
+== GN-i8-d90 (GGML_LI_I8=1)
+prefill: 251198 tokens in 204.59 s = 1227.79 tok/s (chunked)
+decode : 84 tokens, 83 forward passes in 2.32 s = 35.75 tok/s
+exit=0 oom=false wall=262s
+84 ids, reasoning 346 chars, content 36 chars, closed think: True
+FOUND | word 'willow-cobalt-696' in reasoning: True
+== GN-f16-d50 ()
+prefill: 251199 tokens in 214.14 s = 1173.04 tok/s (chunked)
+decode : 8 tokens, 7 forward passes in 0.28 s = 25.26 tok/s
+exit=0 oom=false wall=260s
+stack 74 restarted 20:52:43

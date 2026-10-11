@@ -19,16 +19,17 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   shrunk per prompt) `--prefill-chunk 2048 --chunk-mmq --chunk-prestage` + env `STRATA_MMQ_FP4=1` (Marc: keep it)
   `--mtp ... --mtp-device 1 --mtp-k 2` (speculative decoding with two chained drafts for sampled requests; greedy
   requests fall back to one, `--mtp-k-greedy` 1; a request's `strata_tune.mtp_k` wins, 0 = none) `--park-mib 4096`
-  (conversation parking) `--arena-gib 41`. ~42 GiB container RAM, mem_limit 50g.
-- **Measured through the server (10-10 night)**: prefill 1,100-1,250 / **1,297** / **1,192** tok/s at 8k / 127k / 250k
-  (stack 73: 1011 / 843 / 693); decode K=2 60-68 / **61** / **61**, K=1 56-63 / 57 / 57, plain 47 / 45 / 43 (stack 73
-  with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k; parked chat back in 1.3-1.4 s; agent turns read only what
-  they appended.
+  (conversation parking) `--arena-gib 41` + env `GGML_LI_I8=1` (the lightning indexer on int8 tensor cores, 10-10
+  night; drop the line for the fp16 kernel, no rebuild). ~42 GiB container RAM, mem_limit 50g.
+- **Measured through the server (10-10 night, int8 indexer)**: prefill 1,100-1,250 / **1,337** / **1,248** tok/s at
+  8k / 127k / 250k (fp16 indexer 1,297 / 1,192; stack 73: 1011 / 843 / 693); decode K=2 60-68 / **62** / **62**, K=1
+  56-63 / 54-57 / 55-57, plain 47 / 45 / 43 (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 251k;
+  parked chat back in 1.2-1.4 s; agent turns read only what they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
   WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
 - **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 next targets
-  (250k profile of the deployed build, bench/mab776-m2/work/prof/p250k-m10c): li_mma indexer 20 % (FP8 tensor cores or
-  cp.async pipelining), HCA chunk attention ~13 % with its per-block concats (DS4_PF_HCA1 cut it but moved ppl768
+  (250k profile of the fp16-indexer build, bench/mab776-m2/work/prof/p250k-m10c; the indexer's 20 % is now int8, FP8
+  rejected): HCA chunk attention ~13 % with its per-block concats (DS4_PF_HCA1 cut it but moved ppl768
   +0.48 % - find out why), expert MMQ ~15 %, dense Q8_0 7 %; serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
   #1624, #1601) = a rebase-picture change, ask Marc; after the RAM upgrade: Q3_K_M, the MTP Q2_K expert sweep again,
   the 0731-aligned head again.
@@ -319,4 +320,32 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
 - **Profile of the deployed build** (250k prefill window, p250k-m10c): matmuls 28.8 % (expert MMQ ~15 %, dense Q8_0
   7.3 %), li_mma 20.3 %, flash-attn 15.0 % (CSA sparse 7.2 %, HCA blocked 6.0 %), elementwise 14.3 %, copies 12.7 %
   (HCA's per-block concats 4.6 %, transposes 2.5 %), expert-tier moves 7.4 %, radix top-k 1.5 %.
+- **M6 regression suite re-run on the deployed build (10-10 20:07, Marc's "usual tests"; kit in the untracked
+  bench/mab776-m2/work/m6reg)**: parking A-B-A: A2 reused 92,808 of 92,955, TTFT 1.27 s (M6 1.41 s), fresh 92.8k read
+  in 72 s (M6 88 s); A-B-C-A: A3 reused 92,954 in 1.22 s, B2/C2 re-read (B1/C1 hit max_tokens inside their thinking ->
+  empty content -> the template merges the user turns: the M6 caveat); parked 277 MiB at 93k / 98 MiB at 10k, unpark
+  19 ms; 14-turn agent loop 55.7k -> 87.7k, every turn read only its append (108-9,294 tokens), TTFT 1.1-1.2 s (7.3-7.8
+  s for 9.3k-token file reads), decode 55-65 tok/s; OpenHands "DeepSeek": fib + unittest in 5 actions, 36 s; mode page
+  off -> DeepSeek (Strata) ready in 71 s.  All pass.
+- **M10b int8 lightning indexer (2f56f400, deployed 10-10 21:08 via env `GGML_LI_I8=1`)**: li_mma::kernel_i8b in
+  ggml-lightning-indexer-mma.patch.  The keys are Q8_0 already and an m16n8k32 int8 MMA is 32 dims deep (one Q8_0
+  block).  With ONE scale per 128-dim vector on both sides (K's four blocks re-quantized to the key's own scale at tile
+  load, Q per head row in registers), the four MMAs accumulate the whole dot product in int32 inside the tensor core and
+  the scales apply once per tile: no fp16 dequant, half the shared memory, 256-key tiles.  Standalone (li_test.cu, 1024
+  queries x 50k keys, random data = a crowded top-512 boundary; fp16 li_mma 6.06 ms, exact):
+
+  | variant | ms | top-512 overlap vs exact |
+  |---|---:|---:|
+  | int8, per-32-dim scales (scale epilogue per MMA) | 5.46 | 99.28 % |
+  | FP8 e4m3 | 4.34 | 95.5 % (rejected) |
+  | **int8, one scale per 128-dim vector (shipped)** | **4.06** | 98.75 % |
+
+  Gate (set by the DeepSeek session, Marc's call; one-shot ds4_generate, deployed config, bench/mab776-m2/out/m10j.log):
+  teacher-forced NLL over 128k tokens of real text (the needle haystack's docs + code) fp16 1.64916 / 1.64913, int8
+  1.64891 / 1.64871 (0.02 % lower, Marc: OK); needles 3/3 at 251k (d10 / d50 / d90); ppl768 9.9034 both (768 tokens
+  never reach the 512-block top-k); 8k filler NLL 0.03323 (fp16 band 0.03281-0.03313, +0.0001 nats); prefill 251k
+  1,228-1,235 vs 1,173 tok/s, 128k 731-747 vs 714-723 (ppl mode).  Post-deploy through the server: smoke (plain /
+  stream / tools / tool result) OK; prefill **1,337** at 127k (was 1,297) and **1,248** at 250k (was 1,192); decode
+  unchanged (K=2 61.7 / 61.7, K=1 54.1 / 55.5); A-B-A: A2 reused 92,808 of 92,850, TTFT 1.21 s.  Rollback = drop
+  GGML_LI_I8 from portainer/deepseek-strata/ds4-server.json, copy it to run/, restart.
 
