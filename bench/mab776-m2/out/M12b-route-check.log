@@ -1,0 +1,14 @@
+### route check 08:42:12
+  depth   8192 K=2 lookup 0 decode  73.0 tok/s, pass 27.6 ms, 2.21 tok/pass
+  depth   8192 K=2 lookup 7 decode  76.0 tok/s, pass 27.0 ms, 2.26 tok/pass
+  depth 130048 K=2 lookup 0 decode  70.1 tok/s, pass 28.2 ms, 2.15 tok/pass
+  depth 130048 K=2 lookup 7 decode  68.5 tok/s, pass 28.3 ms, 2.11 tok/pass
+### smoke
+1 plain: '391' | reasoning chars 241 | finish stop | usage {'prompt_tokens': 17, 'completion_tokens': 86, 'total_tokens': 103, 'prompt_tokens_details': {'cached
+2 stream: TTFT 0.33s, 602 chunks, reasoning 1645 chars, content: ''
+3 tools: tool_calls [{"id": "call_049dd0d2e45443388d2bbb22", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Montreal\", \"un
+4 tool result: stop 'The weather in Montreal is currently **7°C** with **light rain**.' | usage {'prompt_tokens': 388, 'completion_tokens': 18, 'total_tokens':
+  DIFFERENT lines: 0
+[route-chk] layer 20: same (79872 of 79872 calls identical)
+[route-chk] layer 16: same (80384 of 80384 calls identical)
+### restored 08:45:56

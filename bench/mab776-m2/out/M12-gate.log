@@ -1,0 +1,33 @@
+### smoke
+1 plain: '391' | reasoning chars 211 | finish stop | usage {'prompt_tokens': 17, 'completion_tokens': 80, 'total_tokens': 97, 'prompt_tokens_details': {'cached_tokens': 0}} | 1.9s
+2 stream: TTFT 0.32s, 172 chunks, reasoning 515 chars, content: 'Silicon whispers,\nthousands of cores compute fast—\npixels bloom in light.'
+3 tools: tool_calls [{"id": "call_b581db280c8347ebaef7f38d", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Montreal\", \"unit\": \"c\"}"}}] | content None | 3.8s
+4 tool result: stop 'The weather in Montreal is currently **7°C** with **light rain**.' | usage {'prompt_tokens': 388, 'completion_tokens': 34, 'total_tokens': 422, 'prompt_tokens_details': {'cached_
+### needles 256k (sampled, T 1.0)
+--- content: 'meadow-copper-504'
+prompt 239794 tokens generated in 564 ms (56.7 tok/s) lookup 1/3 accepted in 1 passes 
+--- content: 'falcon-quartz-940'
+prompt 239795 tokens generated in 4474 ms (65.7 tok/s) lookup 57/69 accepted in 15 passes 
+--- content: 'willow-cobalt-696'
+prompt 239794 tokens generated in 416 ms (62.5 tok/s) lookup 2/2 accepted in 1 passes 
+### aba (max_tokens 1500)
+== A-B-A
+{"req": "A1 (fresh, ~100k)", "prompt_tokens": 92809, "reused": 0, "read": 92809, "ttft_s": 60.27, "prompt_ms": 60170, "gen": 232, "decode_tok_s": 66.3, "drafts": "124/228", "wall_s": 63.8}
+{"req": "B1 (side chat, A parked)", "prompt_tokens": 18543, "reused": 0, "read": 18543, "ttft_s": 12.66, "prompt_ms": 12633, "gen": 1500, "decode_tok_s": 76.1, "drafts": "853/1448", "wall_s": 32.4}
+{"req": "A2 (back to A + 1 turn)", "prompt_tokens": 92964, "reused": 92808, "read": 156, "ttft_s": 1.26, "prompt_ms": 1167, "gen": 176, "decode_tok_s": 58.6, "drafts": "82/190", "wall_s": 4.3}
+== A-B-C-A (3 parked)
+{"req": "C1 (third chat)", "prompt_tokens": 10159, "reused": 0, "read": 10159, "ttft_s": 6.46, "prompt_ms": 6452, "gen": 1500, "decode_tok_s": 84.1, "drafts": "957/1319", "wall_s": 24.3}
+{"req": "B2 (back to B)", "prompt_tokens": 18547, "reused": 0, "read": 18547, "ttft_s": 12.65, "prompt_ms": 12624, "gen": 1500, "decode_tok_s": 79.0, "drafts": "900/1399", "wall_s": 31.6}
+{"req": "A3 (back to A again)", "prompt_tokens": 93014, "reused": 92963, "read": 51, "ttft_s": 1.26, "prompt_ms": 1169, "gen": 554, "decode_tok_s": 64.6, "drafts": "290/589", "wall_s": 9.8}
+{"req": "C2 (back to C)", "prompt_tokens": 11409, "reused": 10158, "read": 1251, "ttft_s": 1.43, "prompt_ms": 1413, "gen": 1500, "decode_tok_s": 86.8, "drafts": "979/1292", "wall_s": 18.7}
+GEN #8: 92809 tokens common 1 -> reset, reused 0 GEN #9: 18543 tokens common 4 -> reset, reused 0 GEN #10: 92964 tokens common 92808 -> checkpoint turn, reused 92808 unparked 93041 tokens GEN #11: 10159 tokens common 2 -> reset, reused 0 GEN #12: 18547 tokens common 2 -> reset, reused 0 GEN #13: 93014 tokens common 92963 -> checkpoint turn, reused 92963 unparked 93140 tokens GEN #14: 11409 tokens common 10158 -> checkpoint turn, reused 10158 unparked 11659 tokens 
+### done 10:32:36
+
+### forced KL (recomputed row by row after the oomd kill)
+== m12-final (depth 130048, 384 rows)
+  plain-a : KL mean 0.00227 median 0.00046 p95 0.00926 max 0.1364, top-1 differs 1/384
+  K1-a    : KL mean 0.00210 median 0.00055 p95 0.00941 max 0.0569, top-1 differs 1/384 | by slot 0.00225 0.00193
+  K2-a    : KL mean 0.00215 median 0.00053 p95 0.00980 max 0.0385, top-1 differs 1/384 | by slot 0.00224 0.00146 0.00274
+  plain-b : KL mean 0.00208 median 0.00045 p95 0.00932 max 0.0637, top-1 differs 4/384
+  K2-b    : KL mean 0.00219 median 0.00063 p95 0.00906 max 0.0512, top-1 differs 4/384 | by slot 0.00240 0.00191 0.00221
+  K1-b    : KL mean 0.00242 median 0.00056 p95 0.01135 max 0.0445, top-1 differs 5/384 | by slot 0.00252 0.00231

@@ -2834,4 +2834,49 @@ void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H,
     check("weighted_rows_sum_f64");
 }
 
+// mab776 M12b (DS4_DEV_ROUTE): a verify layer's GPU 0 hits decided on the card.  The router block holds per token
+// [fn | ids | wts] `blk` bytes apart (the ids at `ids_off`, int32); entry j = token j / K, slot j % K.  The distinct
+// experts in first-seen order (the host tier's order), the ones `tab` points to (a resident VRAM slot or a prefetch
+// staging slot; 0 = not on the card) as groups of their entries - the layout native_expert_grouped reads, its counts
+// on the device.  One thread: at most kMaxEnt = 64 entries.
+__global__ void ds4_route_hits_kernel(const uint8_t* __restrict__ rb, int64_t blk, int64_t ids_off, int nt, int K,
+                                      const unsigned long long* __restrict__ tab, int64_t n_tab,
+                                      unsigned long long* __restrict__ ptr, int32_t* __restrict__ start,
+                                      int32_t* __restrict__ ng_out, int32_t* __restrict__ dst, int32_t* __restrict__ tok) {
+    if (threadIdx.x != 0 || blockIdx.x != 0) return;
+    const int NE = nt * K;
+    int32_t ue[64], eu[64];
+    int nu = 0;
+    for (int j = 0; j < NE; ++j) {
+        const int32_t e = ((const int32_t*) (rb + (int64_t) (j / K) * blk + ids_off))[j % K];
+        int u = -1;
+        for (int i = 0; i < nu && u < 0; ++i)
+            if (ue[i] == e) u = i;
+        if (u < 0) { u = nu; ue[nu++] = e; }
+        eu[j] = u;
+    }
+    int ng = 0, nr = 0;
+    for (int u = 0; u < nu; ++u) {
+        const int32_t e = ue[u];
+        const unsigned long long p = (e >= 0 && e < n_tab) ? tab[e] : 0ull;
+        if (!p) continue;
+        ptr[ng] = p;
+        start[ng] = nr;
+        for (int j = 0; j < NE; ++j)
+            if (eu[j] == u) { dst[nr] = j; tok[nr] = j / K; ++nr; }
+        ++ng;
+    }
+    start[ng] = nr;
+    ng_out[0] = ng;
+}
+
+void ds4_route_hits(const void* router_block, int64_t blk, int64_t ids_off, int nt, int K, const unsigned long long* tab,
+                    int64_t n_tab, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
+                    int32_t* ent_tok, void* stream) {
+    if (nt * K > 64) { std::fprintf(stderr, "ds4_route_hits: %d entries > 64\n", nt * K); std::exit(1); }
+    ds4_route_hits_kernel<<<1, 32, 0, (cudaStream_t) stream>>>((const uint8_t*) router_block, blk, ids_off, nt, K, tab,
+                                                                n_tab, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+    check("ds4_route_hits");
+}
+
 }  // namespace strata::kernels

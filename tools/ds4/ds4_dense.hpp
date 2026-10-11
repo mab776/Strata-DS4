@@ -206,6 +206,11 @@ public:
     /// mab776 M11b (DS4_OVL): a cudaEvent_t on the dense backend's device for the expert tier to record after it mixed
     /// into decode_routed_device() (Ds4MoeTier::run_multi's done_ev), or NULL (CPU backend, no events, DS4_OVL=0)
     void * decode_sum_event();
+    /// mab776 M12b (DS4_DEV_ROUTE): layer `il`'s router block on the device - per token [fn | ids | wts], `*blk` bytes
+    /// apart, int32 ids at `*ids_off` - written by its attention graph; NULL on the CPU backend
+    const void * router_block_device(int il, int64_t * blk, int64_t * ids_off) const;
+    /// ... and a cudaEvent_t recorded now on the dense stream (behind the attention graph just queued), or NULL
+    void * record_attn_event();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

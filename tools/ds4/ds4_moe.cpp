@@ -148,8 +148,13 @@ struct Gpu {
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
     /// mab776 M7a: gpu_run's two launches' metadata (0 = hits, 1 = PCIe share), packed: one pinned block -> one H2D
-    /// copy per launch instead of five pageable ones
+    /// copy per launch instead of five pageable ones.  mab776 M12b: d_meta2 has a third region, the hits' metadata the
+    /// route kernel writes on the card (DS4_DEV_ROUTE)
     void *h_meta2 = nullptr, *d_meta2 = nullptr;
+    /// mab776 M12b (DS4_DEV_ROUTE): a layer's residency as the route kernel reads it - per expert the device address of
+    /// its VRAM slot or prefetch staging slot, 0 = not on the card; pinned + device copies by layer parity
+    unsigned long long* h_rtab[2] = {};
+    void* d_rtab[2] = {};
 
     /// run_chunk (prompt chunks, MiMo prefill): allocated on first use, for up to `c_tok` tokens.  The streamed
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
@@ -206,6 +211,10 @@ struct Gpu {
         if (h_parts) cudaFreeHost(h_parts);
         if (h_meta2) cudaFreeHost(h_meta2);
         if (d_meta2) cudaFree(d_meta2);
+        for (int i = 0; i < 2; ++i) {
+            if (h_rtab[i]) cudaFreeHost(h_rtab[i]);
+            if (d_rtab[i]) cudaFree(d_rtab[i]);
+        }
         for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
         for (uint8_t* p : c_bounce)
@@ -374,6 +383,8 @@ struct Ds4MoeImpl {
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     bool last_dev_sum = false;        ///< mab776 M11: the last run_multi mixed on the card (DS4_DEV_SUM)
     bool last_ev = false;             ///< mab776 M11b: ... and recorded the caller's event instead of syncing
+    int64_t pre_layer = -1;           ///< mab776 M12b: the layer whose hits prelaunch_hits queued (for pre_nt tokens)
+    int pre_nt = 0;
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
     std::vector<uint8_t> ftmp;        ///< the file tier's read buffer, top_k blobs
@@ -1389,7 +1400,11 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
     ck(cudaMallocHost(&gp.h_meta2, 2 * sizeof(G1Meta)), "h_meta2");
-    ck(cudaMalloc(&gp.d_meta2, 2 * sizeof(G1Meta)), "d_meta2");
+    ck(cudaMalloc(&gp.d_meta2, 3 * sizeof(G1Meta)), "d_meta2");   // region 2: the route kernel's hits (M12b)
+    for (int i = 0; i < 2; ++i) {
+        ck(cudaMallocHost((void**) &gp.h_rtab[i], sizeof(unsigned long long) * (size_t) geom.n_experts), "h_rtab");
+        ck(cudaMalloc(&gp.d_rtab[i], sizeof(unsigned long long) * (size_t) geom.n_experts), "d_rtab");
+    }
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds4MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -2298,6 +2313,49 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
 }
 
 
+// mab776 M12b (DS4_DEV_ROUTE): a verify layer's GPU 0 hits queued from the card, before the host has the routing.
+// Called once the dense side queued the attention graph (which writes the router block: per token [fn | ids | wts])
+// and recorded `attn_ev` behind it.  On gp.s: wait for the event, the layer's residency table up (built here from the
+// cache and this layer's prefetch staging - the state gpu_run_n will classify against), the fn rows copied out of the
+// router block and quantized to q8_1, the route kernel (the hits' groups in the host's first-seen order) and the hits
+// kernel.  gpu_run_n for (layer, nt) then skips the x upload / quantize and its own hits launch; every entry row is
+// the same kernel on the same q8_1 activations and blob, so the result is the same bits.
+bool gpu_prelaunch_hits(Ds4MoeImpl& im, int64_t layer, int nt, const void* router_dev, int64_t blk, int64_t ids_off,
+                        void* attn_ev) {
+    im.pre_layer = -1;
+    Gpu& gp = *im.gpu;
+    if (!router_dev || !attn_ev || !gp.cache || im.cfg.no_cache || !gp.h_rtab[0] || nt < 1 || nt > kMaxTok) return false;
+    const int64_t H = im.g.n_embd, K = im.g.top_k, NXL = im.g.n_experts;
+    const int NE = nt * (int) K;
+    const int par = (int) (layer & 1);
+    unsigned long long* tab = gp.h_rtab[par];
+    // the previous user of this pinned half (layer - 2) finished long ago: two router readbacks (full dense syncs,
+    // each after a finish that waited on its tier's event) have passed since
+    for (int64_t e = 0; e < NXL; ++e) {
+        const int32_t sl = gp.cache->slot_of(layer, e);
+        tab[e] = sl >= 0 ? (unsigned long long) gp.cache->device_slot(sl) : 0ull;
+    }
+    for (int j = 0; j < im.pf_n; ++j) {   // gpu_run_n: a resident slot wins over the staging; dummies (-1) never match
+        const int32_t e = im.pf_e[j];
+        if (e >= 0 && e < NXL && !tab[e]) tab[e] = (unsigned long long) gp.d_pf + (size_t) j * (size_t) im.blob;
+    }
+    ck(cudaStreamWaitEvent(gp.s, (cudaEvent_t) attn_ev, 0), "wait attention");
+    ck(cudaMemcpyAsync(gp.d_rtab[par], tab, sizeof(unsigned long long) * (size_t) NXL, cudaMemcpyHostToDevice, gp.s),
+       "rtab h2d");
+    ck(cudaMemcpy2DAsync(gp.d_x, (size_t) H * 4, router_dev, (size_t) blk, (size_t) H * 4, (size_t) nt,
+                         cudaMemcpyDeviceToDevice, gp.s), "x from the router block");
+    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    G1Meta* dm = (G1Meta*) gp.d_meta2 + 2;
+    strata::kernels::ds4_route_hits(router_dev, blk, ids_off, nt, (int) K, (const unsigned long long*) gp.d_rtab[par], NXL,
+                                    dm->ptr, dm->start, dm->ng, dm->dst, dm->tok, gp.s);
+    if (im.pf_n > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
+    strata::kernels::native_expert_grouped(gp.gll[(size_t) layer], dm->ptr, dm->start, dm->ng, dm->dst, dm->tok, NE, NE,
+                                           gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, NE);
+    im.pre_layer = layer;
+    im.pre_nt = nt;
+    return true;
+}
+
 /// `nt` tokens of one layer in one pass (draft verification): the distinct experts across the tokens are each
 /// fetched/read ONCE - a group with one entry per token that routed to it - so the second token's experts cost only
 /// what the first did not already pay.  Entry j = t*K + k writes output row j; token t's sum is taken over its own k
@@ -2314,6 +2372,8 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     const int NE = nt * (int) K;
     const double t0 = now_ms();
     Ds4MoeStats st;
+    const bool pre = im.pre_layer == layer && im.pre_nt == nt;   // mab776 M12b: the hits are already queued
+    im.pre_layer = -1;
     // mab776 M7b: gpu_run's VRAM LRU here too - verify passes ran on the static seed (8k code: hit 80 -> 72 %, CPU +
     // PCIe misses x3, a 2-token pass's experts 14.0 ms vs 5.6 for one token)
     const bool lru = im.cfg.vram_lru && gp.cache && !im.cfg.no_cache;
@@ -2477,8 +2537,10 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     if (any_cpu)
         for (int t = 0; t < nt; ++t)
             cpu::native_quant_act(f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * im.f.act_bytes);
-    ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
-    strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    if (!pre) {   // M12b: prelaunch_hits quantized the same fn rows on the card already
+        ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
+        strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
+    }
 
     // ---- one grouped launch per GPU class (hits, PCIe), groups = distinct experts, entries = their tokens; the
     // metadata packed into region w of one pinned block (one H2D copy a launch, as gpu_run) ----
@@ -2507,8 +2569,40 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         strata::kernels::native_expert_grouped(GL, dm->ptr, dm->start, dm->ng, dm->dst, dm->tok, ng, nr, gp.d_xq,
                                               gp.d_scratch, (float*) gp.d_parts, gp.s, ng);
     };
-    if (npf > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
-    launch(HIT, 0);
+    if (pre) {
+        // M12b: the route kernel launched these hits from the card (prelaunch_hits).  DS4_CHECK_ROUTE=1 (diagnostic):
+        // its groups must be exactly the ones launch(HIT) would build here - pointers, entries and order
+        static const bool check_route = std::getenv("DS4_CHECK_ROUTE") != nullptr;
+        if (check_route) {
+            G1Meta host_m{}, dev_m{};
+            int ng = 0, nr = 0;
+            for (int u = 0; u < nu; ++u) {
+                if (cls[u] != HIT) continue;
+                host_m.ptr[ng] = dptr[u];
+                host_m.start[ng] = nr;
+                for (int j = 0; j < NE; ++j)
+                    if (ent_u[j] == u) { host_m.dst[nr] = j; host_m.tok[nr] = j / (int) K; ++nr; }
+                ++ng;
+            }
+            host_m.start[ng] = nr;
+            host_m.ng[0] = ng;
+            ck(cudaStreamSynchronize(gp.s), "route check sync");
+            ck(cudaMemcpy(&dev_m, (G1Meta*) gp.d_meta2 + 2, sizeof(G1Meta), cudaMemcpyDeviceToHost), "route check d2h");
+            bool same = dev_m.ng[0] == ng;
+            for (int g = 0; same && g < ng; ++g) same = dev_m.ptr[g] == host_m.ptr[g] && dev_m.start[g] == host_m.start[g];
+            for (int r = 0; same && r < nr; ++r) same = dev_m.dst[r] == host_m.dst[r] && dev_m.tok[r] == host_m.tok[r];
+            same = same && dev_m.start[ng] == nr;
+            static int64_t n_calls = 0, n_same = 0;
+            ++n_calls;
+            n_same += same;
+            if (!same || n_calls % 512 == 0)
+                std::fprintf(stderr, "[route-chk] layer %lld: %s (%lld of %lld calls identical)\n", (long long) layer,
+                             same ? "same" : "DIFFERENT", (long long) n_same, (long long) n_calls);
+        }
+    } else {
+        if (npf > 0) ck(cudaStreamWaitEvent(gp.s, gp.ev_pf, 0), "wait prefetch");
+        launch(HIT, 0);
+    }
     // prefetched experts the routing used: device-to-device into a victim slot (the hits kernel above read the
     // staging copy; this copy reads it too, and the next prefetch waits for the layer sync)
     for (int u = 0; lru && u < nu; ++u) {
@@ -3375,6 +3469,19 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
 }
 
 bool Ds4MoeTier::dev_sum_used() const { return im_ && im_->last_dev_sum; }
+
+bool Ds4MoeTier::prelaunch_hits(int64_t layer, int nt, const void* router_dev, int64_t blk, int64_t ids_off, void* attn_ev) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_ || !im_->inited || !im_->gpu || im_->cfg.cpu_only || !im_->g.routed(layer)) return false;
+    // the diagnostics that recompute or read host rows keep the old flow
+    if (check_g1() || std::getenv("DS4_CHECK_MULTI") || std::getenv("DS4_CHECK_DEVSUM") || std::getenv("DS4_MULTI_SERIAL"))
+        return false;
+    return gpu_prelaunch_hits(*im_, layer, nt, router_dev, blk, ids_off, attn_ev);
+#else
+    (void) layer; (void) nt; (void) router_dev; (void) blk; (void) ids_off; (void) attn_ev;
+    return false;
+#endif
+}
 bool Ds4MoeTier::event_used() const { return im_ && im_->last_ev; }
 
 bool Ds4MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {

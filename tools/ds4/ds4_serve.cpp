@@ -944,21 +944,34 @@ bool Server::step_n(const int * toks, int n, int pos0) {
     void * const rdev = mc.cpu_only ? nullptr : dense.decode_routed_device();
     void * const rev = rdev ? dense.decode_sum_event() : nullptr;   // mab776 M11b (DS4_OVL), NULL = the host waits
     const bool pfo = !mc.cpu_only && mc.pf_b > 0;
+    // mab776 M12b (DS4_DEV_ROUTE): the hits queued from the card under the attention (needs the device mix)
+    static const bool dev_route = [] { const char * e = std::getenv("DS4_DEV_ROUTE"); return e && std::atoi(e) != 0; }();
+    const bool route = dev_route && rdev != nullptr;
     int l = 0;
+    bool ahead = false;
     auto prefetch = [&] {
         int m = 0;
         for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) m++] = pred_i[(size_t) i];
         if (m > 0) tier.prefetch(l, pred32.data(), m);
     };
-    const std::function<void()> hint = [&] { if (dense.predict_collect(l, pred_i.data(), kPredW)) prefetch(); };
+    // runs once the attention graph is queued: the hint (+ its prefetch DMAs), then - after the prefetch, so the route
+    // table sees this layer's staging - the hits from the card
+    const std::function<void()> hook = [&] {
+        if (ahead && dense.predict_collect(l, pred_i.data(), kPredW)) prefetch();
+        if (route) {
+            int64_t blk = 0, ids_off = 0;
+            const void * rb = dense.router_block_device(l, &blk, &ids_off);
+            if (void * ev = rb ? dense.record_attn_event() : nullptr) tier.prelaunch_hits(l, n, rb, blk, ids_off, ev);
+        }
+    };
     for (; l < n_layer; ++l) {
         // mab776 M11b (DS4_OVL): token 0's hint is queued with its readback, the attention queued behind it, and the
         // hint collected (+ the prefetch DMAs issued) under the attention - the card runs predict -> attention back
         // to back instead of idling while the host picks the prefetch and launches the attention
-        const bool ahead = pfo && dense.predict_launch(l);
+        ahead = pfo && dense.predict_launch(l);
         if (pfo && !ahead && dense.predict(l, pred_i.data(), kPredW)) prefetch();   // token 0's hint
         const float * x = nullptr;
-        if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x, ahead ? &hint : nullptr)) {
+        if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x, ahead || route ? &hook : nullptr)) {
             err = dense.last_error();
             return false;
         }

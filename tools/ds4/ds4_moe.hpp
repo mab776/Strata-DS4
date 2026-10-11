@@ -351,6 +351,11 @@ public:
                    void* out_dev = nullptr, void* done_ev = nullptr);
     bool dev_sum_used() const;   ///< the last run_multi wrote out_dev (mab776 M11)
     bool event_used() const;     ///< ... and recorded done_ev in place of its stream sync (mab776 M11b)
+    /// mab776 M12b (DS4_DEV_ROUTE): queue `layer`'s GPU 0 hits for an `nt`-token pass from the card, before the host
+    /// reads the routing back: `router_dev` = the dense side's router block on GPU 0 (per token [fn | ids | wts], `blk`
+    /// bytes apart, int32 ids at `ids_off`), `attn_ev` a cudaEvent_t recorded after the graph that writes it.  The next
+    /// run_multi(layer, nt, ...) then skips its x upload and hits launch.  false = nothing queued (run_multi as before).
+    bool prelaunch_hits(int64_t layer, int nt, const void* router_dev, int64_t blk, int64_t ids_off, void* attn_ev);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.

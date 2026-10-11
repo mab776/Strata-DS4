@@ -538,3 +538,43 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   to run with DS4_ASYNC=0 (3/3 different md5s with the other M11 items on) - the engine's known nondeterminism
   (expert placement / CPU-vs-GPU rows), not the async path; the all-off arm matching 2/2 in the before/after run was
   luck.  Validate numerics with the teacher-forced KL test, never with output hashes.
+
+## Session 2026-10-11 day - M12: Marc's three next steps (via the DeepSeek session), order 1 -> 3 -> 2
+- **Where a verify layer's time goes now** (nsys of the LIVE server's production passes, 8k, sampled K=2 + lookup;
+  bench/mab776-m2/work/prof/S8k-m11, analysis work/m12/layer_phases.py + tier_split.py): GPU 0 busy 77 % (60 % before
+  M11).  Per layer, 681 us: attention graph 373 (55 %), expert tier 171 (25 %: GPU 0 expert kernels ~122-152, then ~19
+  waiting for CPU / GPU 1 rows), router readback -> first tier op 44 (6.4 %), predict readback -> attention start 50
+  (7.3 %: the host's graph launches), finish + predict 32, mix -> finish 4 (M11b).  The big buckets left are the
+  attention graph's 150-240 tiny kernels and launch latency, not the expert routing.
+- **M12a - the hash-routed layers' prefetch hint (engine default, `DS4_PF_HASH=0` = the old read)**: predict_pick
+  reads build_predict's F32-cast tid2eid ids as floats (they were read as int32 -> float bit patterns -> dropped by
+  prefetch(): layers 0-2 never prefetched).  A/B, 2 rounds, verify pass ms off -> on: 8k K=1 23.8 -> 23.6, K=2 27.23 ->
+  27.05; 127k K=1 24.65 -> 24.35, K=2 27.55 -> 27.55; 250k K=1 25.6 -> 25.65, K=2 28.6 -> 28.48 (noise-level gain;
+  it is a bug fix).  out/M12a-pfhash-ab.log.
+- **M12c - fp32 accumulation for the decode graphs' F16-weight matmuls (engine default, `DS4_F16_ACC32=0` = half)**:
+  alloc_graph sets ggml_prec_set_acc(F32) on every MUL_MAT with an F16 weight in a decode graph (hyper-connection
+  mixes, compressors, indexer, MTP eh_proj - the loader makes F16 of our F32 / Q8_0 tensors); ggml-cuda's vector kernel
+  otherwise accumulates them in half2 with the activations rounded to half, where llama.cpp multiplies these from the
+  GGUF's F32 tensors in F32.  Prompt chunks (own allocator) untouched.  (Flash attention: ggml-cuda ignores the
+  precision flag and its vector kernel accumulates in fp32 on NVIDIA anyway - no gap there.)  A/B, 2 rounds, K=2
+  verify pass: 27.1 -> 26.55 / 27.5 -> 27.23 / 28.45 -> 28.38 ms at 8k / 127k / 250k - free.  out/M12c-f16acc32-ab.log.
+- **M12b - GPU-side expert routing (`DS4_DEV_ROUTE=1` in the deployed config; code default off)**: once the attention
+  graph is queued, the hook records an event behind it and queues on the tier's stream: the layer's residency table
+  (per expert the device address of its VRAM slot or prefetch staging slot, built from the cache + this layer's
+  prefetch, pinned / device copies by layer parity), the fn rows copied out of the router block and quantized, a
+  one-thread route kernel (ds4_route_hits: the hits' groups in the host's first-seen order) and the grouped hits
+  kernel, which already read its counts on the device - all before the host has the routing.  run_multi then skips
+  the x upload and its own hits launch; classification, GPU 1, PCIe, CPU pool, LRU and the mix are unchanged.  Same
+  kernel on the same q8_1 rows: exact.  DS4_CHECK_ROUTE=1 compares the card's groups with the host's: 80,384 / 80,384
+  layer calls identical (8k + 127k, lookup passes up to 8 tokens; out/M12b-route-check.log).  A/B, 2 rounds, verify
+  pass ms off -> on: 8k K=1 23.6 -> 22.85 (-3.2 %), K=2 26.6 -> 26.13 (-1.8 %); 127k K=1 24.35 -> 23.65 (-2.9 %), K=2
+  27.6 -> 26.68 (-3.3 %); 250k K=1 25.5 -> 24.65 (-3.3 %), K=2 28.43 -> 27.75 (-2.4 %).  out/M12b-devroute-ab.log.
+  Not done (design notes): GPU 1 dispatched from the card (its rows still need the host), PCIe experts decided on the
+  card (zero-copy reads), and the attention graph's launch latency (cuStreamWaitValue32 would let the host queue
+  finish / predict / attention ahead of the tier's host work).
+- **Final gate (all three on)**: teacher-forced KL at 127k vs a plain run 0.0021-0.0024 for every arm (noise band
+  0.0017-0.0027), top-1 differs 1-5 / 384; CPU gate 46/46; smoke OK, needles 3/3 at 240k, A-B-A (A2 / A3 / C2 reused 92,808 / 92,963 / 10,158, TTFT 1.3-1.4 s; B2 = the empty-content artifact) - out/M12-gate.log.
+- **Incident (10-11 09:49)**: systemd-oomd killed the GNOME Terminal scope running Claude: forced_test.py's analysis
+  loaded 7 logit dumps (7 x 198 MB) and did log-softmax in float64 next to the ~42 GiB server with ~9 GiB free.  The
+  server and the box survived, the live config was left in test mode (DS4_DUMP_TOKLOGITS) for 30 min.  Fixed: the
+  analysis is row by row now (forced_test.py), heavy host-side analysis runs in a memory-capped container / scope.

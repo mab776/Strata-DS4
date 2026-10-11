@@ -71,6 +71,12 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
 // mab776 M11: in double, k in order, no FMA - bit for bit the decode tier's host mix
 void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
+/// mab776 M12b: a DeepSeek verify layer's GPU 0 hits from the router block on the card (per token [fn | ids | wts],
+/// `blk` bytes apart, int32 ids at `ids_off`): the distinct experts in first-seen order that `tab[expert]` points to
+/// (0 = not on the card) as native_expert_grouped's groups (ptr / start / count / entry dst / entry token), on `stream`.
+void ds4_route_hits(const void* router_block, int64_t blk, int64_t ids_off, int nt, int K, const unsigned long long* tab,
+                    int64_t n_tab, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
+                    int32_t* ent_tok, void* stream);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)

@@ -1,0 +1,53 @@
+### DS4_DEV_ROUTE=1 09:16:31 02b93775 02b93775-di env: GGML_MMVF_F16_MAX=8 DS4_PF_HASH=1 DS4_F16_ACC32=1 DS4_DEV_ROUTE=1 
+  depth   8192 read at 1301.2 tok/s
+  depth   8192 K=1 decode  72.5 tok/s, 1.75 tok/pass, pass 22.8 ms | GPU0 86.7 GPU1 11.0 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  76.8 tok/s, 2.27 tok/pass, pass 26.7 ms | GPU0 86.4 GPU1 10.7 CPU 1.3 PCIe 1.6
+  depth   8192 K=2 decode  78.0 tok/s, 2.2 tok/pass, pass 25.7 ms | GPU0 86.7 GPU1 11.0 CPU 1.1 PCIe 1.2
+  depth 130048 read at 1518.9 tok/s
+  depth 130048 K=1 decode  70.4 tok/s, 1.76 tok/pass, pass 23.6 ms | GPU0 87.0 GPU1 10.8 CPU 1.0 PCIe 1.3
+  depth 130048 K=2 decode  70.9 tok/s, 2.08 tok/pass, pass 26.8 ms | GPU0 86.6 GPU1 10.9 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  71.7 tok/s, 2.08 tok/pass, pass 26.5 ms | GPU0 86.6 GPU1 11.0 CPU 1.1 PCIe 1.3
+  depth 250000 read at 1434.9 tok/s
+  depth 250000 K=1 decode  70.0 tok/s, 1.82 tok/pass, pass 24.6 ms | GPU0 87.1 GPU1 10.9 CPU 0.9 PCIe 1.0
+  depth 250000 K=2 decode  68.4 tok/s, 2.08 tok/pass, pass 27.8 ms | GPU0 86.5 GPU1 11.3 CPU 1.0 PCIe 1.2
+  depth 250000 K=2 decode  72.6 tok/s, 2.2 tok/pass, pass 27.7 ms | GPU0 87.1 GPU1 10.7 CPU 1.0 PCIe 1.2
+### DS4_DEV_ROUTE=0 09:23:32 02b93775 02b93775-di env: GGML_MMVF_F16_MAX=8 DS4_PF_HASH=1 DS4_F16_ACC32=1 DS4_DEV_ROUTE=0 
+  depth   8192 read at 1298.2 tok/s
+  depth   8192 K=1 decode  69.4 tok/s, 1.74 tok/pass, pass 23.6 ms | GPU0 86.1 GPU1 11.5 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  72.3 tok/s, 2.12 tok/pass, pass 26.7 ms | GPU0 85.9 GPU1 11.8 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  73.2 tok/s, 2.12 tok/pass, pass 26.3 ms | GPU0 87.1 GPU1 10.7 CPU 1.0 PCIe 1.2
+  depth 130048 read at 1519.8 tok/s
+  depth 130048 K=1 decode  70.1 tok/s, 1.79 tok/pass, pass 24.2 ms | GPU0 86.5 GPU1 11.5 CPU 0.9 PCIe 1.1
+  depth 130048 K=2 decode  69.8 tok/s, 2.12 tok/pass, pass 27.7 ms | GPU0 86.6 GPU1 11.0 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  70.0 tok/s, 2.07 tok/pass, pass 27.1 ms | GPU0 86.3 GPU1 11.5 CPU 1.0 PCIe 1.2
+  depth 250000 read at 1432.9 tok/s
+  depth 250000 K=1 decode  65.4 tok/s, 1.76 tok/pass, pass 25.6 ms | GPU0 87.3 GPU1 10.7 CPU 0.9 PCIe 1.1
+  depth 250000 K=2 decode  70.2 tok/s, 2.18 tok/pass, pass 28.4 ms | GPU0 87.1 GPU1 10.5 CPU 1.1 PCIe 1.3
+  depth 250000 K=2 decode  70.8 tok/s, 2.26 tok/pass, pass 29.0 ms | GPU0 86.2 GPU1 10.7 CPU 1.4 PCIe 1.7
+### DS4_DEV_ROUTE=0 09:30:35 02b93775 02b93775-di env: GGML_MMVF_F16_MAX=8 DS4_PF_HASH=1 DS4_F16_ACC32=1 DS4_DEV_ROUTE=0 
+  depth   8192 read at 1289.9 tok/s
+  depth   8192 K=1 decode  70.2 tok/s, 1.75 tok/pass, pass 23.6 ms | GPU0 86.7 GPU1 11.0 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  76.0 tok/s, 2.27 tok/pass, pass 27.2 ms | GPU0 86.4 GPU1 10.7 CPU 1.3 PCIe 1.6
+  depth   8192 K=2 decode  76.6 tok/s, 2.2 tok/pass, pass 26.2 ms | GPU0 86.7 GPU1 11.0 CPU 1.1 PCIe 1.2
+  depth 130048 read at 1521.1 tok/s
+  depth 130048 K=1 decode  67.7 tok/s, 1.76 tok/pass, pass 24.5 ms | GPU0 86.5 GPU1 10.9 CPU 1.2 PCIe 1.4
+  depth 130048 K=2 decode  73.0 tok/s, 2.2 tok/pass, pass 27.6 ms | GPU0 86.8 GPU1 10.5 CPU 1.2 PCIe 1.5
+  depth 130048 K=2 decode  72.3 tok/s, 2.21 tok/pass, pass 28.0 ms | GPU0 86.1 GPU1 10.9 CPU 1.3 PCIe 1.6
+  depth 250000 read at 1437.8 tok/s
+  depth 250000 K=1 decode  65.3 tok/s, 1.75 tok/pass, pass 25.4 ms | GPU0 86.6 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth 250000 K=2 decode  71.6 tok/s, 2.19 tok/pass, pass 28.1 ms | GPU0 87.0 GPU1 11.0 CPU 0.9 PCIe 1.1
+  depth 250000 K=2 decode  72.0 tok/s, 2.22 tok/pass, pass 28.2 ms | GPU0 86.8 GPU1 11.0 CPU 1.0 PCIe 1.2
+### DS4_DEV_ROUTE=1 09:37:36 02b93775 02b93775-di env: GGML_MMVF_F16_MAX=8 DS4_PF_HASH=1 DS4_F16_ACC32=1 DS4_DEV_ROUTE=1 
+  depth   8192 read at 1291.8 tok/s
+  depth   8192 K=1 decode  72.3 tok/s, 1.75 tok/pass, pass 22.9 ms | GPU0 86.7 GPU1 11.0 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  77.6 tok/s, 2.27 tok/pass, pass 26.5 ms | GPU0 86.4 GPU1 10.7 CPU 1.3 PCIe 1.6
+  depth   8192 K=2 decode  78.3 tok/s, 2.2 tok/pass, pass 25.6 ms | GPU0 86.7 GPU1 11.0 CPU 1.1 PCIe 1.2
+  depth 130048 read at 1520.5 tok/s
+  depth 130048 K=1 decode  71.9 tok/s, 1.81 tok/pass, pass 23.7 ms | GPU0 86.8 GPU1 10.7 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  73.7 tok/s, 2.15 tok/pass, pass 26.7 ms | GPU0 86.9 GPU1 10.8 CPU 1.0 PCIe 1.3
+  depth 130048 K=2 decode  69.4 tok/s, 2.02 tok/pass, pass 26.7 ms | GPU0 86.0 GPU1 11.6 CPU 1.1 PCIe 1.3
+  depth 250000 read at 1432.2 tok/s
+  depth 250000 K=1 decode  67.8 tok/s, 1.77 tok/pass, pass 24.7 ms | GPU0 86.3 GPU1 11.6 CPU 1.0 PCIe 1.2
+  depth 250000 K=2 decode  69.8 tok/s, 2.11 tok/pass, pass 27.6 ms | GPU0 87.3 GPU1 10.6 CPU 0.9 PCIe 1.1
+  depth 250000 K=2 decode  68.6 tok/s, 2.09 tok/pass, pass 27.9 ms | GPU0 86.8 GPU1 11.0 CPU 1.0 PCIe 1.2
+### restored (canonical config) 09:44:43

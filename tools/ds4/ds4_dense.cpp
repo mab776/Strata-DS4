@@ -53,6 +53,24 @@ bool async_on();
 // be (mab776 M11, DS4_ASYNC): the decode backend - a real allocation (first use, or after the shared buffer moved) may
 // grow the shared arena and FREE the old buffer while an async graph still runs on its intermediates (cudaFree only
 // "may" synchronize), so the stream is drained first.  The cached path (every other call) never waits.
+// mab776 M12c (DS4_F16_ACC32, default on): the decode graphs' F16-weight matmuls - the hyper-connection mixes, the
+// compressors' and the indexer's projections, the MTP head's eh_proj (the loader makes F16 of our file's F32 / Q8_0
+// tensors because the geometry wants F16) - ask ggml for fp32 accumulation.  ggml-cuda's default for an F16 weight in
+// its vector kernel (every one-token step, and every verify pass with GGML_MMVF_F16_MAX) is half2 accumulation with
+// the activations rounded to half; llama.cpp multiplies these from the GGUF's F32 tensors in F32.  The router already
+// asked for F32.  Prompt chunks (their own allocator, never this function) keep their kernels.  DS4_F16_ACC32=0: the
+// default precision as before.
+bool f16_acc32_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_F16_ACC32"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+void f16_acc32(ggml_cgraph * g) {
+    const int nn = ggml_graph_n_nodes(g);
+    for (int i = 0; i < nn; ++i) {
+        ggml_tensor * t = ggml_graph_node(g, i);
+        if (t->op == GGML_OP_MUL_MAT && t->src[0] && t->src[0]->type == GGML_TYPE_F16) ggml_prec_set_acc(t, GGML_PREC_F32);
+    }
+}
 bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr) {
     static const bool reuse = [] { const char * e = std::getenv("DS4_GRAPH_REUSE"); return !e || std::atoi(e) != 0; }();
     static std::map<const void *, uint64_t> epoch;                  // per allocator
@@ -79,6 +97,7 @@ bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr)
         for (int i = 0; i < g->n_leafs; ++i) unbind(g->leafs[i]);
     }
     if (be && async_on()) ggml_backend_synchronize(be);
+    if (f16_acc32_on()) f16_acc32(g);   // mab776 M12c: op params only, before the graph's first (re)capture
     const size_t before = ggml_gallocr_get_buffer_size(a, 0);
     if (!ggml_gallocr_alloc_graph(a, g)) return false;
     if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++ep;   // the buffer moved
@@ -364,6 +383,7 @@ struct Ds4Dense::Impl {
     ggml_backend_buffer_t pred_hbuf = nullptr;
     void * pred_host = nullptr;
     ggml_backend_event_t ev_pred = nullptr, ev_sum = nullptr;
+    ggml_backend_event_t ev_attn = nullptr;   // mab776 M12b: recorded after a queued attention graph (DS4_DEV_ROUTE)
     int  pred_il = -1;          // the layer whose predict readback is in flight
     bool ovl_tried = false;
     bool ovl_setup() {
@@ -381,7 +401,8 @@ struct Ds4Dense::Impl {
         pred_hbuf = ggml_backend_buft_alloc_buffer(hbt, kPredHost);
         ev_pred = ggml_backend_event_new(dev);
         ev_sum = ggml_backend_event_new(dev);
-        if (!pred_hbuf || !ev_pred || !ev_sum) { ovl_free(); return false; }
+        ev_attn = ggml_backend_event_new(dev);
+        if (!pred_hbuf || !ev_pred || !ev_sum || !ev_attn) { ovl_free(); return false; }
         pred_host = ggml_backend_buffer_get_base(pred_hbuf);
         return true;
     }
@@ -389,7 +410,8 @@ struct Ds4Dense::Impl {
         if (pred_hbuf) ggml_backend_buffer_free(pred_hbuf);
         if (ev_pred) ggml_backend_event_free(ev_pred);
         if (ev_sum) ggml_backend_event_free(ev_sum);
-        pred_hbuf = nullptr; pred_host = nullptr; ev_pred = nullptr; ev_sum = nullptr;
+        if (ev_attn) ggml_backend_event_free(ev_attn);
+        pred_hbuf = nullptr; pred_host = nullptr; ev_pred = nullptr; ev_sum = nullptr; ev_attn = nullptr;
     }
     uint8_t * pf_out_host = nullptr;
     float *   pf_fn = nullptr;
@@ -2090,19 +2112,30 @@ bool Ds4Dense::begin_tokens(const int * tids, int n) {
     return true;
 }
 
-// predict's host half: the hash layers' ids as read, else the top n_top of the router scores (ties keep index order
-// as std::partial_sort leaves them - the same pick whichever way the readback came)
+static bool pf_hash_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_PF_HASH"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+
+// predict's host half: the hash layers' ids, else the top n_top of the router scores (ties keep index order as
+// std::partial_sort leaves them - the same pick whichever way the readback came)
 static void predict_pick(Ds4Dense::Impl & im, int il, const void * raw, int * top_ids, int n_top) {
     ggml_tensor * out = im.ly[(size_t) il].predict_out;
     const size_t ne = (size_t) ggml_nelements(out);
     if (il < (int) im.g.hash_layer_count) {
-        // NOTE (found 10-11, kept as is): build_predict casts tid2eid's I32 rows to F32, so these "ids" are float bit
-        // patterns that prefetch() drops as out of range - the hash layers get no hint.  The fix (read floats) moves
-        // expert placement on 3 layers: an A/B of its own.
-        std::vector<int32_t> ids(ne);
-        std::memcpy(ids.data(), raw, ne * 4);
+        // build_predict casts tid2eid's I32 rows to F32.  mab776 M12a (DS4_PF_HASH, default on): read them as the
+        // floats they are - token 0's exact experts, so the hash layers get a hint that is always right.
+        // DS4_PF_HASH=0: the old int32 read (float bit patterns, which prefetch() dropped as out of range: no hint).
         const int n = std::min<int>(n_top, (int) ne);
-        for (int i = 0; i < n; ++i) top_ids[i] = ids[(size_t) i];
+        if (pf_hash_on() && out->type == GGML_TYPE_F32) {
+            std::vector<float> f(ne);
+            std::memcpy(f.data(), raw, ne * 4);
+            for (int i = 0; i < n; ++i) top_ids[i] = (int) f[(size_t) i];
+        } else {
+            std::vector<int32_t> ids(ne);
+            std::memcpy(ids.data(), raw, ne * 4);
+            for (int i = 0; i < n; ++i) top_ids[i] = ids[(size_t) i];
+        }
         return;
     }
     std::vector<float> sel(ne);
@@ -2865,6 +2898,21 @@ bool Ds4Dense::prefill_end() {
 }
 
 void Ds4Dense::prefill_release() { p_->pf_free(); }
+
+const void * Ds4Dense::router_block_device(int il, int64_t * blk, int64_t * ids_off) const {
+    const Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || ggml_backend_is_cpu(im.backend) || !im.ly[(size_t) il].o_span) return nullptr;
+    if (blk) *blk = im.o_blk;
+    if (ids_off) *ids_off = im.o_ids_off;
+    return im.ly[(size_t) il].o_span->data;
+}
+
+void * Ds4Dense::record_attn_event() {
+    Impl & im = *p_;
+    if (!im.ovl_setup() || !im.ev_attn) return nullptr;
+    ggml_backend_event_record(im.ev_attn, im.backend);   // behind whatever is queued: the attention graph just launched
+    return im.ev_attn->context;
+}
 
 void * Ds4Dense::decode_sum_event() {
     Impl & im = *p_;
