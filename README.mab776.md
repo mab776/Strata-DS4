@@ -375,6 +375,32 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   10-10 23:04 (snapshot 2bed102c); post-deploy through the server: smoke OK; prefill **1,530** at 127k (was 1,337)
   and **1,428** at 250k (was 1,248); decode unchanged (K=2 59.7 / 61.2, K=1 53.2 / 56.5); A-B-A: A2 reused 92,808 of
   92,957, TTFT 1.27 s, a fresh 92.8k read 61.6 s (was 70.8).  Rollback: env DS4_PF_EMIT=0 / DS4_PF_HCAB=0.
+
+## Session 2026-10-10 night - M11 decode (Marc's plan via the DeepSeek session: solo, one agent max)
+- **Where a step goes** (read-only survey, one agent): a plain step is driven from the host - per layer a predict
+  graph (expert prefetch hint), the attention+router graph (165-243 nodes), the expert tier (host placement, GPU 0 hits
+  + PCIe on one stream, CPU pool, GPU 1, the weighted sum on the host in double) and the finish graph: 131 graph
+  computes and ~300 blocking waits per token, nothing overlapping across layers.  M7a's split: attention+router 13-15
+  ms, experts ~6 ms - against a dense-weight read floor of ~5 ms.  ~8,600 kernels a token at ~1.5-2 us each = the
+  attention phase: the node count, not the bytes, is the cost.
+- **Prompt-lookup drafts (2bed102c + ae329f7f, `--lookup 7`, deployed)**: when the context's last 3 tokens occurred
+  earlier (prompt + output), the tokens that followed there are the next pass's drafts instead of the MTP chain.
+  Exact for any deterministic draft (verify_row: accept with p(draft), else sample p without it); the MTP block still
+  runs over the verified positions.  Policy after 3 A/B rounds (bench/mab776-m2/work/m11/lookab.py, greedy, mtp_k=2
+  forced, lookup 0/7 alternating from the same restored checkpoint):
+  - the occurrence must match G + 1 tokens back; a match of M drafts M - G + 1 (a copied file: 7);
+  - `--lookup-agree 1`: copy only when its first token is the MTP head's first guess (else the chain continues from
+    it, no pass lost) - this turned fresh code from -8 % / -3.5 % into +4 %;
+  - a lookup pass with less than half right sits the lookup out 1, 2, 4 .. 64 passes;
+  - greedy requests without a key: `--lookup-greedy` (default 0, like --mtp-k-greedy); sampled: --lookup; the
+    request's `strata_tune.lookup` wins.
+
+  | prompt (decode tok/s) | MTP K=2 | + lookup 7 | |
+  |---|---:|---:|---|
+  | rewrite a shell script with a rename | 74.6 | **105.7** | +42 %, 5 tokens a pass |
+  | edit a JSON config (round 2) | 74.5 | **108.3** | +45 % |
+  | fresh code (LRU cache + tests) | 66.3 | 69.0 | +4 % |
+  | fresh prose | 58.4 | 60.1 | neutral |
   Two lessons from the windows: a second, overlapping GPU window (an `&` waiter that `ps` didn't show) killed the
   other's runs through the shared container name - gpuwin now holds a flock; and SIGTERM did not stop a window
   script - windows stop through a STOP file checked between runs.

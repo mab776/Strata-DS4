@@ -27,6 +27,10 @@ at long context:
 - **Speculative decoding** with DeepSeek's own MTP head, using exact speculative sampling (the output distribution is
   unchanged). The head can draft **chained tokens** (K per verify pass; K=2 is the fastest), and its experts run on
   GPU 1.
+- **Prompt-lookup drafts** beside the MTP head. When the output starts copying its context (a code edit, a file
+  rewrite, a quoted tool result), the copied tokens become up to 7 drafts per pass. That makes file and config edits
+  40-45 % faster to decode; fresh text is unchanged. A copy is drafted only when its first token matches the MTP head's
+  own guess.
 - **Prefill kernels for long prompts:**
   - chunked prefill (2,048 tokens) on MMQ, with FP4 MMQ for the MXFP4 layers;
   - a tensor-core lightning indexer (`tools/ds4/patches/ggml-lightning-indexer-mma.patch`). With env `GGML_LI_I8=1`
@@ -100,11 +104,13 @@ The engine flags that matter are all in [tools/ds4/ds4-server.json.example](tool
 | `--vram-margin 9 --vram-grow 2` | GPU 0's elastic cache |
 | `--prefill-chunk 2048 --chunk-mmq --chunk-prestage`, env `STRATA_MMQ_FP4=1 GGML_LI_I8=1` | prefill (FP4 MMQ for the MXFP4 layers, int8 indexer) |
 | `--mtp DeepSeek-V4-Flash-MTP-bf16.gguf --mtp-device 1 --mtp-k 2` | speculative decoding (K drafts per pass; greedy requests: `--mtp-k-greedy`, default 1) |
+| `--lookup 7` | prompt-lookup drafts for sampled requests (greedy ones: `--lookup-greedy`, default 0) |
 | `--park-mib 4096` | conversation parking |
 | `--comp-type iq4_nl --icomp-q8` | compressed KV cache |
 | `--arena-gib 41` | pinned RAM arena |
 
-A request can change the draft depth for itself with `"strata_tune": {"mtp_k": K}`, where 0 means plain decoding.
+A request can change the draft depth for itself with `"strata_tune": {"mtp_k": K}`, where 0 means plain decoding, and
+its lookup drafts with `"strata_tune": {"lookup": L}`, where 0 turns them off.
 
 The Portainer stack this runs in (Dockerfile, compose file, snapshot/deploy scripts) is described in the log.
 
