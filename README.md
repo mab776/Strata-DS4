@@ -28,7 +28,9 @@ at long context:
   unchanged). The head can draft **chained tokens** (K per verify pass; K=2 is the fastest), and its experts run on
   GPU 1.
 - **Decode with fewer host round trips.** The dense half's graphs and hand-offs are queued on the GPU stream without a
-  host wait per graph, and each hyper-connection's gates run as one fused op instead of eight tiny kernels.
+  host wait per graph. Each hyper-connection's gates run as one fused op instead of eight tiny kernels. A verify
+  pass mixes its experts' outputs on the GPU, in the same double-precision order as the host loop it replaces, so the
+  bits are unchanged. Together these make a two-draft verify pass ~6.5 % faster.
 - **Prompt-lookup drafts** beside the MTP head. When the output starts copying its context (a code edit, a file
   rewrite, a quoted tool result), the copied tokens become up to 7 drafts per pass. That makes file and config edits
   40-45 % faster to decode; fresh text is unchanged. A copy is drafted only when its first token matches the MTP head's
@@ -59,9 +61,9 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 
 | context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
-| 8k   | 1,100-1,250 | 1,011 | 60-68 / 56-63 | 40.8 |
-| 127k | **1,530**   | 843   | **60** / 53-57 | 39.0 |
-| 250k | **1,428**   | 693   | **61** / 55-57 | ~36 |
+| 8k   | 1,100-1,250 | 1,011 | 67-69 / 63-65 | 40.8 |
+| 127k | **1,530**   | 843   | **68-69** / 64 | 39.0 |
+| 250k | **1,428**   | 693   | **65-67** / 61-62 | ~36 |
 
 - **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
   tokens on average.
