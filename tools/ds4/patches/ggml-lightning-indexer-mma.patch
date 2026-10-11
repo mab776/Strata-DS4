@@ -1,6 +1,6 @@
 --- a/ggml/src/ggml-cuda/lightning-indexer.cu
 +++ b/ggml/src/ggml-cuda/lightning-indexer.cu
-@@ -382,6 +382,186 @@
+@@ -382,6 +382,364 @@
      }
  }
  
@@ -181,13 +181,191 @@
 +    return cudaGetLastError();
 +}
 +
++__device__ __forceinline__ void mma_s8_16832(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++__device__ __forceinline__ uint32_t pack_s8x4(float a, float b, float c, float d, float inv) {
++    const int ia = __float2int_rn(a * inv), ib = __float2int_rn(b * inv), ic = __float2int_rn(c * inv), id = __float2int_rn(d * inv);
++    return (uint32_t) (ia & 0xff) | ((uint32_t) (ib & 0xff) << 8) | ((uint32_t) (ic & 0xff) << 16) | ((uint32_t) (id & 0xff) << 24);
++}
++
++// ---------------------------------------------------------------------------------------------------------------------
++// mab776 M10b: int8 with ONE scale per 128-dim vector on both sides, so the four m16n8k32 MMAs accumulate the whole dot
++// product in int32 inside the tensor core: K's four Q8_0 blocks are re-quantized at tile load to the key's own scale
++// (max over its 128 dims), Q per head row; the two scales apply once per tile (folded into the head weight / per key).
++template <int TK>
++struct SmemI8B {
++    static constexpr int KROW = 144;
++    int8_t ks[TK][KROW];
++    float  kd[TK];
++    float  out[8][TK];
++    float  ws[8][64];
++};
++
++template <int TK, bool MC = false>
++__global__ void __launch_bounds__(256) kernel_i8b(
++        const float * __restrict__ Q, const char * __restrict__ K, const float * __restrict__ W,
++        const void * __restrict__ M, float * __restrict__ dst,
++        int n_batch, int n_kv,
++        size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++    NO_DEVICE_CODE;
++#else
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    SmemI8B<TK> & S = *reinterpret_cast<SmemI8B<TK> *>(smem_raw);
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int kv0 = blockIdx.x * TK, q0 = blockIdx.y * 8, stream = blockIdx.z;
++    const char * kbase = K + (size_t) stream * nbk3;
++
++    // ---- K tile: lanes 4m..4m+3 own the 4 blocks of one row -> the row's absmax by two shuffles, then re-quantize
++    for (int i = tid; i < TK * 4; i += 256) {                // TK * 4 is a multiple of 32: whole warps
++        const int r = i >> 2, b = i & 3, kv = kv0 + r;
++        int8_t v[32];
++        float d = 0.f;
++        int amax = 0;
++        if (kv < n_kv) {
++            const block_q8_0_t * blk = reinterpret_cast<const block_q8_0_t *>(kbase + (size_t) kv * nbk2) + b;
++            d = __half2float(blk->d);
++            const short * qs2 = reinterpret_cast<const short *>(blk->qs);
++            #pragma unroll
++            for (int j = 0; j < 16; ++j) {
++                const short p = qs2[j];
++                v[2 * j] = (int8_t) (p & 0xff);
++                v[2 * j + 1] = (int8_t) ((p >> 8) & 0xff);
++                amax = max(amax, max(abs((int) v[2 * j]), abs((int) v[2 * j + 1])));
++            }
++        } else {
++            #pragma unroll
++            for (int j = 0; j < 32; ++j) v[j] = 0;
++        }
++        float bmax = d * (float) amax;
++        bmax = fmaxf(bmax, __shfl_xor_sync(0xffffffffu, bmax, 1));
++        bmax = fmaxf(bmax, __shfl_xor_sync(0xffffffffu, bmax, 2));
++        const float kd = bmax / 127.f;                       // the key's scale
++        const float f = kd > 0.f ? d / kd : 0.f;             // this block's values in units of it
++        int8_t * o = &S.ks[r][b * 32];
++        #pragma unroll
++        for (int j = 0; j < 32; j += 4) {
++            const int a0 = __float2int_rn((float) v[j] * f), a1 = __float2int_rn((float) v[j + 1] * f);
++            const int a2 = __float2int_rn((float) v[j + 2] * f), a3 = __float2int_rn((float) v[j + 3] * f);
++            *reinterpret_cast<uint32_t *>(o + j) = (uint32_t) (a0 & 0xff) | ((uint32_t) (a1 & 0xff) << 8) |
++                                                   ((uint32_t) (a2 & 0xff) << 16) | ((uint32_t) (a3 & 0xff) << 24);
++        }
++        if (b == 0) S.kd[r] = kd;
++    }
++    for (int i = tid; i < 8 * 64; i += 256) {
++        const int ql = i >> 6, h = i & 63, q = q0 + ql;
++        S.ws[ql][h] = q < n_batch ? W[(size_t) stream * nbw3 / 4 + ((size_t) q * nbw1) / 4 + h] : 0.f;
++    }
++    for (int i = tid; i < 8 * TK; i += 256) (&S.out[0][0])[i] = 0.f;
++    __syncthreads();
++
++    const int q = q0 + warp;
++    if (q < n_batch) {
++        const char * qbase = reinterpret_cast<const char *>(Q) + (size_t) stream * nbq3 + (size_t) q * nbq2;
++        const int r0 = lane >> 2, c4 = (lane & 3) * 4, c2 = (lane & 3) * 2;
++        #pragma unroll 1
++        for (int hg = 0; hg < 4; ++hg) {
++            const float * qh0 = reinterpret_cast<const float *>(qbase + (size_t) (hg * 16 + r0) * nbq1);
++            const float * qh1 = reinterpret_cast<const float *>(qbase + (size_t) (hg * 16 + r0 + 8) * nbq1);
++            float4 x[4][4];
++            float m0 = 0.f, m1 = 0.f;
++            #pragma unroll
++            for (int kb = 0; kb < 4; ++kb) {
++                x[kb][0] = *reinterpret_cast<const float4 *>(qh0 + kb * 32 + c4);
++                x[kb][1] = *reinterpret_cast<const float4 *>(qh1 + kb * 32 + c4);
++                x[kb][2] = *reinterpret_cast<const float4 *>(qh0 + kb * 32 + c4 + 16);
++                x[kb][3] = *reinterpret_cast<const float4 *>(qh1 + kb * 32 + c4 + 16);
++                m0 = fmaxf(m0, fmaxf(fmaxf(fmaxf(fabsf(x[kb][0].x), fabsf(x[kb][0].y)), fmaxf(fabsf(x[kb][0].z), fabsf(x[kb][0].w))),
++                                     fmaxf(fmaxf(fabsf(x[kb][2].x), fabsf(x[kb][2].y)), fmaxf(fabsf(x[kb][2].z), fabsf(x[kb][2].w)))));
++                m1 = fmaxf(m1, fmaxf(fmaxf(fmaxf(fabsf(x[kb][1].x), fabsf(x[kb][1].y)), fmaxf(fabsf(x[kb][1].z), fabsf(x[kb][1].w))),
++                                     fmaxf(fmaxf(fabsf(x[kb][3].x), fabsf(x[kb][3].y)), fmaxf(fabsf(x[kb][3].z), fabsf(x[kb][3].w)))));
++            }
++            m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 1)); m0 = fmaxf(m0, __shfl_xor_sync(0xffffffffu, m0, 2));
++            m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 1)); m1 = fmaxf(m1, __shfl_xor_sync(0xffffffffu, m1, 2));
++            const float d0 = m0 / 127.f, d1 = m1 / 127.f;
++            const float i0 = d0 > 0.f ? 1.f / d0 : 0.f, i1 = d1 > 0.f ? 1.f / d1 : 0.f;
++            uint32_t a[4][4];
++            #pragma unroll
++            for (int kb = 0; kb < 4; ++kb) {
++                a[kb][0] = pack_s8x4(x[kb][0].x, x[kb][0].y, x[kb][0].z, x[kb][0].w, i0);
++                a[kb][1] = pack_s8x4(x[kb][1].x, x[kb][1].y, x[kb][1].z, x[kb][1].w, i1);
++                a[kb][2] = pack_s8x4(x[kb][2].x, x[kb][2].y, x[kb][2].z, x[kb][2].w, i0);
++                a[kb][3] = pack_s8x4(x[kb][3].x, x[kb][3].y, x[kb][3].z, x[kb][3].w, i1);
++            }
++            const float w0 = S.ws[warp][hg * 16 + r0] * d0, w1 = S.ws[warp][hg * 16 + r0 + 8] * d1;
++            #pragma unroll 1
++            for (int cc = 0; cc < TK / 64; ++cc) {
++                int c[8][4];
++                #pragma unroll
++                for (int nt = 0; nt < 8; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0;
++                #pragma unroll
++                for (int kb = 0; kb < 4; ++kb) {
++                    #pragma unroll
++                    for (int nt = 0; nt < 8; ++nt) {
++                        const int8_t * kr = &S.ks[cc * 64 + nt * 8 + r0][kb * 32 + c4];
++                        mma_s8_16832(c[nt], a[kb], *reinterpret_cast<const uint32_t *>(kr),
++                                     *reinterpret_cast<const uint32_t *>(kr + 16));
++                    }
++                }
++                #pragma unroll
++                for (int nt = 0; nt < 8; ++nt) {
++                    const int col = cc * 64 + nt * 8 + c2;
++                    const float kd0 = S.kd[col], kd1 = S.kd[col + 1];
++                    float v0 = (fmaxf((float) c[nt][0], 0.f) * w0 + fmaxf((float) c[nt][2], 0.f) * w1) * kd0;
++                    float v1 = (fmaxf((float) c[nt][1], 0.f) * w0 + fmaxf((float) c[nt][3], 0.f) * w1) * kd1;
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 4);  v1 += __shfl_xor_sync(0xffffffffu, v1, 4);
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 8);  v1 += __shfl_xor_sync(0xffffffffu, v1, 8);
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 16); v1 += __shfl_xor_sync(0xffffffffu, v1, 16);
++                    if (r0 == 0) {
++                        S.out[warp][col] += v0;
++                        S.out[warp][col + 1] += v1;
++                    }
++                }
++            }
++        }
++    }
++    __syncthreads();
++    for (int i = tid; i < 8 * TK; i += 256) {
++        const int ql = i / TK, k = i % TK, qq = q0 + ql, kv = kv0 + k;
++        if (qq < n_batch && kv < n_kv) {
++            const char * mrow = reinterpret_cast<const char *>(M) + (size_t) qq * nbm1 + (size_t) (stream % nem3) * nbm3;
++            float * d = reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + (size_t) qq * nb1 + (size_t) stream * nb3);
++            if constexpr (MC) {
++                d[kv] = S.out[ql][k] + ((float) kv < *reinterpret_cast<const float *>(mrow) ? 0.0f : -INFINITY);
++            } else {
++                d[kv] = S.out[ql][k] + __half2float(reinterpret_cast<const half *>(mrow)[kv]);
++            }
++        }
++    }
++#endif
++}
++
++template <int TK, bool MC = false>
++inline cudaError_t launch_i8b(const float * Q, const char * K, const float * W, const void * M, float * dst,
++                              int n_stream, int n_batch, int n_kv,
++                              size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
++                              size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3, cudaStream_t s) {
++    const size_t smem = sizeof(SmemI8B<TK>);
++    cudaFuncSetAttribute(kernel_i8b<TK, MC>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
++    dim3 grid((n_kv + TK - 1) / TK, (n_batch + 7) / 8, n_stream);
++    kernel_i8b<TK, MC><<<grid, 256, smem, s>>>(Q, K, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
++                                               nbw1, nbw3, nbm1, nbm3, nem3);
++    return cudaGetLastError();
++}
++
 +}  // namespace li_mma
 +#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 +
  #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
      if (K->type == (type_K)) {                                                              \
          lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
-@@ -406,7 +586,9 @@
+@@ -406,7 +764,9 @@
      GGML_ASSERT(dst->type == GGML_TYPE_F32);
      GGML_ASSERT(  q->type == GGML_TYPE_F32);
      GGML_ASSERT(  w->type == GGML_TYPE_F32);
@@ -198,7 +376,7 @@
  
      GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
      GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
-@@ -436,6 +618,7 @@
+@@ -436,6 +796,7 @@
      const int n_batch  = q->ne[2];
      const int n_stream = q->ne[3];
      const int n_kv     = k->ne[2];
@@ -206,7 +384,7 @@
  
      const float *   q_d = (const float *)   q->data;
      const char  *   k_d = (const char  *)   k->data;
-@@ -448,6 +631,28 @@
+@@ -448,6 +809,38 @@
  
      if (n_embd == 128 && n_head == 64) {
  #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -216,6 +394,16 @@
 +        if (li_mma_on && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
 +            (k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_F16)) {
 +            const void * mv = m->data;
++            // mab776 M10b, GGML_LI_I8=1 (opt-in): int8 tensor cores with one scale per 128-dim vector (q8_0 keys)
++            static const bool li_i8 = [] { const char * e = getenv("GGML_LI_I8"); return e && atoi(e) != 0; }();
++            if (li_i8 && k->type == GGML_TYPE_Q8_0) {
++                CUDA_CHECK((m_counts
++                    ? li_mma::launch_i8b<256, true>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                                    nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())
++                    : li_mma::launch_i8b<256>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
++                                              nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())));
++                return;
++            }
 +            if (k->type == GGML_TYPE_Q8_0) {
 +                CUDA_CHECK((m_counts
 +                    ? li_mma::launch<128, true, true>(q_d, k_d, w_d, mv, dst_d, n_stream, n_batch, n_kv, nb1, nb3,
@@ -235,7 +423,7 @@
          if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
              // use wmma kernel
              constexpr int K_VECS_PER_BLOCK = 32;
-@@ -534,7 +739,6 @@
+@@ -534,7 +927,6 @@
  }
  
  bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
@@ -243,7 +431,7 @@
  
      const ggml_tensor * q = dst->src[0];
      const ggml_tensor * k = dst->src[1];
-@@ -560,6 +764,18 @@
+@@ -560,6 +952,18 @@
          return false;
      }
  
