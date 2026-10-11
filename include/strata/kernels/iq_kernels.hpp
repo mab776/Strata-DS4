@@ -69,6 +69,8 @@ bool native_expert_supported3(int gate_type, int up_type, int d_type, int64_t n_
 size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// out[t] = sum_k w[t*K + k] * parts[t*K + k] over rows of H floats, t < n (device pointers; the prompt chunk's mix).
 void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
+// mab776 M11: in double, k in order, no FMA - bit for bit the decode tier's host mix
+void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
 
 /// Grouped experts in the native format: group g's blob at device address grp_ptr[g]; its entries
 /// [grp_start[g], grp_start[g+1]) read token ent_tok[e]'s q8_1 activation (n_embd/32 blocks per token in x_q8_1)

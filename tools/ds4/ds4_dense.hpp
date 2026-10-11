@@ -189,6 +189,10 @@ public:
     /// backend.  An expert tier on the same device can write the sums there; prefill_finish(il, nullptr) then skips
     /// the host upload (which would queue behind the tier's expert DMAs on the copy engine).
     void * prefill_routed_device();
+    /// mab776 M11 (DS4_DEV_SUM): the decode routed-sum tensor on the device (kNtMax * n_embd floats, token-major), or
+    /// NULL on the CPU backend - the expert tier on GPU 0 mixes straight into it; finish_layer_n(il, n, nullptr) then
+    /// skips the upload
+    void * decode_routed_device();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

@@ -342,7 +342,12 @@ public:
     bool in_arena(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
-    bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
+    // out_dev (mab776 M11, DS4_DEV_SUM): the routed sums go straight into this device tensor (GPU 0, nt rows of n_embd
+    // floats) instead of `out` - which then holds nothing; the CPU tier and the diagnostics still fill `out`, so the caller
+    // asks dev_sum_used() before relying on it
+    bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out,
+                   void* out_dev = nullptr);
+    bool dev_sum_used() const;   ///< the last run_multi wrote out_dev (mab776 M11)
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.

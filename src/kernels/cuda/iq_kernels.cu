@@ -2812,4 +2812,26 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
     check("weighted_rows_sum");
 }
 
+// mab776 M11: the same mix in DOUBLE, k in order, one rounding per multiply and per add (__dmul_rn / __dadd_rn: no
+// fused multiply-add) and a round-to-nearest cast - bit for bit the decode tier's host loop (gpu_run_n), which it
+// replaces so the parts no longer come back to the host
+__global__ void weighted_rows_sum_f64_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K,
+                                             int64_t H, int64_t n, float* __restrict__ out) {
+    const int64_t total = n * H;
+    for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
+        const int64_t t = q / H, i = q - t * H;
+        double acc = 0.0;
+        for (int k = 0; k < K; ++k)
+            acc = __dadd_rn(acc, __dmul_rn((double) w[t * K + k], (double) parts[(t * K + k) * H + i]));
+        out[q] = __double2float_rn(acc);
+    }
+}
+
+void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream) {
+    const int64_t total = n * H;
+    const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 65535);
+    weighted_rows_sum_f64_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out);
+    check("weighted_rows_sum_f64");
+}
+
 }  // namespace strata::kernels

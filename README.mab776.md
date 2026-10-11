@@ -20,8 +20,10 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   `--mtp ... --mtp-device 1 --mtp-k 2` (speculative decoding with two chained drafts for sampled requests; greedy
   requests fall back to one, `--mtp-k-greedy` 1; a request's `strata_tune.mtp_k` wins, 0 = none) `--park-mib 4096`
   (conversation parking) `--arena-gib 41` + env `GGML_LI_I8=1` (the lightning indexer on int8 tensor cores, 10-10
-  night; drop the line for the fp16 kernel, no rebuild); the engine's own defaults since 10-10 late: emit-only
-  compressors + batched HCA (env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 = the old paths). ~42 GiB container RAM, mem_limit 50g.
+  night; drop the line for the fp16 kernel, no rebuild) + `--lookup 7` (prompt-lookup drafts, sampled requests); the
+  engine's own defaults since 10-10/11 night: emit-only compressors + batched HCA (prefill), async decode hand-offs +
+  the fused hc gates op (decode) - env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 / DS4_ASYNC=0 / DS4_HC_GATES=0 = the old paths.
+  ~42 GiB container RAM, mem_limit 50g.
 - **Measured through the server (10-10 late: int8 indexer + emit-only compressors + batched HCA)**: prefill
   1,100-1,250 / **1,530** / **1,428** tok/s at 8k / 127k / 250k (morning: 1,297 / 1,192; stack 73: 1011 / 843 / 693);
   decode K=2 60-68 / **60** / **61**, K=1 56-63 / 53-57 / 55-57, plain 47 / 45 / 43 (stack 73 with its drafter 40.8 /

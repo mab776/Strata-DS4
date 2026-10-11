@@ -27,6 +27,8 @@ at long context:
 - **Speculative decoding** with DeepSeek's own MTP head, using exact speculative sampling (the output distribution is
   unchanged). The head can draft **chained tokens** (K per verify pass; K=2 is the fastest), and its experts run on
   GPU 1.
+- **Decode with fewer host round trips.** The dense half's graphs and hand-offs are queued on the GPU stream without a
+  host wait per graph, and each hyper-connection's gates run as one fused op instead of eight tiny kernels.
 - **Prompt-lookup drafts** beside the MTP head. When the output starts copying its context (a code edit, a file
   rewrite, a quoted tool result), the copied tokens become up to 7 drafts per pass. That makes file and config edits
   40-45 % faster to decode; fresh text is unchanged. A copy is drafted only when its first token matches the MTP head's

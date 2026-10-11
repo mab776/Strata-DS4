@@ -2332,12 +2332,14 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum) {
     Impl::Layer & L = im.ly[(size_t) il];
     if (!alloc_graph(L.allo_finish[n], L.gf_finish[n], im.backend)) { im.err = "gallocr(finish) failed"; return false; }
     const size_t rbytes = (size_t) (im.D * n) * 4;
-    if (async_on() && !im.dec_routed) {   // once: D x kNtMax floats, pinned when the backend has a host buffer type
+    if (!routed_sum) {}   // mab776 M11 (DS4_DEV_SUM): the expert tier mixed straight into im.routed_sum on the device
+    else if (async_on() && !im.dec_routed) {   // once: D x kNtMax floats, pinned when the backend has a host buffer type
         if (ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend)))
             if ((im.dec_hbuf = ggml_backend_buft_alloc_buffer(hbt, (size_t) (im.D * kNtMax) * 4)))
                 im.dec_routed = (float *) ggml_backend_buffer_get_base(im.dec_hbuf);
     }
-    if (async_on() && im.dec_routed) {   // the previous upload from it finished: a readback waited since
+    if (!routed_sum) {}
+    else if (async_on() && im.dec_routed) {   // the previous upload from it finished: a readback waited since
         std::memcpy(im.dec_routed, routed_sum, rbytes);
         ggml_backend_tensor_set_async(im.backend, im.routed_sum, im.dec_routed, 0, rbytes);
     } else {
@@ -2776,6 +2778,12 @@ bool Ds4Dense::prefill_end() {
 }
 
 void Ds4Dense::prefill_release() { p_->pf_free(); }
+
+void * Ds4Dense::decode_routed_device() {
+    Impl & im = *p_;
+    if (ggml_backend_is_cpu(im.backend) || !im.routed_sum) return nullptr;
+    return im.routed_sum->data;
+}
 
 void * Ds4Dense::prefill_routed_device() {
     Impl & im = *p_;

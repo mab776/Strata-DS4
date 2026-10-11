@@ -941,6 +941,7 @@ bool Server::step_n(const int * toks, int n, int pos0) {
             dense.set_route_bias(l, rb.data());
         }
     if (!dense.begin_tokens(toks, n)) { err = dense.last_error(); return false; }
+    void * const rdev = mc.cpu_only ? nullptr : dense.decode_routed_device();
     for (int l = 0; l < n_layer; ++l) {
         if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {   // token 0's hint
             int m = 0;
@@ -950,11 +951,13 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         const float * x = nullptr;
         if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x)) { err = dense.last_error(); return false; }
         for (int k = 0; k < top_k * n; ++k) ids32_n[(size_t) k] = ids_n[(size_t) k];
-        if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data())) {
+        // mab776 M11 (DS4_DEV_SUM): the tier mixes the experts' rows on the card straight into the dense half's
+        // routed-sum tensor (bit for bit its host mix) - no rows back, no upload
+        if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data(), rdev)) {
             err = "tier.run_multi refused at layer " + std::to_string(l);
             return false;
         }
-        if (!dense.finish_layer_n(l, n, routed_n.data())) { err = dense.last_error(); return false; }
+        if (!dense.finish_layer_n(l, n, rdev && tier.dev_sum_used() ? nullptr : routed_n.data())) { err = dense.last_error(); return false; }
     }
     return true;
 }

@@ -141,6 +141,8 @@ struct Gpu {
     cudaStream_t s_pf = nullptr;  ///< the prefetch stream (never the main one: the DMAs run under the dense work)
     cudaEvent_t ev_pf = nullptr;
     cudaStream_t s_dma = nullptr; ///< mab776 M11 (DS4_PCIE_EARLY): the PCIe share's DMAs, ahead of the hits kernel
+    void* d_w = nullptr;          ///< mab776 M11 (DS4_DEV_SUM): a pass's routing weights on the card (kMaxEnt floats)
+    float* h_w = nullptr;         ///< ... their pinned staging
     cudaEvent_t ev_dma = nullptr;
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
@@ -195,6 +197,8 @@ struct Gpu {
         if (ev_pf) cudaEventDestroy(ev_pf);
         if (s_pf) cudaStreamDestroy(s_pf);
         if (s_dma) cudaStreamDestroy(s_dma);
+        if (d_w) cudaFree(d_w);
+        if (h_w) cudaFreeHost(h_w);
         if (ev_dma) cudaEventDestroy(ev_dma);
         if (s) cudaStreamDestroy(s);
         if (h_dummy) cudaFreeHost(h_dummy);
@@ -368,6 +372,7 @@ struct Ds4MoeImpl {
     std::vector<uint8_t> nact;        ///< the Q8_K activation the CPU kernel consumes
     std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
+    bool last_dev_sum = false;        ///< mab776 M11: the last run_multi mixed on the card (DS4_DEV_SUM)
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
     std::vector<uint8_t> ftmp;        ///< the file tier's read buffer, top_k blobs
@@ -1377,6 +1382,8 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     ck(cudaMalloc(&gp.d_stage, (size_t) kMaxParts * (size_t) im_->blob), "d_stage");
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
     ck(cudaStreamCreateWithFlags(&gp.s_dma, cudaStreamNonBlocking), "dma stream");
+    ck(cudaMalloc(&gp.d_w, sizeof(float) * kMaxEnt), "d_w");
+    ck(cudaMallocHost((void**) &gp.h_w, sizeof(float) * kMaxEnt), "h_w");
     ck(cudaEventCreateWithFlags(&gp.ev_dma, cudaEventDisableTiming), "ev_dma");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
@@ -2295,7 +2302,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
 /// what the first did not already pay.  Entry j = t*K + k writes output row j; token t's sum is taken over its own k
 /// in order, exactly as gpu_run does for one token.
 bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
-               float* out) {
+               float* out, void* out_dev = nullptr) {
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -2546,8 +2553,39 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         im.pool->run_split_multi_native(f, im.jobs.data(), nj);
         st.cpu_ms = now_ms() - c0;
     }
-    // the readback queued before the one sync of the layer (as gpu_run)
-    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
+    // mab776 M11 (DS4_DEV_SUM, default on, when the caller hands a device tensor): the per-token mix on the CARD - the
+    // CPU pool's and GPU 1's rows go up into their entry rows of d_parts (the card's own rows are there already: the
+    // grouped kernels write row j), then one kernel sums them in double, k in order, no FMA (bit for bit the host loop
+    // below) straight into the caller's tensor: the NE x H readback, the host loop and the caller's upload are gone.
+    // The diagnostics that read host rows keep the host path.
+    static const bool dev_sum_on = [] { const char* e = std::getenv("DS4_DEV_SUM"); return !e || std::atoi(e) != 0; }();
+    static const int check_multi = std::getenv("DS4_CHECK_MULTI") ? std::atoi(std::getenv("DS4_CHECK_MULTI")) : -1;
+    // DS4_CHECK_DEVSUM=1 (diagnostic): the host loop runs too and its rows are compared with the card's, byte for byte
+    static const bool check_devsum = std::getenv("DS4_CHECK_DEVSUM") != nullptr;
+    const bool dev_sum = out_dev && dev_sum_on && !check_g1() && check_multi < 0;
+    im.last_dev_sum = dev_sum;
+    if (dev_sum) {
+        for (int j = 0; j < NE; ++j)
+            if (cls[ent_u[j]] == CPU)
+                ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * H, im.parts_n.data() + (size_t) j * H, (size_t) H * 4,
+                                   cudaMemcpyHostToDevice, gp.s), "cpu rows h2d");
+        if (n1g > 0) {
+            g1_wait(im, st);
+            const float* g1p = (const float*) im.g1->h_parts;
+            for (int j = 0; j < NE; ++j)
+                if (cls[ent_u[j]] == G1)
+                    ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * H, g1p + (size_t) g1_row[j] * H, (size_t) H * 4,
+                                       cudaMemcpyHostToDevice, gp.s), "gpu1 rows h2d");
+        }
+        std::memcpy(gp.h_w, w, sizeof(float) * (size_t) NE);
+        ck(cudaMemcpyAsync(gp.d_w, gp.h_w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "w h2d");
+        strata::kernels::weighted_rows_sum_f64((const float*) gp.d_parts, (const float*) gp.d_w, (int) K, H, nt,
+                                               (float*) out_dev, gp.s);
+        if (check_devsum)   // the card's own rows back for the host loop below (the uploaded ones are read from host)
+            ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
+    } else {   // the readback queued before the one sync of the layer (as gpu_run)
+        ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
+    }
     ck(cudaStreamSynchronize(gp.s), "layer sync");
     if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter (GPU 1's are not misses)
         for (int u = 0; u < nu; ++u)
@@ -2563,7 +2601,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         ++st.vram_swaps;
     }
     const float* gpu_parts = (const float*) gp.h_parts;
-    if (n1g > 0) g1_wait(im, st);
+    if (n1g > 0 && !dev_sum) g1_wait(im, st);
     const float* g1_parts = n1g > 0 ? (const float*) im.g1->h_parts : nullptr;
     if (n1g > 0 && check_g1())
         for (int gi = 0; gi < n1g; ++gi)
@@ -2572,7 +2610,6 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     // mab776 M7c, DS4_CHECK_MULTI=<layer> (diagnostic): that layer's GPU 0 rows of a multi-token pass (VRAM hits and
     // PCIe-staged experts, several tokens per group) recomputed one entry at a time from the file's bytes and compared
     // byte for byte (counted with DS4_CHECK_G1's decode rows, printed by close())
-    static const int check_multi = std::getenv("DS4_CHECK_MULTI") ? std::atoi(std::getenv("DS4_CHECK_MULTI")) : -1;
     if (check_multi == (int) layer && nt > 1)
         for (int j = 0; j < NE; ++j) {
             const int c = cls[ent_u[j]];
@@ -2580,7 +2617,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         }
 
     // ---- per-token weighted sums, k in order (each token's rows picked once, as gpu_run) ----
-    for (int t = 0; t < nt; ++t) {
+    for (int t = 0; t < nt && (!dev_sum || check_devsum); ++t) {
         const float* src[kMaxParts];
         double wv[kMaxParts];
         for (int64_t k = 0; k < K; ++k) {
@@ -2597,6 +2634,17 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
             for (int64_t k = 0; k < K; ++k) acc += wv[k] * (double) src[k][(size_t) i];
             o[i] = (float) acc;
         }
+    }
+    if (dev_sum && check_devsum) {
+        static int64_t n_rows = 0, n_same = 0;
+        std::vector<float> dv((size_t) nt * (size_t) H);
+        ck(cudaMemcpy(dv.data(), out_dev, dv.size() * 4, cudaMemcpyDeviceToHost), "devsum check d2h");
+        for (int t = 0; t < nt; ++t) {
+            ++n_rows;
+            n_same += std::memcmp(dv.data() + (size_t) t * H, out + (size_t) t * H, (size_t) H * 4) == 0;
+        }
+        if (n_rows % 256 < (int64_t) nt)
+            std::fprintf(stderr, "[devsum-chk] %lld of %lld token rows identical\n", (long long) n_same, (long long) n_rows);
     }
 
     // ---- admission of the distinct misses (as gpu_run) ----
@@ -3285,9 +3333,11 @@ bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const 
 #endif
 }
 
-bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out) {
+bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out,
+                           void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
+    im_->last_dev_sum = false;
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
@@ -3304,11 +3354,13 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
             if (!gpu_run(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr, out + (size_t) t * H)) return false;
         return true;
     }
-    return gpu_run_n(*im_, layer, nt, ids, w, x, out);
+    return gpu_run_n(*im_, layer, nt, ids, w, x, out, out_dev);
 #else
     return false;
 #endif
 }
+
+bool Ds4MoeTier::dev_sum_used() const { return im_ && im_->last_dev_sum; }
 
 bool Ds4MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
     if (im_->cfg.cpu_only) return true;
