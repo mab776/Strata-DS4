@@ -1,0 +1,31 @@
+== PE-mtp-chk: 2026-10-11 00:59:55 MEM 39g ARENA 33 SKIP 1 CHUNK 2048 PCIE 0.55 G1 1 GROW 2.0 MARGIN 9.0 build-ds4-cu13 --mtp /mtp/DeepSeek-V4-Flash-MTP-bf16.gguf --verify
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 64244 MiB):
+  Device 0: NVIDIA RTX PRO 5000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 48403 MiB
+  Device 1: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, VMM: yes, VRAM: 15841 MiB
+dense backend: CUDA0
+context cap 262144 tokens
+dense compute buffers: one shared arena 49.1 MiB for every decode graph
+slots auto: 38.76 GiB free after the dense half -> 28.76 GiB of expert slots (margin 10.00 GiB; expert 7.19-9.38 MiB -> 3141-4097 experts)
+vram grow: the prompt on 28.76 GiB of slots, then up to 35.76 GiB (leaving 3.00 GiB)
+tier: gpu, 4061 resident slots, arena 33.0 GiB (4652 experts), file tier 312; load 40.2 s
+gpu1: device 1 holds 1990 experts (14.10 GiB, filled in 5.6 s; no arena copies)
+MTP head: layer 43 from /mtp/DeepSeek-V4-Flash-MTP-bf16.gguf (experts on the CPU, MXFP4)
+strata: prompt kernels: mxfp4 is FP4 x FP4 in llama.cpp's MMQ on this GPU: MMQ with FP4 activations (STRATA_MMQ_FP4=1)
+ds4_moe: run_chunk: prestage halves of 1.00 GiB (busiest layer: 131 arena experts)
+chunk prof: 215 calls, 5592 launches: wall 4522 ms = waits on reads 1503 + wave/copy waits 0 + final sync 1896 + other host 1123; reader wall 1539 ms; GPU grouped kernels 1311 ms (resident 0); file tier 3.2 GB read in 1527 ms of reader time = 2.10 GB/s
+grow_cache: 4061 -> 4989 slots (+928, 0 from the file tier) in 123 ms
+prefill chunks of 2048: dense 2832 ms (attention+router 2704, finish 128), experts 4523 ms, head/ppl 21 ms, cache seed 128 ms -> 4989 resident slots, MTP window 972 ms
+
+prefill: 8234 tokens in 8.91 s = 924.51 tok/s (chunked)
+decode : 128 tokens, 65 forward passes in 5.32 s = 12.22 tok/s
+verify : 65 passes, 1.95 tokens/pass, 23.88 tok/s (tokens after the first / decode time)
+experts/token: hit 78.1% (prefetched-useful 7.4/token of 27.6 issued), cpu 3.5%, pcie 3.8%, file tier 103
+gpu1: 14.6% of lookups (75.31/pass), host wait 0.027 ms/pass; prefill: 17.6% of entries
+tier moves: vram_lru swaps 5.91/pass (demoted 30), arena swaps 0, file reads 5.71 ms/pass
+decode ms/token: predict+prefetch 1.80, attention+router 17.85, experts 52.12, finish 0.31, head 0.55
+MTP: 65 drafts, 63 accepted = 96.9% (greedy: draft == the next decoded token); 8.85 ms/draft (routed experts 7.72, rest 1.14); expert pages in RAM 87% (file mmap)
+tier ms/token: wall 52.11 (gpu hits 0.00, pcie 0.00, cpu pool 3.25)
+VRAM free at the end: 2.99 GiB (calibrates --vram-margin)
+[g1-chk] GPU 1 rows vs GPU 0 recomputation: decode 608/608 identical, prompt 0/0 identical
+exit=139 oom=false wall=57s
+peak VmHWM 45.1 GiB, cgroup peak 39.0 GiB, min host avail 11.9 GiB, peak VRAM 45341 MiB (GPU 1 15333 MiB)

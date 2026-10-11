@@ -1,0 +1,47 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 13.0.2
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+1897
+1014
+201
+1897
+94076
+201
+5356
+23093
+1662
+125091
+51432
+271
+3767
+46360
+19183
+6634
+17136
+46
+1137
+361
+1351
+7854
+7025
+16797
+2161
+14
+7768
+28
+688
+14
+259
+50060

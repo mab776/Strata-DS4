@@ -1,0 +1,22 @@
+== PE-127k-on2: 2026-10-11 00:58:02 MEM 38g ARENA 32 SKIP 1 CHUNK 0 PCIE 0.55 G1 1 GROW 2.0 MARGIN 9.0 build-ds4-cu13 --pos-offset 127000
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 64244 MiB):
+  Device 0: NVIDIA RTX PRO 5000 Blackwell, compute capability 12.0, VMM: yes, VRAM: 48403 MiB
+  Device 1: NVIDIA GeForce RTX 5070 Ti, compute capability 12.0, VMM: yes, VRAM: 15841 MiB
+dense backend: CUDA0
+context cap 262144 tokens
+dense compute buffers: one shared arena 48.8 MiB for every decode graph
+slots auto: 38.94 GiB free after the dense half -> 29.94 GiB of expert slots (margin 9.00 GiB; expert 7.19-9.38 MiB -> 3269-4264 experts)
+vram grow: the prompt on 29.94 GiB of slots, then up to 36.94 GiB (leaving 2.00 GiB)
+tier: gpu, 4219 resident slots, arena 32.0 GiB (4512 experts), file tier 214; load 37.3 s
+gpu1: device 1 holds 2063 experts (14.62 GiB, filled in 6.5 s; no arena copies)
+
+prefill: 16 tokens in 0.61 s = 26.28 tok/s (decode-loop prefill)
+decode : 400 tokens, 399 forward passes in 9.82 s = 40.63 tok/s
+experts/token: hit 76.5% (prefetched-useful 4.2/token of 26.5 issued), cpu 2.3%, pcie 2.5%, file tier 235
+gpu1: 18.7% of lookups (48.23/pass), host wait 0.039 ms/pass; prefill: 15.0% of entries
+tier moves: vram_lru swaps 1.99/pass (demoted 794), arena swaps 0, file reads 2.64 ms/pass
+decode ms/token: predict+prefetch 1.65, attention+router 14.07, experts 8.13, finish 0.20, head 0.50
+tier ms/token: wall 8.12 (gpu hits 2.98, pcie 0.33, cpu pool 3.32)
+VRAM free at the end: 8.71 GiB (calibrates --vram-margin)
+exit=139 oom=false wall=49s
+peak VmHWM 39.1 GiB, cgroup peak 33.1 GiB, min host avail 15.5 GiB, peak VRAM 39479 MiB (GPU 1 15293 MiB)
