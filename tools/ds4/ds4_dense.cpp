@@ -48,7 +48,11 @@ constexpr int64_t kNtMax = 8;
 // makes ggml-alloc reallocate it, which leaves every graph allocated earlier pointing into freed memory: the
 // allocator's epoch then advances and each graph re-allocates (and ggml-cuda re-captures it) on its next use.
 // reserve_graphs reserves every variant first, so in practice the buffer reaches its size before any graph runs.
-bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g) {
+bool async_on();
+// be (mab776 M11, DS4_ASYNC): the decode backend - a real allocation (first use, or after the shared buffer moved) may
+// grow the shared arena and FREE the old buffer while an async graph still runs on its intermediates (cudaFree only
+// "may" synchronize), so the stream is drained first.  The cached path (every other call) never waits.
+bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr) {
     static const bool reuse = [] { const char * e = std::getenv("DS4_GRAPH_REUSE"); return !e || std::atoi(e) != 0; }();
     static std::map<const void *, uint64_t> epoch;                  // per allocator
     static std::map<const ggml_cgraph *, uint64_t> graph_epoch;     // the epoch each graph was allocated in
@@ -73,12 +77,32 @@ bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g) {
         }
         for (int i = 0; i < g->n_leafs; ++i) unbind(g->leafs[i]);
     }
+    if (be && async_on()) ggml_backend_synchronize(be);
     const size_t before = ggml_gallocr_get_buffer_size(a, 0);
     if (!ggml_gallocr_alloc_graph(a, g)) return false;
     if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++ep;   // the buffer moved
     graph_epoch[g] = ep;
     if (reuse) g->uid = ggml_graph_next_uid();
     return true;
+}
+
+// mab776 M11 (DS4_ASYNC, default on): decode graphs and their hand-offs ride the backend's stream with no host wait per
+// graph.  ggml_backend_graph_compute is compute_async + a synchronize, and ggml-cuda's plain tensor_get/set copy on
+// cudaStreamPerThread + a synchronize: a layer waited 6 times on the dense half alone (predict, its readback,
+// attention, its readback, the routed-sum upload, finish), the GPU idle while the host launched the next graph (nsys
+// @127k: GPU 0 busy 71 %).  Async: one synchronize where the host needs a result (the predict and router readbacks);
+// finish and the next predict queue behind each other.  Stream order keeps every dependency (one stream, and the
+// graphs that share the decode arena run one after the other on it).  DS4_ASYNC=0: the waits as before.
+bool async_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_ASYNC"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+bool compute_dec(ggml_backend_t be, ggml_cgraph * g) {
+    return (async_on() ? ggml_backend_graph_compute_async(be, g) : ggml_backend_graph_compute(be, g)) == GGML_STATUS_SUCCESS;
+}
+void get_dec(ggml_backend_t be, const ggml_tensor * t, void * dst, size_t n) {   // waits for the stream
+    if (async_on()) { ggml_backend_tensor_get_async(be, t, dst, 0, n); ggml_backend_synchronize(be); }
+    else ggml_backend_tensor_get(t, dst, 0, n);
 }
 
 int64_t next_pow2(int64_t v) {
@@ -319,6 +343,10 @@ struct Ds4Dense::Impl {
     // the driver in pieces that queue behind the tier's expert DMAs on the one host-to-device copy engine
     ggml_backend_buffer_t pf_hbuf = nullptr;
     std::vector<uint8_t> pf_hvec;        // the same, pageable (CPU backend)
+    // mab776 M11 (DS4_ASYNC): the decode finish's routed sums, pinned (CUDA), so their upload is queued on the stream
+    // with no host wait - a pageable source has the driver stage it synchronously
+    ggml_backend_buffer_t dec_hbuf = nullptr;
+    float * dec_routed = nullptr;
     uint8_t * pf_out_host = nullptr;
     float *   pf_fn = nullptr;
     float *   pf_routed = nullptr;
@@ -489,6 +517,9 @@ struct Ds4Dense::Impl {
     bool snap_alloc(int slots);   // init(), after the state; defined with Ds4Dense::snapshot
 
     ~Impl() {
+        if (own_backend && backend) ggml_backend_synchronize(backend);   // mab776 M11: no async upload still reading
+        // dec_hbuf (an outside owner frees - and so drains - its backend first: ds4_generate does, before this runs)
+        if (dec_hbuf) ggml_backend_buffer_free(dec_hbuf);
         if (snapbuf) ggml_backend_buffer_free(snapbuf);
         if (snapctx) ggml_free(snapctx);
         pf_free();
@@ -2009,21 +2040,21 @@ bool Ds4Dense::predict(int il, int * top_ids, int n_top) {
     Impl::Layer & L = im.ly[(size_t) il];
     for (int i = 0; i < n_top; ++i) top_ids[i] = -1;
 
-    if (!alloc_graph(L.allo_predict, L.gf_predict)) { im.err = "gallocr(predict) failed"; return false; }
-    if (ggml_backend_graph_compute(im.backend, L.gf_predict) != GGML_STATUS_SUCCESS) {
+    if (!alloc_graph(L.allo_predict, L.gf_predict, im.backend)) { im.err = "gallocr(predict) failed"; return false; }
+    if (!compute_dec(im.backend, L.gf_predict)) {
         im.err = "predict graph compute failed";
         return false;
     }
     ggml_tensor * out = L.predict_out;
     if (il < (int) im.g.hash_layer_count) {
         std::vector<int32_t> ids((size_t) ggml_nelements(out));
-        ggml_backend_tensor_get(out, ids.data(), 0, ids.size() * 4);
+        get_dec(im.backend, out, ids.data(), ids.size() * 4);
         const int n = std::min<int>(n_top, (int) ids.size());
         for (int i = 0; i < n; ++i) top_ids[i] = ids[(size_t) i];
         return true;
     }
     std::vector<float> sel((size_t) ggml_nelements(out));
-    ggml_backend_tensor_get(out, sel.data(), 0, sel.size() * 4);
+    get_dec(im.backend, out, sel.data(), sel.size() * 4);
     std::vector<int> idx(sel.size());
     for (size_t i = 0; i < sel.size(); ++i) idx[i] = (int) i;
     const int n = std::min<int>(n_top, (int) sel.size());
@@ -2062,7 +2093,7 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
     }
     const bool emit = !(comp_skip_on() && n == 1 && L.ratio != 0 && (pos_last + 1) % L.ratio != 0);
     Impl::Var * var = attn_var(im, il, attn_cap(L, pos_last), n, emit);
-    if (!alloc_graph(var->allo, var->gf)) { im.err = "gallocr(attn) failed"; return false; }
+    if (!alloc_graph(var->allo, var->gf, im.backend)) { im.err = "gallocr(attn) failed"; return false; }
 
     // ---- per-step inputs: every layer's, for this pass, in ONE upload per pass ------------------
     if (pos0 != im.in_pos || n != im.in_n) {
@@ -2152,12 +2183,14 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
             std::fprintf(stderr, "\n");
         }
     }
-    if (ggml_backend_graph_compute(im.backend, var->gf) != GGML_STATUS_SUCCESS) {
+    if (!compute_dec(im.backend, var->gf)) {
         im.err = "attn graph compute failed";
         return false;
     }
 
     static const bool dbg_idx = std::getenv("DS4_DBG_INDEXER") != nullptr;
+    if (async_on() && (dbg_idx || !L.host_attn_raw.empty() || !L.host_attn.empty()))
+        ggml_backend_synchronize(im.backend);   // the diagnostic readbacks below are plain (another stream)
     if (dbg_idx && var->dbg_isc) {
         std::vector<float> v((size_t) (var->cap * n));
         ggml_backend_tensor_get(var->dbg_isc, v.data(), 0, v.size() * 4);
@@ -2171,7 +2204,7 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
     // ---- router outputs + hand-offs: n token blocks [fn | ids | wts], one readback ----------------
     {
         const size_t ob = (size_t) im.o_blk;
-        ggml_backend_tensor_get(L.o_span, L.host_out.data(), 0, ob * (size_t) n);
+        get_dec(im.backend, L.o_span, L.host_out.data(), ob * (size_t) n);
         for (int t = 0; t < n; ++t) {
             const uint8_t * b0 = L.host_out.data() + ob * (size_t) t;
             const int32_t * ids = (const int32_t *) (b0 + im.o_ids_off);
@@ -2286,13 +2319,31 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum) {
     if (il < 0 || il >= (int) im.ly.size()) { im.err = "finish_layer: bad layer"; return false; }
     if (!im.ensure_n(n)) return false;
     Impl::Layer & L = im.ly[(size_t) il];
-    if (!alloc_graph(L.allo_finish[n], L.gf_finish[n])) { im.err = "gallocr(finish) failed"; return false; }
-    ggml_backend_tensor_set(im.routed_sum, routed_sum, 0, (size_t) (im.D * n) * 4);
-    if (ggml_backend_graph_compute(im.backend, L.gf_finish[n]) != GGML_STATUS_SUCCESS) {
+    if (!alloc_graph(L.allo_finish[n], L.gf_finish[n], im.backend)) { im.err = "gallocr(finish) failed"; return false; }
+    const size_t rbytes = (size_t) (im.D * n) * 4;
+    if (async_on() && !im.dec_routed) {   // once: D x kNtMax floats, pinned when the backend has a host buffer type
+        if (ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend)))
+            if ((im.dec_hbuf = ggml_backend_buft_alloc_buffer(hbt, (size_t) (im.D * kNtMax) * 4)))
+                im.dec_routed = (float *) ggml_backend_buffer_get_base(im.dec_hbuf);
+    }
+    if (async_on() && im.dec_routed) {   // the previous upload from it finished: a readback waited since
+        std::memcpy(im.dec_routed, routed_sum, rbytes);
+        ggml_backend_tensor_set_async(im.backend, im.routed_sum, im.dec_routed, 0, rbytes);
+    } else {
+        ggml_backend_tensor_set(im.routed_sum, routed_sum, 0, rbytes);
+    }
+    if (!compute_dec(im.backend, L.gf_finish[n])) {
         im.err = "finish graph compute failed";
         return false;
     }
-    if (!L.host_llast.empty()) ggml_backend_tensor_get(L.t_llast, L.host_llast.data(), 0, (size_t) (im.D * im.HC * n) * 4);
+    // the async window stays INSIDE a pass: its last trunk layer and the MTP block wait, so whatever follows a pass
+    // (plain copies of the state - prefill_state_to_decode writes x_state, which the MTP block's finish writes too -
+    // checkpoints, snapshots) finds the stream idle
+    if (async_on() && (il + 1 >= im.n_trunk || il == im.il_mtp)) ggml_backend_synchronize(im.backend);
+    if (!L.host_llast.empty()) {
+        if (async_on()) ggml_backend_synchronize(im.backend);
+        ggml_backend_tensor_get(L.t_llast, L.host_llast.data(), 0, (size_t) (im.D * im.HC * n) * 4);
+    }
     L.have_finish = true;
     return true;
 }
