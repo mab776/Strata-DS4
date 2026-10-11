@@ -401,6 +401,60 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   | edit a JSON config (round 2) | 74.5 | **108.3** | +45 % |
   | fresh code (LRU cache + tests) | 66.3 | 69.0 | +4 % |
   | fresh prose | 58.4 | 60.1 | neutral |
+- **Decode profile** (ds4_generate `--pos-offset N` = depth-N graphs over empty caches, no prefill; m11a/m11b windows):
+
+  | depth | tok/s | predict+prefetch | attention+router | experts | finish | head (ms/token) |
+  |---|---:|---:|---:|---:|---:|---:|
+  | 8k | 43.2 | 1.42 | 13.40 | 6.69 | 1.07 | 0.50 |
+  | 127k | 43.0 | 1.40 | 14.30 | 5.84 | 1.05 | 0.50 |
+  | 250k | 41.6 | 1.34 | 15.50 | 5.62 | 1.03 | 0.49 |
+
+  Node census (DS4_DBG_GRAPH): 122 / 150 / 176-179 nodes per attention graph (SWA / HCA / CSA layers), 26-36 of them
+  free reshapes.  nsys @127k (5 s, node-level graph trace): ~5,100 kernels a token averaging 3.8 us; dense Q8_0
+  matvecs ~6 ms of it (the real weight reads), then hundreds of tiny ones a token (522 adds, 351 rms_norms, 345
+  q8_1 quantizes, 277 scales, 224 muls, 213 sigmoids); 131 cudaGraphLaunch a token at ~45 us of CPU each, 307
+  blocking syncs; GPU 0 busy only 71 % of the window.  One HCA layer = 128 ops in 608 us: host gaps ~45 us (router
+  readback -> the tier's first op), ~14 us (inside the tier's launch), ~34 us (tier -> finish), ~17 us (finish ->
+  next predict); the predict graph recomputes the next attention's whole hyper-connection prelude (~25 us); the
+  router's top-6 of 256 is a full argsort (7.7 us).  Prefetch off (--pf-b 0) broke even in the probe, but there its
+  predictions are 17 % useful (65 % after a real prompt) - not a basis to drop it.
+- **Async decode hand-offs (633419b4, `DS4_ASYNC`, default on, deployed)**: predict / attention+router launch async
+  and their readback (an async copy on the backend stream) is the one wait; finish uploads the routed sums from a
+  pinned buffer and launches without waiting, except after a pass's last trunk layer and the MTP block (whatever
+  follows a pass - prefill_state_to_decode writes x_state, as the MTP block's finish does - finds the stream idle).
+  Adversarial review (one agent): no live race; its two latent points closed (alloc_graph drains before a real
+  allocation - the shared decode arena may grow and free its old buffer; ~Impl drains an owned backend).  A first
+  version synced a backend ds4_generate had already freed: exit code 139 at exit, fixed (own_backend only).
+  Plain decode probe @127k: 43.0 -> 44.25 tok/s.  Through the server (2 rounds, same session, verify pass ms):
+  127k K=1 28.05 -> 27.45, K=2 31.4 -> 30.65; 250k K=1 29.2 -> 28.8, K=2 33.05 -> 32.6 = **-1.4 to -2.4 %**.
+- **Early PCIe DMAs (`DS4_PCIE_EARLY=1`, opt-in)**: the PCIe share's DMAs (+ LRU admissions) first on their own copy
+  stream, under the activation upload / hits kernel / LRU copies (gpu_run and gpu_run_n).  No gain @127k (40.58 /
+  40.40 -> 40.61 / 40.63): they then share VRAM bandwidth with the hits kernel.  DS4_CHECK_GPU (1,082 PCIe experts),
+  DS4_CHECK_LRU and DS4_CHECK_MULTI (608/608 rows identical) pass with it on.  Retry after the RAM upgrade.
+- **Tree drafts (item 3) - not built**: with each extra verify token costing ~15 % of a step, verifying MTP's top-2
+  for draft 1 (+ a child each) lifts tokens/pass ~2.18 -> ~2.36 (+8 %) for a 5-token pass (+~22 % pass cost) - a
+  loss here.  Lookup drafts are the better use of a longer pass.
+- **GPU-side expert routing - DESIGN only (Marc: design tonight unless 1-4 finish early and it is clearly safe)**.
+  Today every layer reads the router's ids back (o_span), places the 6 experts on the host, launches the grouped
+  kernels with host-built metadata, downloads the parts, sums them on the host in double and uploads the sum: the
+  trace shows ~45 + 14 + 34 us of host gaps a layer (~4 ms a token at 127k) besides the GPU work.
+  1. A device copy of GPU 0's residency (`slot_of[layer][expert]`, int32, -1 = absent), updated by the host with the
+     LRU admissions/evictions it already decides (an H2D of the changed entries before the next use, same stream).
+  2. A route kernel at the end of the attention graph: top-6 ids/weights (already on the device) -> the GPU 0 hits'
+     grouped metadata (the kernels already read G1Meta from device memory: only the builder moves) + a miss mask.
+  3. The hits' gate/up/down kernels and a device weighted sum of their parts (weighted_rows_sum, as prompt chunks do)
+     in the same graph -> `routed_sum` partial on the device.
+  4. The misses (GPU 1 tier, CPU pool, PCIe) still need the host: an ASYNC readback of the ids + x (24 B + 16 KB)
+     queued after the route kernel; the host waits for that alone, dispatches the misses, and their parts are added
+     to `routed_sum` on the device (CPU parts H2D, GPU 1 parts peer copy); finish waits on an event.
+  5. Layers whose 6 experts are all on GPU 0 run attention -> experts -> finish -> next layer with no host wait at
+     all.  Per-expert GPU 0 hit rate ~75 % -> all 6 on GPU 0 in ~18 % of layers; with GPU 1 dispatched from the
+     device too (a GPU 1 stream waiting on a GPU 0 event, reading the ids over P2P) ~69 %.
+  Expected: ~90 us of host gaps saved on those layers -> ~2.7 ms of a ~22 ms step (~12 %) at 69 %, ~0.7 ms at 18 %.
+  Costs/risks: the device sum is float, not the host's double (not bit-identical to today; the CPU gate's
+  decode-vs-chunk parity is CPU-only and unaffected), cross-GPU dispatch is new, LRU bookkeeping must stay exact.
+  Order: (a) device metadata for GPU 0 hits + device sum + async miss readback, (b) GPU 1 from the device, (c) a
+  CUDA graph per layer.
   Two lessons from the windows: a second, overlapping GPU window (an `&` waiter that `ps` didn't show) killed the
   other's runs through the shared container name - gpuwin now holds a flock; and SIGTERM did not stop a window
   script - windows stop through a STOP file checked between runs.

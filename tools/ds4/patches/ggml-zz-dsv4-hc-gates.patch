@@ -1,0 +1,274 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -585,6 +585,7 @@
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_DSV4_HC_GATES,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2726,6 +2727,19 @@
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // hc_gates (mab776): hc_pre's two gates in one op.  mixes [(2+hc)*hc, n_tokens], scale [>= 2], base [(2+hc)*hc]
++    //          -> [2*hc, n_tokens]
++    //   result[h, t] = sigmoid(mixes[h, t]*scale[0] + base[h]) + eps       (h <  hc: the pre weights)
++    //   result[h, t] = 2*sigmoid(mixes[h, t]*scale[1] + base[h])           (hc <= h < 2*hc: post)
++    //   rounded like the unfused graph (mul, add, sigmoid, scale ops): no fused multiply-add
++    //
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_gates(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * mixes,
++            struct ggml_tensor  * scale,
++            struct ggml_tensor  * base,
++            float                 eps);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1084,6 +1084,7 @@
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "DSV4_HC_GATES",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1102,7 @@
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "dsv4_hc_gates(mixes, scale, base)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1218,7 @@
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6503,6 +6505,35 @@
+     result->src[0] = mixes;
+     result->src[1] = scale;
+     result->src[2] = base;
++
++    return result;
++}
++
++// ggml_dsv4_hc_gates (mab776)
++
++struct ggml_tensor * ggml_dsv4_hc_gates(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * mixes,
++        struct ggml_tensor  * scale,
++        struct ggml_tensor  * base,
++        float                 eps) {
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
++    GGML_ASSERT(scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(base->type == GGML_TYPE_F32);
++    const int64_t hc = 4;
++    GGML_ASSERT(mixes->ne[0] == (2 + hc)*hc);
++    GGML_ASSERT(mixes->ne[2] == 1 && mixes->ne[3] == 1);
++    GGML_ASSERT(scale->ne[0] >= 2);
++    GGML_ASSERT(base->ne[0] == (2 + hc)*hc);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*hc, mixes->ne[1]);
++
++    ggml_set_op_params_f32(result, 0, eps);
++
++    result->op     = GGML_OP_DSV4_HC_GATES;
++    result->src[0] = mixes;
++    result->src[1] = scale;
++    result->src[2] = base;
+ 
+     return result;
+ }
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1037,7 +1037,8 @@
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_DSV4_HC_GATES: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2109,6 +2109,10 @@
+             {
+                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+             } break;
++        case GGML_OP_DSV4_HC_GATES:
++            {
++                ggml_compute_forward_dsv4_hc_gates(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2292,6 +2296,7 @@
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
++        case GGML_OP_DSV4_HC_GATES:
+             {
+                 n_tasks = n_threads;
+             } break;
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11105,6 +11105,29 @@
+ }
+ 
+ 
++// ggml_compute_forward_dsv4_hc_gates (mab776)
++
++void ggml_compute_forward_dsv4_hc_gates(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * mixes = dst->src[0];
++    const ggml_tensor * scale = dst->src[1];
++    const ggml_tensor * base  = dst->src[2];
++    const int64_t hc = 4;
++    const int64_t n_tokens = mixes->ne[1];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const float s0 = *(const float *) ((const char *) scale->data);
++    const float s1 = *(const float *) ((const char *) scale->data + scale->nb[0]);
++    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
++        const float * m = (const float *) ((const char *) mixes->data + t*mixes->nb[1]);
++        float * d = (float *) ((char *) dst->data + t*dst->nb[1]);
++        for (int64_t h = 0; h < 2*hc; ++h) {
++            const float b = *(const float *) ((const char *) base->data + h*base->nb[0]);
++            volatile float a = m[h*(mixes->nb[0]/sizeof(float))]*(h < hc ? s0 : s1);   // two roundings, as mul then add
++            const float sg = 1.0f/(1.0f + expf(-(a + b)));
++            d[h] = h < hc ? sg + eps : 2.0f*sg;
++        }
++    }
++}
++
+ // ggml_compute_forward_dsv4_hc_comb
+ 
+ static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -106,6 +106,7 @@
+ void ggml_compute_forward_gated_delta_net(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv4_hc_gates(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -194,6 +194,67 @@
+     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+ }
+ 
++// mab776: hc_pre's pre and post gates in one launch (they were 8: mul, add, sigmoid, scale per gate).  One thread per
++// (token, h).  __fmul_rn / __fadd_rn keep the unfused graph's two roundings (nvcc may otherwise contract them into an
++// FMA under -use_fast_math); the sigmoid is the unary op's own expression, compiled with the same flags; the eps add
++// and the x2 match scale_f32's fma(1, x, eps) and fma(2, x, 0) exactly.
++static __global__ void dsv4_hc_gates_f32(
++        const float * mixes,
++        const float * scale,
++        const float * base,
++        float * dst,
++        int64_t n_tokens,
++        int64_t sm0,
++        int64_t sm1,
++        int64_t ss0,
++        int64_t sb0,
++        int64_t sd0,
++        int64_t sd1,
++        float   eps) {
++    ggml_cuda_pdl_lc();
++    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (i >= n_tokens*2*DSV4_HC) {
++        return;
++    }
++    ggml_cuda_pdl_sync();
++    const int64_t h = i % (2*DSV4_HC);
++    const int64_t t = i / (2*DSV4_HC);
++    const float s = h < DSV4_HC ? scale[0] : scale[ss0];
++    const float a = __fadd_rn(__fmul_rn(mixes[h*sm0 + t*sm1], s), base[h*sb0]);
++    const float sg = 1.0f / (1.0f + expf(-a));
++    dst[h*sd0 + t*sd1] = h < DSV4_HC ? __fadd_rn(sg, eps) : __fmul_rn(2.0f, sg);
++}
++
++void ggml_cuda_op_dsv4_hc_gates(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * mixes = dst->src[0];
++    const ggml_tensor * scale = dst->src[1];
++    const ggml_tensor * base  = dst->src[2];
++
++    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
++    GGML_ASSERT(scale->type == GGML_TYPE_F32);
++    GGML_ASSERT(base->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(mixes->ne[0] == (2 + DSV4_HC)*DSV4_HC);
++    GGML_ASSERT(dst->ne[0] == 2*DSV4_HC && dst->ne[1] == mixes->ne[1]);
++
++    const int64_t n_tokens = mixes->ne[1];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const int64_t n = n_tokens*2*DSV4_HC;
++    const int block_size = 64;
++    const dim3 block_dims(block_size, 1, 1);
++    const dim3 grid_dims((unsigned) ((n + block_size - 1) / block_size), 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
++
++    ggml_cuda_kernel_launch(dsv4_hc_gates_f32, launch_params,
++            (const float *) mixes->data, (const float *) scale->data, (const float *) base->data, (float *) dst->data,
++            n_tokens,
++            (int64_t) (mixes->nb[0] / sizeof(float)), (int64_t) (mixes->nb[1] / sizeof(float)),
++            (int64_t) (scale->nb[0] / sizeof(float)),
++            (int64_t) (base->nb[0] / sizeof(float)),
++            (int64_t) (dst->nb[0] / sizeof(float)), (int64_t) (dst->nb[1] / sizeof(float)),
++            eps);
++}
++
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * mixes = dst->src[0];
+     const ggml_tensor * scale = dst->src[1];
+--- a/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+@@ -4,3 +4,4 @@
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv4_hc_gates(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2385,6 +2385,9 @@
+         case GGML_OP_DSV4_HC_COMB:
+             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
+             break;
++        case GGML_OP_DSV4_HC_GATES:
++            ggml_cuda_op_dsv4_hc_gates(ctx, dst);
++            break;
+         case GGML_OP_DSV4_HC_PRE:
+             ggml_cuda_op_dsv4_hc_pre(ctx, dst);
+             break;
+@@ -5490,6 +5493,7 @@
+             return true;
+ #endif // GGML_USE_MUSA
+         case GGML_OP_DSV4_HC_COMB:
++        case GGML_OP_DSV4_HC_GATES:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;
+         case GGML_OP_DSV4_HC_PRE:

@@ -636,13 +636,24 @@ struct B {
         ggml_tensor * base_pre   = v1(bs, hc, 0);
         ggml_tensor * base_post  = v1(bs, hc, (size_t) hc * 4);
 
-        ggml_tensor * pre = v2(mixes, hc, nt, mixes->nb[1], 0);
-        pre = ggml_sigmoid(c, hc_affine(pre, scale_pre, base_pre));
-        pre = ggml_scale_bias(c, pre, 1.0f, (float) g->hc_eps);
+        ggml_tensor * pre = nullptr;
+        // mab776 M11 (DS4_HC_GATES, default on, GPU): both gates in ONE launch (they were 8 tiny kernels - mul, add,
+        // sigmoid, scale each - three hc_pre a decode layer: ~20 launches for 2 x 4 floats a token).  The op rounds
+        // exactly as these ops do (no fused multiply-add): same bits.  The CPU keeps the ops (its gate stays as is).
+        static const bool gates_on = [] { const char * e = std::getenv("DS4_HC_GATES"); return !e || std::atoi(e) != 0; }();
+        if (!unfused() && gates_on && !ggml_backend_is_cpu(im->backend)) {
+            ggml_tensor * gt = ggml_dsv4_hc_gates(c, mixes, sc, bs, (float) g->hc_eps);   // [2*hc, nt]: pre | post
+            pre = v2(gt, hc, nt, gt->nb[1], 0);
+            *post = v2(gt, hc, nt, gt->nb[1], (size_t) hc * gt->nb[0]);
+        } else {
+            pre = v2(mixes, hc, nt, mixes->nb[1], 0);
+            pre = ggml_sigmoid(c, hc_affine(pre, scale_pre, base_pre));
+            pre = ggml_scale_bias(c, pre, 1.0f, (float) g->hc_eps);
 
-        *post = v2(mixes, hc, nt, mixes->nb[1], (size_t) hc * mixes->nb[0]);
-        *post = ggml_sigmoid(c, hc_affine(*post, scale_post, base_post));
-        *post = ggml_scale(c, *post, 2.0f);
+            *post = v2(mixes, hc, nt, mixes->nb[1], (size_t) hc * mixes->nb[0]);
+            *post = ggml_sigmoid(c, hc_affine(*post, scale_post, base_post));
+            *post = ggml_scale(c, *post, 2.0f);
+        }
 
         ggml_tensor * scale_comb = v1(sc, 1, 2 * sizeof(float));
         ggml_tensor * base_comb  = v1(bs, hc * hc, (size_t) 2 * hc * 4);
