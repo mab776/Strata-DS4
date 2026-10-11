@@ -1,0 +1,65 @@
+### before 05:08:17 env: DS4_ASYNC=0 DS4_HC_GATES=0 DS4_DEV_SUM=0 
+  depth   8192 read 8171 tokens at 1278.3 tok/s
+  depth   8192 K=2 lookup 0 decode  62.1 tok/s, 2.12 tok/pass, pass 31.3 ms, md5 b6c098a2a5
+  depth   8192 K=2 lookup 7 decode  65.6 tok/s, 2.21 tok/pass, pass 31.0 ms, md5 79b7945d3a, lookup 23/28 in 8 passes
+  depth   8192 K=2 lookup 0 decode  69.7 tok/s, 2.35 tok/pass, pass 31.2 ms, md5 8e41894bcd
+  depth   8192 K=2 lookup 7 decode  65.5 tok/s, 2.19 tok/pass, pass 30.9 ms, md5 5ac33480b7, lookup 19/22 in 5 passes
+  depth 130048 read 129245 tokens at 1517.1 tok/s
+  depth 130048 K=2 lookup 0 decode  61.9 tok/s, 2.16 tok/pass, pass 32.4 ms, md5 d915a27f68
+  depth 130048 K=2 lookup 7 decode  63.9 tok/s, 2.24 tok/pass, pass 32.6 ms, md5 da2ce8f880, lookup 37/55 in 16 passes
+  depth 130048 K=2 lookup 0 decode  62.9 tok/s, 2.16 tok/pass, pass 31.9 ms, md5 47dbc6d0ed
+  depth 130048 K=2 lookup 7 decode  65.4 tok/s, 2.26 tok/pass, pass 31.9 ms, md5 96c55653b0, lookup 31/36 in 8 passes
+  depth 250000 read 248415 tokens at 1434.2 tok/s
+  depth 250000 K=2 lookup 0 decode  60.0 tok/s, 2.12 tok/pass, pass 33.0 ms, md5 6428f3aa63
+  depth 250000 K=2 lookup 7 decode  60.9 tok/s, 2.19 tok/pass, pass 33.3 ms, md5 4439751c98, lookup 33/48 in 11 passes
+  depth 250000 K=2 lookup 0 decode  60.9 tok/s, 2.16 tok/pass, pass 32.9 ms, md5 36ca681467
+  depth 250000 K=2 lookup 7 decode  60.7 tok/s, 2.18 tok/pass, pass 33.4 ms, md5 b80b113940, lookup 29/44 in 9 passes
+### after 05:15:56 env: GGML_MMVF_F16_MAX=8 
+  depth   8192 read 8171 tokens at 1228.3 tok/s
+  depth   8192 K=2 lookup 0 decode  72.2 tok/s, 2.16 tok/pass, pass 27.3 ms, md5 5e04b63dae
+  depth   8192 K=2 lookup 7 decode  70.6 tok/s, 2.12 tok/pass, pass 27.2 ms, md5 2ca0f79307, lookup 24/27 in 7 passes
+  depth   8192 K=2 lookup 0 decode  72.2 tok/s, 2.11 tok/pass, pass 26.6 ms, md5 63bf8c2bff
+  depth   8192 K=2 lookup 7 decode  75.9 tok/s, 2.22 tok/pass, pass 26.8 ms, md5 9cd3b9629f, lookup 39/41 in 9 passes
+  depth 130048 read 129245 tokens at 1526.6 tok/s
+  depth 130048 K=2 lookup 0 decode  73.0 tok/s, 2.21 tok/pass, pass 27.7 ms, md5 d242cd64db
+  depth 130048 K=2 lookup 7 decode  73.8 tok/s, 2.3 tok/pass, pass 28.6 ms, md5 f09dd0bfb1, lookup 34/43 in 10 passes
+  depth 130048 K=2 lookup 0 decode  68.8 tok/s, 2.09 tok/pass, pass 27.8 ms, md5 33cbc6f365
+  depth 130048 K=2 lookup 7 decode  71.5 tok/s, 2.16 tok/pass, pass 27.7 ms, md5 4fb55a0af0, lookup 19/24 in 6 passes
+  depth 250000 read 248415 tokens at 1441.2 tok/s
+  depth 250000 K=2 lookup 0 decode  65.4 tok/s, 2.04 tok/pass, pass 28.7 ms, md5 ea032101d7
+  depth 250000 K=2 lookup 7 decode  70.5 tok/s, 2.23 tok/pass, pass 28.9 ms, md5 d5c86b1c8d, lookup 35/52 in 11 passes
+  depth 250000 K=2 lookup 0 decode  66.6 tok/s, 2.08 tok/pass, pass 28.6 ms, md5 d3342dddf7
+  depth 250000 K=2 lookup 7 decode  71.6 tok/s, 2.22 tok/pass, pass 28.6 ms, md5 abb9db8d7c, lookup 31/43 in 10 passes
+### after 05:23:30 env: GGML_MMVF_F16_MAX=8 
+  depth   8192 read 8171 tokens at 1323.8 tok/s
+  depth   8192 K=2 lookup 0 decode  74.8 tok/s, 2.3 tok/pass, pass 27.9 ms, md5 2d211f514e
+  depth   8192 K=2 lookup 7 decode  75.6 tok/s, 2.26 tok/pass, pass 27.1 ms, md5 cbd28f5a83, lookup 18/19 in 4 passes
+  depth   8192 K=2 lookup 0 decode  72.8 tok/s, 2.12 tok/pass, pass 26.6 ms, md5 7b05e4ff60
+  depth   8192 K=2 lookup 7 decode  78.3 tok/s, 2.36 tok/pass, pass 27.6 ms, md5 98cc6f0abf, lookup 20/24 in 6 passes
+  depth 130048 read 129245 tokens at 1523.6 tok/s
+  depth 130048 K=2 lookup 0 decode  72.6 tok/s, 2.2 tok/pass, pass 27.9 ms, md5 e5c9d99c66
+  depth 130048 K=2 lookup 7 decode  70.5 tok/s, 2.16 tok/pass, pass 28.2 ms, md5 fe2fab5ee5, lookup 31/35 in 8 passes
+  depth 130048 K=2 lookup 0 decode  71.2 tok/s, 2.14 tok/pass, pass 27.5 ms, md5 447118916b
+  depth 130048 K=2 lookup 7 decode  71.7 tok/s, 2.18 tok/pass, pass 27.8 ms, md5 3ee0475961, lookup 36/43 in 10 passes
+  depth 250000 read 248415 tokens at 1436.7 tok/s
+  depth 250000 K=2 lookup 0 decode  67.7 tok/s, 2.12 tok/pass, pass 28.6 ms, md5 2606da3cd1
+  depth 250000 K=2 lookup 7 decode  68.5 tok/s, 2.16 tok/pass, pass 28.9 ms, md5 8ed8602367, lookup 28/39 in 8 passes
+  depth 250000 K=2 lookup 0 decode  71.2 tok/s, 2.2 tok/pass, pass 28.5 ms, md5 6a702a3000
+  depth 250000 K=2 lookup 7 decode  68.5 tok/s, 2.14 tok/pass, pass 28.8 ms, md5 e2a20b3e9a, lookup 18/29 in 8 passes
+### before 05:31:03 env: DS4_ASYNC=0 DS4_HC_GATES=0 DS4_DEV_SUM=0 
+  depth   8192 read 8171 tokens at 1239.3 tok/s
+  depth   8192 K=2 lookup 0 decode  61.2 tok/s, 2.12 tok/pass, pass 31.7 ms, md5 b6c098a2a5
+  depth   8192 K=2 lookup 7 decode  66.7 tok/s, 2.3 tok/pass, pass 31.9 ms, md5 4ab64e3407, lookup 38/60 in 17 passes
+  depth   8192 K=2 lookup 0 decode  66.9 tok/s, 2.26 tok/pass, pass 31.1 ms, md5 9214385a8f
+  depth   8192 K=2 lookup 7 decode  62.6 tok/s, 2.07 tok/pass, pass 30.7 ms, md5 93d0ae640e, lookup 23/31 in 6 passes
+  depth 130048 read 129245 tokens at 1515.4 tok/s
+  depth 130048 K=2 lookup 0 decode  62.7 tok/s, 2.17 tok/pass, pass 32.1 ms, md5 75f5da313c
+  depth 130048 K=2 lookup 7 decode  64.6 tok/s, 2.27 tok/pass, pass 32.6 ms, md5 cdb74da38c, lookup 31/33 in 7 passes
+  depth 130048 K=2 lookup 0 decode  62.5 tok/s, 2.14 tok/pass, pass 31.8 ms, md5 c205cbd4d8
+  depth 130048 K=2 lookup 7 decode  61.4 tok/s, 2.14 tok/pass, pass 32.3 ms, md5 16d1263083, lookup 34/45 in 10 passes
+  depth 250000 read 248415 tokens at 1433.1 tok/s
+  depth 250000 K=2 lookup 0 decode  59.5 tok/s, 2.09 tok/pass, pass 32.7 ms, md5 f02f8960b9
+  depth 250000 K=2 lookup 7 decode  60.1 tok/s, 2.12 tok/pass, pass 32.8 ms, md5 1f21b152fc, lookup 27/37 in 7 passes
+  depth 250000 K=2 lookup 0 decode  60.7 tok/s, 2.12 tok/pass, pass 32.5 ms, md5 fed9c347da
+  depth 250000 K=2 lookup 7 decode  60.6 tok/s, 2.14 tok/pass, pass 32.8 ms, md5 670774f728, lookup 31/41 in 9 passes
+### restored (deployed config) 05:38:54

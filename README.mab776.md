@@ -4,7 +4,7 @@ Fork of https://github.com/Indras-Mirror/Strata-DS4 (one developer, no releases,
 https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster than our llama.cpp stack (stack 73
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
-## STATUS 2026-10-10 night - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+## STATUS 2026-10-11 morning - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
 - **Runs**: container `strata-ds4`, image `strata-ds4:cu13` (portainer/deepseek-strata/Dockerfile: Ubuntu 24.04 +
   Python + libnccl; nothing of the engine baked in), serve/server.py + `ds4_serve` from the DEPLOY SNAPSHOT
   `models/strata-ds4/run` (bind-mounted read-only at /app; the previous one is `run.prev`). A DROP-IN for llama.cpp
@@ -22,20 +22,25 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   (conversation parking) `--arena-gib 41` + env `GGML_LI_I8=1` (the lightning indexer on int8 tensor cores, 10-10
   night; drop the line for the fp16 kernel, no rebuild) + `--lookup 7` (prompt-lookup drafts, sampled requests); the
   engine's own defaults since 10-10/11 night: emit-only compressors + batched HCA (prefill), async decode hand-offs +
-  the fused hc gates op + the verify passes' expert mix on the card (decode) - env DS4_PF_EMIT=0 / DS4_PF_HCAB=0 /
-  DS4_ASYNC=0 / DS4_HC_GATES=0 / DS4_DEV_SUM=0 = the old paths.
+  the fused hc gates op + the verify passes' expert mix on the card + the predict/tier overlap (decode) - env
+  DS4_PF_EMIT=0 / DS4_PF_HCAB=0 / DS4_ASYNC=0 / DS4_HC_GATES=0 / DS4_DEV_SUM=0 / DS4_OVL=0 = the old paths - and env
+  `GGML_MMVF_F16_MAX=8` (verify passes keep ggml's F16 vector kernel; drop the line for the tensor-core tiles).
   ~42 GiB container RAM, mem_limit 50g.
-- **Measured through the server (10-10 late: int8 indexer + emit-only compressors + batched HCA)**: prefill
+- **Measured through the server (prefill 10-10 late: int8 indexer + emit-only compressors + batched HCA; decode 10-11)**: prefill
   1,100-1,250 / **1,530** / **1,428** tok/s at 8k / 127k / 250k (morning: 1,297 / 1,192; stack 73: 1011 / 843 / 693);
-  decode K=2 60-68 / **60** / **61**, K=1 56-63 / 53-57 / 55-57, plain 47 / 45 / 43 (stack 73 with its drafter 40.8 /
-  39.0 / ~36); needles 3/3 at 251k; parked chat back in 1.2-1.4 s; agent turns read only what they appended.
+  decode after M11 (10-11 morning, greedy K=2, fresh code, mean of 4) **73.0 / 71.4 / 67.7** (before M11 65.0 / 62.5 /
+  60.3; verify pass 27.1 / 27.7 / 28.6 ms vs 31.3 / 32.1 / 32.8), K=1 ~70 / ~68 / ~67, copy-heavy edits ~100-110
+  (prompt lookup), plain 47 / 45 / 43 (stack 73 with its drafter 40.8 / 39.0 / ~36); needles 3/3 at 240k; parked
+  chat back in 0.6-1.3 s; agent turns read only what they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
   WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
 - **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 next targets
   (250k profile of the fp16-indexer build, bench/mab776-m2/work/prof/p250k-m10c; done since: the indexer on int8,
   emit-only compressors, batched HCA blocks): expert MMQ ~15 % + the Strata MMQ plumbing ~9 % (copy16 / scatter /
-  quantize), dense Q8_0 7 %; M11 (decode, Marc's plan for 10-10 night) = profile, prompt-lookup drafts (in, opt-in
-  --lookup), tree drafts, overlapped misses, GPU-side routing (design); serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
+  quantize), dense Q8_0 7 %; M11 DONE (10-10/11 night, session notes below): shipped lookup drafts, async hand-offs,
+  fused gates, the expert mix on the card, the F16 vector kernel for verify passes, the predict/tier overlap (-13 % a
+  verify pass together); not shipped: early PCIe DMAs (opt-in), tree drafts (a loss); GPU-side expert routing = a
+  design (the next decode step); to A/B: the hash-layer predict fix, GGML_PREC_F32 on the F16 decode matmuls; serve/ fixes of Strata 0.1.42 worth taking (#984, #1620,
   #1624, #1601) = a rebase-picture change, ask Marc; after the RAM upgrade: Q3_K_M, the MTP Q2_K expert sweep again,
   the 0731-aligned head again.
 
@@ -514,3 +519,22 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   (-2.4 %); 250k K=1 26.35 -> 25.25 (-4.2 %), K=2 29.48 -> 28.43 (-3.6 %).  Rollback: env DS4_OVL=0.
   (md5s can't prove exactness here: two identical OFF arms gave different texts - restarts are not bit-deterministic,
   as the README says; the teacher-forced test is the numerics gate.)
+- **M11 before / after (10-11 05:08-05:39, final_m11.sh, bench/mab776-m2/out/M11-final-before-after.log)**: the live
+  server, BEFORE = every M11 decode switch off (DS4_ASYNC=0 DS4_HC_GATES=0 DS4_DEV_SUM=0, no GGML_MMVF_F16_MAX; OVL
+  needs async) vs AFTER = the deployed config, ABBA, the same prompts in every arm (fixed nonce), greedy K=2, 512
+  tokens of fresh code, lookup 0 and 7 alternating from the same restored state; mean of 4 decodes per cell:
+
+  | decode tok/s (verify pass ms) | 8k | 127k | 250k |
+  |---|---:|---:|---:|
+  | before M11 | 65.0 (31.3) | 62.5 (32.1) | 60.3 (32.8) |
+  | **after M11** | **73.0 (27.1)** | **71.4 (27.7)** | **67.7 (28.6)** |
+  | change | +12 % (-13.5 %) | +14 % (-13.5 %) | +12 % (-12.7 %) |
+  | after + lookup 7 (this fresh-code prompt) | 75.1 | 71.9 | 69.8 |
+
+  Per item (its own 2-round server A/B, K=2 verify pass): async -3.6 % (8k, 1 round) / -2.4 % / -1.4 %; fused gates
+  inside the noise (probe +1.2 %); expert mix on the card - / -3.6 % / -4.2 %; F16 vector kernel - / -3.6 % / -3.3 %;
+  OVL -4.0 % / -2.4 % / -3.6 %.  Lookup drafts: edits +42-45 % (short prompts), fresh code +3-4 %, prose neutral.
+- **Determinism probe (10-11 05:40)**: the first request after a fresh restart (fixed prompt, greedy) still differs run
+  to run with DS4_ASYNC=0 (3/3 different md5s with the other M11 items on) - the engine's known nondeterminism
+  (expert placement / CPU-vs-GPU rows), not the async path; the all-off arm matching 2/2 in the before/after run was
+  luck.  Validate numerics with the teacher-forced KL test, never with output hashes.
