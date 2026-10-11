@@ -373,6 +373,7 @@ struct Ds4MoeImpl {
     std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     bool last_dev_sum = false;        ///< mab776 M11: the last run_multi mixed on the card (DS4_DEV_SUM)
+    bool last_ev = false;             ///< mab776 M11b: ... and recorded the caller's event instead of syncing
     std::vector<float> parts;         ///< top_k * n_embd, one expert output per routing index
     std::vector<cpu::ExpertJobMulti> jobs;
     std::vector<uint8_t> ftmp;        ///< the file tier's read buffer, top_k blobs
@@ -2302,7 +2303,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
 /// what the first did not already pay.  Entry j = t*K + k writes output row j; token t's sum is taken over its own k
 /// in order, exactly as gpu_run does for one token.
 bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const float* w, const float* x_host,
-               float* out, void* out_dev = nullptr) {
+               float* out, void* out_dev = nullptr, void* done_ev = nullptr) {
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -2564,6 +2565,16 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     static const bool check_devsum = std::getenv("DS4_CHECK_DEVSUM") != nullptr;
     const bool dev_sum = out_dev && dev_sum_on && !check_g1() && check_multi < 0;
     im.last_dev_sum = dev_sum;
+    // mab776 M11b (DS4_OVL, default on: the caller hands an event): with the mix on the card nothing below needs the
+    // card's results on the host - the stream sync becomes an event the dense finish queues behind, so the host goes on
+    // to queue finish (+ the next layer's predict and attention) while the hits, the uploads and the mix still run.
+    // What the host touches next is ordered after it, through the dense stream (finish(l) waits on this event):
+    // prefetch(l+1) writes d_pf only after predict_collect(l+1)'s event (recorded after finish(l)) or predict()'s full
+    // sync; the next call here (h_x, h_meta2, h_w, d_stage, LRU slots, parts_n, GPU 1's h_parts) only after the router
+    // readback of l+1, a full dense sync.  Admission below relies on gp.s being a BLOCKING stream (plain
+    // cudaStreamCreate): fill_slot_blocking's legacy-stream cudaMemcpy waits for it.
+    const bool use_ev = dev_sum && done_ev && !check_devsum;
+    im.last_ev = use_ev;
     if (dev_sum) {
         for (int j = 0; j < NE; ++j)
             if (cls[ent_u[j]] == CPU)
@@ -2586,7 +2597,8 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     } else {   // the readback queued before the one sync of the layer (as gpu_run)
         ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     }
-    ck(cudaStreamSynchronize(gp.s), "layer sync");
+    if (use_ev) ck(cudaEventRecord((cudaEvent_t) done_ev, gp.s), "layer event");
+    else ck(cudaStreamSynchronize(gp.s), "layer sync");
     if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter (GPU 1's are not misses)
         for (int u = 0; u < nu; ++u)
             if (!resident_u[u] && cls[u] != G1) im.vmiss[(size_t) (layer * NXL + ue[u])] = lc;
@@ -2651,6 +2663,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     if (gp.cache && !im.cfg.no_cache && !im.mixed_sizes) {
         for (int u = 0; u < nu; ++u) {
             if (cls[u] == HIT || cls[u] == G1) continue;
+            if (gp.cache->slot_of(layer, ue[u]) >= 0) continue;   // vram_lru already gave it a slot this call (as gpu_run)
             const uint8_t* p = gp.arena.ptr(layer, ue[u]);
             if (!p) continue;
             const int32_t sl = gp.cache->admit(layer, ue[u]);
@@ -3334,10 +3347,11 @@ bool Ds4MoeTier::run(int64_t layer, const int32_t* ids6, const float* w6, const 
 }
 
 bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out,
-                           void* out_dev) {
+                           void* out_dev, void* done_ev) {
     if (!im_->inited || !im_->pool) return false;
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
     im_->last_dev_sum = false;
+    im_->last_ev = false;
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
@@ -3354,13 +3368,14 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
             if (!gpu_run(*im_, layer, ids + t * K, w + t * K, x + (size_t) t * H, nullptr, out + (size_t) t * H)) return false;
         return true;
     }
-    return gpu_run_n(*im_, layer, nt, ids, w, x, out, out_dev);
+    return gpu_run_n(*im_, layer, nt, ids, w, x, out, out_dev, done_ev);
 #else
     return false;
 #endif
 }
 
 bool Ds4MoeTier::dev_sum_used() const { return im_ && im_->last_dev_sum; }
+bool Ds4MoeTier::event_used() const { return im_ && im_->last_ev; }
 
 bool Ds4MoeTier::build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err) {
     if (im_->cfg.cpu_only) return true;

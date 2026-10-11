@@ -1,0 +1,26 @@
+### check 02:34:30
+  depth   8192 K=1 decode  63.0 tok/s, 1.78 tok/pass, pass 26.9 ms
+  depth   8192 K=2 decode  68.8 tok/s, 2.31 tok/pass, pass 31.0 ms
+[devsum-chk] 77570 of 77570 token rows identical
+[devsum-chk] 77825 of 77825 token rows identical
+### off (round 1) 02:36:08
+  depth 130048 K=1 decode  63.6 tok/s, 1.79 tok/pass, pass 26.6 ms
+  depth 130048 K=2 decode  64.2 tok/s, 2.12 tok/pass, pass 30.4 ms
+  depth 250000 K=1 decode  60.0 tok/s, 1.77 tok/pass, pass 28.1 ms
+  depth 250000 K=2 decode  63.1 tok/s, 2.16 tok/pass, pass 31.8 ms
+### on (round 1) 02:42:40
+  depth 130048 K=1 decode  63.5 tok/s, 1.78 tok/pass, pass 26.6 ms
+  depth 130048 K=2 decode  68.3 tok/s, 2.17 tok/pass, pass 29.3 ms
+  depth 250000 K=1 decode  62.0 tok/s, 1.79 tok/pass, pass 27.5 ms
+  depth 250000 K=2 decode  63.3 tok/s, 2.12 tok/pass, pass 30.9 ms
+### off (round 2) 02:49:05
+  depth 130048 K=1 decode  63.2 tok/s, 1.79 tok/pass, pass 26.9 ms
+  depth 130048 K=2 decode  66.4 tok/s, 2.17 tok/pass, pass 30.0 ms
+  depth 250000 K=1 decode  59.0 tok/s, 1.76 tok/pass, pass 28.4 ms
+  depth 250000 K=2 decode  64.9 tok/s, 2.23 tok/pass, pass 31.9 ms
+### on (round 2) 02:55:31
+  depth 130048 K=1 decode  64.4 tok/s, 1.78 tok/pass, pass 26.3 ms
+  depth 130048 K=2 decode  69.3 tok/s, 2.19 tok/pass, pass 28.9 ms
+  depth 250000 K=1 decode  61.3 tok/s, 1.76 tok/pass, pass 27.3 ms
+  depth 250000 K=2 decode  67.0 tok/s, 2.17 tok/pass, pass 30.1 ms
+### restored 03:01:51

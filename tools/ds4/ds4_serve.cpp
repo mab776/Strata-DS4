@@ -942,22 +942,39 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         }
     if (!dense.begin_tokens(toks, n)) { err = dense.last_error(); return false; }
     void * const rdev = mc.cpu_only ? nullptr : dense.decode_routed_device();
-    for (int l = 0; l < n_layer; ++l) {
-        if (!mc.cpu_only && mc.pf_b > 0 && dense.predict(l, pred_i.data(), kPredW)) {   // token 0's hint
-            int m = 0;
-            for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) m++] = pred_i[(size_t) i];
-            if (m > 0) tier.prefetch(l, pred32.data(), m);
-        }
+    void * const rev = rdev ? dense.decode_sum_event() : nullptr;   // mab776 M11b (DS4_OVL), NULL = the host waits
+    const bool pfo = !mc.cpu_only && mc.pf_b > 0;
+    int l = 0;
+    auto prefetch = [&] {
+        int m = 0;
+        for (int i = 0; i < kPredW && pred_i[(size_t) i] >= 0; ++i) pred32[(size_t) m++] = pred_i[(size_t) i];
+        if (m > 0) tier.prefetch(l, pred32.data(), m);
+    };
+    const std::function<void()> hint = [&] { if (dense.predict_collect(l, pred_i.data(), kPredW)) prefetch(); };
+    for (; l < n_layer; ++l) {
+        // mab776 M11b (DS4_OVL): token 0's hint is queued with its readback, the attention queued behind it, and the
+        // hint collected (+ the prefetch DMAs issued) under the attention - the card runs predict -> attention back
+        // to back instead of idling while the host picks the prefetch and launches the attention
+        const bool ahead = pfo && dense.predict_launch(l);
+        if (pfo && !ahead && dense.predict(l, pred_i.data(), kPredW)) prefetch();   // token 0's hint
         const float * x = nullptr;
-        if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x)) { err = dense.last_error(); return false; }
+        if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x, ahead ? &hint : nullptr)) {
+            err = dense.last_error();
+            return false;
+        }
         for (int k = 0; k < top_k * n; ++k) ids32_n[(size_t) k] = ids_n[(size_t) k];
         // mab776 M11 (DS4_DEV_SUM): the tier mixes the experts' rows on the card straight into the dense half's
-        // routed-sum tensor (bit for bit its host mix) - no rows back, no upload
-        if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data(), rdev)) {
+        // routed-sum tensor (bit for bit its host mix) - no rows back, no upload; M11b: and records `rev` after it
+        // instead of waiting, the finish waits for it on the card
+        if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data(), rdev, rev)) {
             err = "tier.run_multi refused at layer " + std::to_string(l);
             return false;
         }
-        if (!dense.finish_layer_n(l, n, rdev && tier.dev_sum_used() ? nullptr : routed_n.data())) { err = dense.last_error(); return false; }
+        const bool dsum = rdev && tier.dev_sum_used();
+        if (!dense.finish_layer_n(l, n, dsum ? nullptr : routed_n.data(), dsum && tier.event_used())) {
+            err = dense.last_error();
+            return false;
+        }
     }
     return true;
 }

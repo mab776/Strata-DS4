@@ -11,6 +11,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml-impl.h"   // ggml_cgraph::uid + ggml_graph_next_uid (graph reuse, see alloc_graph)
+#include "ggml-backend-impl.h"   // ggml_backend_event::context (= a cudaEvent_t on CUDA; mab776 M11b)
 #include "ggml-cpu.h"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -103,6 +104,16 @@ bool compute_dec(ggml_backend_t be, ggml_cgraph * g) {
 void get_dec(ggml_backend_t be, const ggml_tensor * t, void * dst, size_t n) {   // waits for the stream
     if (async_on()) { ggml_backend_tensor_get_async(be, t, dst, 0, n); ggml_backend_synchronize(be); }
     else ggml_backend_tensor_get(t, dst, 0, n);
+}
+// mab776 M11b (DS4_OVL, default on; needs DS4_ASYNC): the two host waits a verify layer kept that the card had to idle
+// through - (1) the predict readback: the host picked the prefetch, then launched the attention graph; (2) the expert
+// tier's stream sync before finish was launched.  Now predict's readback lands in pinned memory behind an event and
+// the attention is queued before the host waits for it (predict_launch / predict_collect + attn_router_n's `queued`
+// hook), and the tier records an event after its mix that finish waits on ON THE CARD (decode_sum_event).  Same
+// kernels in the same stream order: exact.  DS4_OVL=0: the waits as before.
+bool ovl_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_OVL"); return !e || std::atoi(e) != 0; }();
+    return on && async_on();
 }
 
 int64_t next_pow2(int64_t v) {
@@ -347,6 +358,39 @@ struct Ds4Dense::Impl {
     // with no host wait - a pageable source has the driver stage it synchronously
     ggml_backend_buffer_t dec_hbuf = nullptr;
     float * dec_routed = nullptr;
+    // mab776 M11b (DS4_OVL): the split predict's pinned readback and its event, and the event the expert tier records
+    // after mixing into routed_sum (finish_layer_n waits on it on the card) - set up once, on CUDA only
+    static constexpr size_t kPredHost = 64 * 1024;
+    ggml_backend_buffer_t pred_hbuf = nullptr;
+    void * pred_host = nullptr;
+    ggml_backend_event_t ev_pred = nullptr, ev_sum = nullptr;
+    int  pred_il = -1;          // the layer whose predict readback is in flight
+    bool ovl_tried = false;
+    bool ovl_setup() {
+        if (ovl_tried) return ev_pred != nullptr;
+        ovl_tried = true;
+        if (!ovl_on() || !backend || ggml_backend_is_cpu(backend)) return false;
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (!dev) return false;
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg || std::strcmp(ggml_backend_reg_name(reg), "CUDA") != 0) return false;   // the tier records raw CUDA events
+        ggml_backend_dev_props props = {};
+        ggml_backend_dev_get_props(dev, &props);
+        ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(dev);
+        if (!props.caps.events || !hbt) return false;
+        pred_hbuf = ggml_backend_buft_alloc_buffer(hbt, kPredHost);
+        ev_pred = ggml_backend_event_new(dev);
+        ev_sum = ggml_backend_event_new(dev);
+        if (!pred_hbuf || !ev_pred || !ev_sum) { ovl_free(); return false; }
+        pred_host = ggml_backend_buffer_get_base(pred_hbuf);
+        return true;
+    }
+    void ovl_free() {
+        if (pred_hbuf) ggml_backend_buffer_free(pred_hbuf);
+        if (ev_pred) ggml_backend_event_free(ev_pred);
+        if (ev_sum) ggml_backend_event_free(ev_sum);
+        pred_hbuf = nullptr; pred_host = nullptr; ev_pred = nullptr; ev_sum = nullptr;
+    }
     uint8_t * pf_out_host = nullptr;
     float *   pf_fn = nullptr;
     float *   pf_routed = nullptr;
@@ -520,6 +564,7 @@ struct Ds4Dense::Impl {
         if (own_backend && backend) ggml_backend_synchronize(backend);   // mab776 M11: no async upload still reading
         // dec_hbuf (an outside owner frees - and so drains - its backend first: ds4_generate does, before this runs)
         if (dec_hbuf) ggml_backend_buffer_free(dec_hbuf);
+        ovl_free();
         if (snapbuf) ggml_backend_buffer_free(snapbuf);
         if (snapctx) ggml_free(snapctx);
         pf_free();
@@ -2045,6 +2090,30 @@ bool Ds4Dense::begin_tokens(const int * tids, int n) {
     return true;
 }
 
+// predict's host half: the hash layers' ids as read, else the top n_top of the router scores (ties keep index order
+// as std::partial_sort leaves them - the same pick whichever way the readback came)
+static void predict_pick(Ds4Dense::Impl & im, int il, const void * raw, int * top_ids, int n_top) {
+    ggml_tensor * out = im.ly[(size_t) il].predict_out;
+    const size_t ne = (size_t) ggml_nelements(out);
+    if (il < (int) im.g.hash_layer_count) {
+        // NOTE (found 10-11, kept as is): build_predict casts tid2eid's I32 rows to F32, so these "ids" are float bit
+        // patterns that prefetch() drops as out of range - the hash layers get no hint.  The fix (read floats) moves
+        // expert placement on 3 layers: an A/B of its own.
+        std::vector<int32_t> ids(ne);
+        std::memcpy(ids.data(), raw, ne * 4);
+        const int n = std::min<int>(n_top, (int) ne);
+        for (int i = 0; i < n; ++i) top_ids[i] = ids[(size_t) i];
+        return;
+    }
+    std::vector<float> sel(ne);
+    std::memcpy(sel.data(), raw, ne * 4);
+    std::vector<int> idx(ne);
+    for (size_t i = 0; i < ne; ++i) idx[i] = (int) i;
+    const int n = std::min<int>(n_top, (int) ne);
+    std::partial_sort(idx.begin(), idx.begin() + n, idx.end(), [&](int a, int b) { return sel[(size_t) a] > sel[(size_t) b]; });
+    for (int i = 0; i < n; ++i) top_ids[i] = idx[(size_t) i];
+}
+
 bool Ds4Dense::predict(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
     if (il < 0 || il >= (int) im.ly.size() || n_top <= 0) { im.err = "predict: bad layer/args"; return false; }
@@ -2057,21 +2126,35 @@ bool Ds4Dense::predict(int il, int * top_ids, int n_top) {
         return false;
     }
     ggml_tensor * out = L.predict_out;
-    if (il < (int) im.g.hash_layer_count) {
-        std::vector<int32_t> ids((size_t) ggml_nelements(out));
-        get_dec(im.backend, out, ids.data(), ids.size() * 4);
-        const int n = std::min<int>(n_top, (int) ids.size());
-        for (int i = 0; i < n; ++i) top_ids[i] = ids[(size_t) i];
-        return true;
+    std::vector<uint8_t> raw(ggml_nbytes(out));
+    get_dec(im.backend, out, raw.data(), raw.size());
+    predict_pick(im, il, raw.data(), top_ids, n_top);
+    return true;
+}
+
+bool Ds4Dense::predict_launch(int il) {
+    Impl & im = *p_;
+    if (il < 0 || il >= (int) im.ly.size() || !im.ovl_setup()) return false;
+    Impl::Layer & L = im.ly[(size_t) il];
+    if (!L.predict_out || ggml_nbytes(L.predict_out) > Impl::kPredHost) return false;
+    if (!alloc_graph(L.allo_predict, L.gf_predict, im.backend)) { im.err = "gallocr(predict) failed"; return false; }
+    if (!compute_dec(im.backend, L.gf_predict)) {
+        im.err = "predict graph compute failed";
+        return false;
     }
-    std::vector<float> sel((size_t) ggml_nelements(out));
-    get_dec(im.backend, out, sel.data(), sel.size() * 4);
-    std::vector<int> idx(sel.size());
-    for (size_t i = 0; i < sel.size(); ++i) idx[i] = (int) i;
-    const int n = std::min<int>(n_top, (int) sel.size());
-    std::partial_sort(idx.begin(), idx.begin() + n, idx.end(),
-                      [&](int a, int b) { return sel[(size_t) a] > sel[(size_t) b]; });
-    for (int i = 0; i < n; ++i) top_ids[i] = idx[(size_t) i];
+    ggml_backend_tensor_get_async(im.backend, L.predict_out, im.pred_host, 0, ggml_nbytes(L.predict_out));
+    ggml_backend_event_record(im.ev_pred, im.backend);
+    im.pred_il = il;
+    return true;
+}
+
+bool Ds4Dense::predict_collect(int il, int * top_ids, int n_top) {
+    Impl & im = *p_;
+    if (il != im.pred_il || n_top <= 0) return false;
+    im.pred_il = -1;
+    for (int i = 0; i < n_top; ++i) top_ids[i] = -1;
+    ggml_backend_event_synchronize(im.ev_pred);   // the readback alone: the attention queued behind it keeps running
+    predict_pick(im, il, im.pred_host, top_ids, n_top);
     return true;
 }
 
@@ -2089,7 +2172,7 @@ bool Ds4Dense::attn_router(int il, int pos, int tid, int * routed_ids, float * r
 }
 
 bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w,
-                             const float ** ffn_norm_host) {
+                             const float ** ffn_norm_host, const std::function<void()> * queued) {
     Impl & im = *p_;
     if (il < 0 || il >= (int) im.ly.size()) { im.err = "attn_router: bad layer"; return false; }
     if (n < 1 || n > kNtMax) { im.err = "attn_router: pass size out of range"; return false; }
@@ -2198,6 +2281,7 @@ bool Ds4Dense::attn_router_n(int il, int pos0, int n, int * routed_ids, float * 
         im.err = "attn graph compute failed";
         return false;
     }
+    if (queued && *queued) (*queued)();   // mab776 M11b: e.g. predict_collect + the prefetch, under the attention
 
     static const bool dbg_idx = std::getenv("DS4_DBG_INDEXER") != nullptr;
     if (async_on() && (dbg_idx || !L.host_attn_raw.empty() || !L.host_attn.empty()))
@@ -2325,8 +2409,11 @@ void Ds4Dense::set_route_bias(int il, const float * bias) {
 
 bool Ds4Dense::finish_layer(int il, const float * routed_sum) { return finish_layer_n(il, 1, routed_sum); }
 
-bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum) {
+bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event) {
     Impl & im = *p_;
+    // mab776 M11b: the tier's mix into routed_sum ran on its own stream and recorded ev_sum - the finish waits there.
+    // Queued first, so even if a step below fails, the next dense sync (reset, alloc) also drains the tier's work.
+    if (!routed_sum && wait_sum_event && im.ev_sum) ggml_backend_event_wait(im.backend, im.ev_sum);
     if (il < 0 || il >= (int) im.ly.size()) { im.err = "finish_layer: bad layer"; return false; }
     if (!im.ensure_n(n)) return false;
     Impl::Layer & L = im.ly[(size_t) il];
@@ -2778,6 +2865,11 @@ bool Ds4Dense::prefill_end() {
 }
 
 void Ds4Dense::prefill_release() { p_->pf_free(); }
+
+void * Ds4Dense::decode_sum_event() {
+    Impl & im = *p_;
+    return im.ovl_setup() && im.ev_sum ? im.ev_sum->context : nullptr;   // ggml-cuda's event context: the cudaEvent_t
+}
 
 void * Ds4Dense::decode_routed_device() {
     Impl & im = *p_;

@@ -474,3 +474,43 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   other's runs through the shared container name - gpuwin now holds a flock; and SIGTERM did not stop a window
   script - windows stop through a STOP file checked between runs.
 
+- **F16 matvec for verify passes (a360f164, env `GGML_MMVF_F16_MAX=8`, ggml patch ggml-zz-mmvf-f16-batch.patch,
+  deployed 10-11)**: ggml-cuda multiplies an F16 weight by 2-8 columns with mul_mat_f (tensor-core tiles).  A verify
+  pass's F16 weights are the small ones the loader makes of our F32/BF16 tensors (the geometry wants F16): the
+  hyper-connection mixes (16,384 x 24), the compressors', the indexer's - where the verify trace had
+  mul_mat_f<half2> at 11.9 us a call vs 6.8 us for the one-token vector kernel, ~200 calls a pass.  With the env set,
+  small F16 weights keep the vector kernel up to 8 columns: per column the one-token decode's own arithmetic (ggml's
+  default half2 accumulation for F16 weights; the router is set to F32 and stays so).  Server, 2 rounds, verify pass
+  ms off -> on: 127k K=1 26.1 -> 24.9 (-4.6 %), K=2 29.05 -> 28.0 (-3.6 %); 250k K=1 27.45 -> 26.05 (-5.1 %), K=2
+  30.5 -> 29.5 (-3.3 %).  Teacher-forced (m7c/forced_test.py at 127k, KL of each logits row vs a plain run): verify
+  rows 0.0018-0.0020 off, 0.0020-0.0025 on, plain vs plain 0.0017-0.0020 in both = inside the run-to-run noise
+  (M7c: 0.0018-0.0026).  Needles 3/3 at 240k, smoke OK.  Rollback: drop the env line.
+  Follow-up worth an A/B: every one-token step accumulates those F16 matmuls in half precision too (ggml's default),
+  where llama.cpp runs them from the F32 tensors in F32 - GGML_PREC_F32 on them in the decode graphs should cost
+  ~nothing (memory-bound) and might be measurably cleaner.
+- **Found, not fixed: predict() never hints the 3 hash-routed layers** - build_predict casts tid2eid's I32 ids to F32
+  and predict() reads the floats back as int32 (7.0f -> 1088421888), which prefetch() drops as out of range (only
+  expert 0 = 0.0f passes).  One line to fix (read floats), but it moves expert placement on 3 of 43 layers (CPU/GPU
+  rows round differently): an A/B of its own.  Marked in predict_pick.
+- **A-B-A artifact (not a regression)**: with max_tokens 300 a sampled A1 can spend all of it reasoning; aba.py then
+  sends an empty assistant turn, the template collapses it and A2's new question lands INSIDE A's user turn - before
+  the turn checkpoint, so nothing is reused (the tell: A2's prompt only +10 tokens, B2 +4).  Gates now use aba2.py
+  (max_tokens 1500).
+- **DS4_OVL - the last two host waits of a verify layer (M11b, default on)**: after DS4_ASYNC a layer still had the
+  card idle twice while the host worked: (1) predict's readback -> the host picked the prefetch -> only then launched
+  the attention graph; (2) the expert tier's cudaStreamSynchronize -> only then was finish launched.  Now
+  `predict_launch` queues predict + its readback into pinned memory + an event, the attention is queued behind it, and
+  attn_router_n's `queued` hook runs `predict_collect` (that event alone) + the prefetch DMAs under the attention; and
+  the tier, when it mixed on the card (DS4_DEV_SUM), records `decode_sum_event()` after its last op instead of
+  syncing, finish_layer_n waits on it on the card, and the host goes on queuing finish + the next predict + attention.
+  Same kernels, same stream order = exact.  What makes it safe (the tier's comment has the list): everything the host
+  reuses in layer l+1 is touched only after it observed something on the dense stream ordered after finish(l) - which
+  waited on the tier's event: predict_collect's event (d_pf) or the router readback (h_x / h_meta2 / h_w / d_stage /
+  LRU slots / parts_n / GPU 1's h_parts); the pass's last finish syncs the dense stream.  One adversarial review
+  (agent): no defect; its two hardening points were taken (the event wait is queued first thing in finish_layer_n so
+  an error path's dense sync drains the tier too; gpu_run_n's admission skips experts vram_lru already placed, as
+  gpu_run does - dormant on our mixed-size layers).  Server A/B, 2 rounds ABBA, fixed prompts, verify pass ms off -> on:
+  8k K=1 24.15 -> 23.45 (-2.9 %), K=2 27.43 -> 26.33 (-4.0 %); 127k K=1 25.15 -> 24.25 (-3.6 %), K=2 28.33 -> 27.65
+  (-2.4 %); 250k K=1 26.35 -> 25.25 (-4.2 %), K=2 29.48 -> 28.43 (-3.6 %).  Rollback: env DS4_OVL=0.
+  (md5s can't prove exactness here: two identical OFF arms gave different texts - restarts are not bit-deterministic,
+  as the README says; the teacher-forced test is the numerics gate.)

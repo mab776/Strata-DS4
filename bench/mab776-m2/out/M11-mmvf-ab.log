@@ -1,0 +1,21 @@
+### off (round 1) 03:19:26
+  depth 130048 K=1 decode  64.1 tok/s, 1.76 tok/pass, pass 26.0 ms
+  depth 130048 K=2 decode  68.2 tok/s, 2.15 tok/pass, pass 28.9 ms
+  depth 250000 K=1 decode  62.2 tok/s, 1.79 tok/pass, pass 27.4 ms
+  depth 250000 K=2 decode  66.0 tok/s, 2.19 tok/pass, pass 30.7 ms
+### on (round 1) 03:25:41
+  depth 130048 K=1 decode  68.2 tok/s, 1.8 tok/pass, pass 25.0 ms
+  depth 130048 K=2 decode  68.9 tok/s, 2.11 tok/pass, pass 28.1 ms
+  depth 250000 K=1 decode  65.0 tok/s, 1.78 tok/pass, pass 26.0 ms
+  depth 250000 K=2 decode  64.1 tok/s, 2.05 tok/pass, pass 29.4 ms
+### off (round 2) 03:32:03
+  depth 130048 K=1 decode  64.6 tok/s, 1.79 tok/pass, pass 26.2 ms
+  depth 130048 K=2 decode  68.5 tok/s, 2.18 tok/pass, pass 29.2 ms
+  depth 250000 K=1 decode  61.4 tok/s, 1.77 tok/pass, pass 27.5 ms
+  depth 250000 K=2 decode  62.4 tok/s, 2.04 tok/pass, pass 30.3 ms
+### on (round 2) 03:38:37
+  depth 130048 K=1 decode  67.4 tok/s, 1.77 tok/pass, pass 24.8 ms
+  depth 130048 K=2 decode  70.6 tok/s, 2.16 tok/pass, pass 27.9 ms
+  depth 250000 K=1 decode  64.6 tok/s, 1.78 tok/pass, pass 26.1 ms
+  depth 250000 K=2 decode  66.5 tok/s, 2.12 tok/pass, pass 29.6 ms
+### restored 03:45:06

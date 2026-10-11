@@ -1,0 +1,40 @@
+### forced (deployed config) 04:51:24 a360f164 a360f164-dirty snapshot 2026-10-11T04:17:22-04:00
+== ovl-on (depth 130048, 384 rows)
+  plain-a : KL mean 0.00177 median 0.00041 p95 0.00821 max 0.0224, top-1 differs 10/384
+  K1-a    : KL mean 0.00266 median 0.00049 p95 0.01083 max 0.1405, top-1 differs 5/384 | by slot 0.00357 0.00169
+  K2-a    : KL mean 0.00213 median 0.00068 p95 0.01001 max 0.0286, top-1 differs 10/384 | by slot 0.00180 0.00196 0.00251
+  plain-b : KL mean 0.00197 median 0.00047 p95 0.00857 max 0.0430, top-1 differs 7/384
+  K2-b    : KL mean 0.00216 median 0.00060 p95 0.00912 max 0.0288, top-1 differs 13/384 | by slot 0.00196 0.00222 0.00219
+  K1-b    : KL mean 0.00224 median 0.00053 p95 0.00941 max 0.0364, top-1 differs 9/384 | by slot 0.00261 0.00184
+   gen 8492 ms (45.2 tok/s), length; drafts off (mtp_k=0); experts GPU0 84.7% GPU1 11.1% CPU 1.9% PCIe 2.3%
+   gen 7944 ms (48.3 tok/s), length; drafts off (mtp_k=0); experts GPU0 86.9% GPU1 11.1% CPU 0.9% PCIe 1.1%
+   gen 4979 ms (77.1 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 24.4 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+   gen 3857 ms (99.6 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 27.3 ms, 3.00 tokens each), MTP window 0
+   gen 7895 ms (48.6 tok/s), length; drafts off (mtp_k=0); experts GPU0 87.6% GPU1 11.1% CPU 0.6% PCIe 0.7%
+   gen 3775 ms (101.7 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 26.7 ms, 3.00 tokens each), MTP window 
+   gen 4857 ms (79.1 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 23.8 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+### deployed config 04:55:09
+### smoke
+1 plain: '391' | reasoning chars 211 | finish stop | usage {'prompt_tokens': 17, 'completion_tokens': 80, 'total_tokens': 97, 'prompt_tokens_details': {'cached_tokens': 0}} | 1.9s
+2 stream: TTFT 0.32s, 417 chunks, reasoning 1483 chars, content: 'Silicon whispers,  \nThousands of cores compute fast—  \nRender dreams in time.'
+3 tools: tool_calls [{"id": "call_d5d1466d312a40e7b3274c35", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Montreal\", \"unit\": \"c\"}"}}] | content None | 3.4s
+4 tool result: stop 'The weather in Montreal is currently **7°C** with **light rain**.' | usage {'prompt_tokens': 388, 'completion_tokens': 18, 'total_tokens': 406, 'prompt_tokens_details': {'cached_
+### needles 256k (sampled, T 1.0)
+--- content: 'meadow-copper-504'
+prompt 239794 tokens generated in 3661 ms (70.5 tok/s) lookup 79/95 accepted in 19 passes 
+--- content: 'falcon-quartz-940'
+prompt 239795 tokens generated in 1858 ms (57.0 tok/s) lookup 20/29 accepted in 8 passes 
+--- content: 'willow-cobalt-696'
+prompt 239794 tokens generated in 429 ms (60.7 tok/s) lookup 2/2 accepted in 1 passes 
+### aba (max_tokens 1500)
+== A-B-A
+{"req": "A1 (fresh, ~100k)", "prompt_tokens": 92809, "reused": 0, "read": 92809, "ttft_s": 60.65, "prompt_ms": 60541, "gen": 363, "decode_tok_s": 64.1, "drafts": "188/355", "wall_s": 66.3}
+{"req": "B1 (side chat, A parked)", "prompt_tokens": 18543, "reused": 0, "read": 18543, "ttft_s": 12.65, "prompt_ms": 12622, "gen": 577, "decode_tok_s": 72.6, "drafts": "325/534", "wall_s": 20.6}
+{"req": "A2 (back to A + 1 turn)", "prompt_tokens": 93002, "reused": 92808, "read": 194, "ttft_s": 1.29, "prompt_ms": 1200, "gen": 244, "decode_tok_s": 59.8, "drafts": "118/255", "wall_s": 5.4}
+== A-B-C-A (3 parked)
+{"req": "C1 (third chat)", "prompt_tokens": 10159, "reused": 0, "read": 10159, "ttft_s": 6.46, "prompt_ms": 6450, "gen": 75, "decode_tok_s": 54.0, "drafts": "33/84", "wall_s": 7.9}
+{"req": "B2 (back to B)", "prompt_tokens": 18566, "reused": 18542, "read": 24, "ttft_s": 0.61, "prompt_ms": 588, "gen": 640, "decode_tok_s": 78.3, "drafts": "383/584", "wall_s": 8.8}
+{"req": "A3 (back to A again)", "prompt_tokens": 93073, "reused": 93001, "read": 72, "ttft_s": 1.23, "prompt_ms": 1134, "gen": 579, "decode_tok_s": 59.1, "drafts": "269/621", "wall_s": 11.0}
+{"req": "C2 (back to C)", "prompt_tokens": 10225, "reused": 10158, "read": 67, "ttft_s": 1.18, "prompt_ms": 1169, "gen": 1500, "decode_tok_s": 98.2, "drafts": "1078/1292", "wall_s": 16.5}
+GEN #8: 92809 tokens common 1 -> reset, reused 0 GEN #9: 18543 tokens common 4 -> reset, reused 0 GEN #10: 93002 tokens common 92808 -> checkpoint turn, reused 92808 unparked 93172 tokens GEN #11: 10159 tokens common 2 -> reset, reused 0 GEN #12: 18566 tokens common 18542 -> checkpoint turn, reused 18542 unparked 19120 tokens GEN #13: 93073 tokens common 93001 -> checkpoint turn, reused 93001 unparked 93246 tokens GEN #14: 10225 tokens common 10158 -> checkpoint turn, reused 10158 unparked 10234 tokens 
+### done 05:06:10

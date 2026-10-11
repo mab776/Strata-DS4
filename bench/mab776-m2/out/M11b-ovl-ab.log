@@ -1,0 +1,41 @@
+### on 04:20:48 a360f164 a360f164-dirty snapshot 2026-10 env: GGML_MMVF_F16_MAX=8 
+  depth   8192 K=1 decode  71.1 tok/s, 1.75 tok/pass, pass 23.2 ms, md5 124d202a2d
+  depth   8192 K=2 decode  70.3 tok/s, 2.01 tok/pass, pass 26.1 ms, md5 f965cc64d7
+  depth   8192 K=2 decode  70.9 tok/s, 2.04 tok/pass, pass 26.3 ms, md5 fa866c64ed
+  depth 130048 K=1 decode  68.9 tok/s, 1.77 tok/pass, pass 24.2 ms, md5 075423f79f
+  depth 130048 K=2 decode  70.4 tok/s, 2.12 tok/pass, pass 27.7 ms, md5 4fd7370b47
+  depth 130048 K=2 decode  73.6 tok/s, 2.22 tok/pass, pass 27.7 ms, md5 2d807e6f69
+  depth 250000 K=1 decode  68.6 tok/s, 1.82 tok/pass, pass 25.2 ms, md5 997d3f26eb
+  depth 250000 K=2 decode  71.8 tok/s, 2.22 tok/pass, pass 28.5 ms, md5 262f6f288a
+  depth 250000 K=2 decode  74.0 tok/s, 2.25 tok/pass, pass 28.0 ms, md5 b2c0e4e394
+### off 04:27:57 a360f164 a360f164-dirty snapshot 2026-10 env: GGML_MMVF_F16_MAX=8 DS4_OVL=0 
+  depth   8192 K=1 decode  70.4 tok/s, 1.8 tok/pass, pass 24.1 ms, md5 7ff4094cb2
+  depth   8192 K=2 decode  70.6 tok/s, 2.13 tok/pass, pass 27.6 ms, md5 a07a6f6b5d
+  depth   8192 K=2 decode  72.9 tok/s, 2.14 tok/pass, pass 26.9 ms, md5 3402099058
+  depth 130048 K=1 decode  67.3 tok/s, 1.78 tok/pass, pass 25.2 ms, md5 5dd069eb0d
+  depth 130048 K=2 decode  67.4 tok/s, 2.07 tok/pass, pass 28.3 ms, md5 0e6e966064
+  depth 130048 K=2 decode  68.2 tok/s, 2.1 tok/pass, pass 28.1 ms, md5 3941b665bf
+  depth 250000 K=1 decode  64.1 tok/s, 1.79 tok/pass, pass 26.6 ms, md5 80e5dfd73b
+  depth 250000 K=2 decode  71.0 tok/s, 2.3 tok/pass, pass 29.7 ms, md5 7e85dc479f
+  depth 250000 K=2 decode  69.8 tok/s, 2.2 tok/pass, pass 29.1 ms, md5 ff962faf68
+### off 04:35:23 a360f164 a360f164-dirty snapshot 2026-10 env: GGML_MMVF_F16_MAX=8 DS4_OVL=0 
+  depth   8192 K=1 decode  69.1 tok/s, 1.77 tok/pass, pass 24.2 ms, md5 19b1accce0
+  depth   8192 K=2 decode  70.9 tok/s, 2.13 tok/pass, pass 27.6 ms, md5 4cc7421376
+  depth   8192 K=2 decode  69.9 tok/s, 2.12 tok/pass, pass 27.6 ms, md5 f4df090661
+  depth 130048 K=1 decode  66.0 tok/s, 1.74 tok/pass, pass 25.1 ms, md5 af10bfab7c
+  depth 130048 K=2 decode  68.2 tok/s, 2.12 tok/pass, pass 28.5 ms, md5 8d0a217ead
+  depth 130048 K=2 decode  70.6 tok/s, 2.18 tok/pass, pass 28.4 ms, md5 05baf12119
+  depth 250000 K=1 decode  66.1 tok/s, 1.81 tok/pass, pass 26.1 ms, md5 cc4e507920
+  depth 250000 K=2 decode  67.3 tok/s, 2.13 tok/pass, pass 29.3 ms, md5 a3f6e02f8f
+  depth 250000 K=2 decode  69.2 tok/s, 2.23 tok/pass, pass 29.8 ms, md5 929a05d559
+### on 04:42:38 a360f164 a360f164-dirty snapshot 2026-10 env: GGML_MMVF_F16_MAX=8 
+  depth   8192 K=1 decode  69.4 tok/s, 1.74 tok/pass, pass 23.7 ms, md5 4c149e77eb
+  depth   8192 K=2 decode  72.4 tok/s, 2.13 tok/pass, pass 26.7 ms, md5 8bf475eb4e
+  depth   8192 K=2 decode  70.6 tok/s, 2.02 tok/pass, pass 26.2 ms, md5 de6964c753
+  depth 130048 K=1 decode  66.9 tok/s, 1.72 tok/pass, pass 24.3 ms, md5 0638cd9299
+  depth 130048 K=2 decode  72.5 tok/s, 2.18 tok/pass, pass 27.6 ms, md5 d76bf8ba92
+  depth 130048 K=2 decode  69.0 tok/s, 2.07 tok/pass, pass 27.6 ms, md5 2558c3006a
+  depth 250000 K=1 decode  66.3 tok/s, 1.77 tok/pass, pass 25.3 ms, md5 460e9b0997
+  depth 250000 K=2 decode  69.6 tok/s, 2.18 tok/pass, pass 28.9 ms, md5 455c467763
+  depth 250000 K=2 decode  70.8 tok/s, 2.19 tok/pass, pass 28.3 ms, md5 2bb6b995a8
+### restored (deployed config) 04:49:46

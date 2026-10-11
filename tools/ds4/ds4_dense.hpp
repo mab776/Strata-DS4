@@ -28,6 +28,7 @@
 
 #include "strata/artifact/ds4_geometry.hpp"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -115,6 +116,12 @@ public:
     /// tid2eid ids in the first n_expert_used slots.  `top_ids` holds `n_top` entries (n_top <= 16);
     /// unused slots are set to -1.  A hint only: it does not change the decode result.
     bool predict(int il, int * top_ids, int n_top);
+    /// mab776 M11b (DS4_OVL): predict() in two halves - launch queues the graph and its readback (pinned, an event
+    /// marks it) without waiting, collect waits for that readback alone and returns what predict() would.  A caller
+    /// queues the layer's attention between them, so the card never idles while the host picks the prefetch.  launch
+    /// returns false when unavailable (CPU backend, no events, DS4_OVL=0, DS4_ASYNC=0): use predict().
+    bool predict_launch(int il);
+    bool predict_collect(int il, int * top_ids, int n_top);
 
     /// Attention for layer `il` at position `pos` + the layer's MoE router + the shared expert.
     /// `routed_ids`/`routed_w` must hold n_expert_used entries; `routed_w` is the final normalised,
@@ -125,13 +132,16 @@ public:
                      const float ** ffn_norm_host, ggml_tensor ** ffn_norm_dev);
     /// attn_router for the pass begun by begin_tokens(tids, n), positions pos0..pos0+n-1.  `routed_ids`/`routed_w`
     /// hold n * n_expert_used entries (token-major); `*ffn_norm_host` points at n * n_embd floats (token-major).
-    bool attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w, const float ** ffn_norm_host);
+    bool attn_router_n(int il, int pos0, int n, int * routed_ids, float * routed_w, const float ** ffn_norm_host,
+                       const std::function<void()> * queued = nullptr);   ///< M11b: run once the graph is queued
 
     /// Add the routed-expert sum (n_embd f32, host) to the shared expert held from `attn_router` and run the
     /// ffn hyper-connection into the next layer state.
     bool finish_layer(int il, const float * routed_sum);
     /// finish_layer for an n-token pass: `routed_sum` is n * n_embd floats (token-major).
-    bool finish_layer_n(int il, int n, const float * routed_sum);
+    /// wait_sum_event (mab776 M11b, with routed_sum == NULL): the finish waits on the card for decode_sum_event(),
+    /// which the expert tier recorded after its mix, instead of the host having waited for the tier
+    bool finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event = false);
 
     /// Head for the current state: hc_head -> output_norm -> output.  Valid after the last layer's
     /// `finish_layer`.  `*out` is a borrowed [n_vocab] f32 host buffer.
@@ -193,6 +203,9 @@ public:
     /// NULL on the CPU backend - the expert tier on GPU 0 mixes straight into it; finish_layer_n(il, n, nullptr) then
     /// skips the upload
     void * decode_routed_device();
+    /// mab776 M11b (DS4_OVL): a cudaEvent_t on the dense backend's device for the expert tier to record after it mixed
+    /// into decode_routed_device() (Ds4MoeTier::run_multi's done_ev), or NULL (CPU backend, no events, DS4_OVL=0)
+    void * decode_sum_event();
     const float * tap_attn_raw(int il) const;
     const float * tap_attn_out(int il) const;
     const float * tap_l_last  (int il) const;

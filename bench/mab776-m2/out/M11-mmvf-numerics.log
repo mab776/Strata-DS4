@@ -1,0 +1,51 @@
+### forced off 03:46:22
+== mmvf-off (depth 130048, 384 rows)
+  plain-a : KL mean 0.00166 median 0.00047 p95 0.00770 max 0.0249, top-1 differs 6/384
+  K1-a    : KL mean 0.00183 median 0.00043 p95 0.00840 max 0.0273, top-1 differs 6/384 | by slot 0.00192 0.00171
+  K2-a    : KL mean 0.00195 median 0.00040 p95 0.00817 max 0.0575, top-1 differs 5/384 | by slot 0.00175 0.00200 0.00203
+  plain-b : KL mean 0.00203 median 0.00043 p95 0.00832 max 0.0446, top-1 differs 9/384
+  K2-b    : KL mean 0.00191 median 0.00043 p95 0.00849 max 0.0412, top-1 differs 6/384 | by slot 0.00209 0.00198 0.00165
+  K1-b    : KL mean 0.00196 median 0.00051 p95 0.00814 max 0.0496, top-1 differs 9/384 | by slot 0.00216 0.00177
+   gen 8346 ms (46.0 tok/s), length; drafts off (mtp_k=0); experts GPU0 84.9% GPU1 10.9% CPU 1.9% PCIe 2.3%
+   gen 7833 ms (49.0 tok/s), length; drafts off (mtp_k=0); experts GPU0 87.1% GPU1 10.9% CPU 0.9% PCIe 1.1%
+   gen 5339 ms (71.9 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 26.3 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+   gen 4070 ms (94.4 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 29.1 ms, 3.00 tokens each), MTP window 0
+   gen 7803 ms (49.2 tok/s), length; drafts off (mtp_k=0); experts GPU0 87.9% GPU1 10.9% CPU 0.5% PCIe 0.7%
+   gen 3981 ms (96.5 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 28.4 ms, 3.00 tokens each), MTP window 0
+   gen 5182 ms (74.1 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 25.5 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+### forced on 03:50:02
+== mmvf-on (depth 130048, 384 rows)
+  plain-a : KL mean 0.00172 median 0.00041 p95 0.00723 max 0.0378, top-1 differs 8/384
+  K1-a    : KL mean 0.00203 median 0.00043 p95 0.00958 max 0.0239, top-1 differs 9/384 | by slot 0.00174 0.00232
+  K2-a    : KL mean 0.00211 median 0.00055 p95 0.00951 max 0.0337, top-1 differs 8/384 | by slot 0.00169 0.00196 0.00258
+  plain-b : KL mean 0.00196 median 0.00050 p95 0.00893 max 0.0745, top-1 differs 10/384
+  K2-b    : KL mean 0.00250 median 0.00061 p95 0.01098 max 0.0381, top-1 differs 12/384 | by slot 0.00234 0.00243 0.00269
+  K1-b    : KL mean 0.00216 median 0.00052 p95 0.00947 max 0.0249, top-1 differs 8/384 | by slot 0.00209 0.00221
+   gen 8311 ms (46.2 tok/s), length; drafts off (mtp_k=0); experts GPU0 85.5% GPU1 10.5% CPU 1.8% PCIe 2.2%
+   gen 7883 ms (48.7 tok/s), length; drafts off (mtp_k=0); experts GPU0 87.5% GPU1 10.5% CPU 0.9% PCIe 1.1%
+   gen 5024 ms (76.4 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 24.7 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+   gen 3946 ms (97.3 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 27.8 ms, 3.00 tokens each), MTP window 0
+   gen 7774 ms (49.4 tok/s), length; drafts off (mtp_k=0); experts GPU0 88.3% GPU1 10.4% CPU 0.6% PCIe 0.7%
+   gen 3819 ms (100.5 tok/s), length; drafts 256/256 accepted (K=2, by position 128/128 128/128; 128 passes of 27.2 ms, 3.00 tokens each), MTP window 
+   gen 4917 ms (78.1 tok/s), length; drafts 192/192 accepted (K=1, by position 192/192; 192 passes of 24.2 ms, 2.00 tokens each), MTP window 0 ms, 1.1
+### override on 03:53:51
+### smoke
+1 plain: '391' | reasoning chars 211 | finish stop | usage {'prompt_tokens': 17, 'completion_tokens': 80, 'total_tokens': 97, 'prompt_tokens_details': {'cached_tokens': 0}} | 1.9s
+2 stream: TTFT 0.31s, 158 chunks, reasoning 556 chars, content: 'Silicon whispers,\nparallel threads weave the code,\npixels bloom in light.'
+3 tools: tool_calls [{"id": "call_267ba647f5c04b19bbdc6d5b", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\": \"Montreal\", \"unit\": \"c\"}"}}] | content None | 3.4s
+4 tool result: stop 'The weather in Montreal is currently **7°C** with **light rain**.' | usage {'prompt_tokens': 388, 'completion_tokens': 18, 'total_tokens': 406, 'prompt_tokens_details': {'cached_
+### needles 256k (sampled, T 1.0)
+--- content: 'meadow-copper-504'
+prompt 239794 tokens generated in 1305 ms (59.0 tok/s) lookup 14/17 accepted in 4 passes 
+--- content: 'falcon-quartz-940'
+prompt 239795 tokens generated in 1976 ms (60.2 tok/s) lookup 16/21 accepted in 6 passes 
+--- content: 'willow-cobalt-696'
+prompt 239794 tokens generated in 696 ms (69.0 tok/s) lookup 12/13 accepted in 3 passes 
+### aba
+== A-B-A
+{"req": "A1 (fresh, ~100k)", "prompt_tokens": 92809, "reused": 0, "read": 92809, "ttft_s": 60.55, "prompt_ms": 60451, "gen": 300, "decode_tok_s": 67.1, "drafts": "176/259", "wall_s": 65.0}
+{"req": "B1 (side chat, A parked)", "prompt_tokens": 18543, "reused": 0, "read": 18543, "ttft_s": 12.69, "prompt_ms": 12671, "gen": 300, "decode_tok_s": 68.4, "drafts": "171/277", "wall_s": 17.1}
+{"req": "A2 (back to A + 1 turn)", "prompt_tokens": 92819, "reused": 0, "read": 92819, "ttft_s": 60.26, "prompt_ms": 60165, "gen": 300, "decode_tok_s": 57.6, "drafts": "143/321", "wall_s": 65.5}
+== A-B-C-A (3 parked)
+{"req": "C1 (third chat)", "prompt_tokens": 10159, "reused": 0, "read": 10159, "ttft_s": 6.4, "prompt_ms": 6385, "gen": 300, "decode_tok_s": 66.9, "drafts": "164/287", "wall_s": 10.9}
+### restored (override off) 04:06:48
