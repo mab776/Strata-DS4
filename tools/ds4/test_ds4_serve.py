@@ -1055,6 +1055,36 @@ class TErrors(Case):
                 finally:
                     self.assertEqual(eng.close(), 0)
 
+    def test_nonfinite_logits_drop_the_state(self):
+        """mab776 M13 (the NaN guard, DS4_NAN_INJECT=<k>: the k-th checked pass reports non-finite logits): the request
+        ends DONE ... nonfinite with none of that pass's tokens, every state is dropped (the next request reads from
+        token 0 and matches a fresh engine), and DS4_NAN_GUARD=0 never fires."""
+        p = prompt(40, 420)
+        ref = Serve("tame")
+        try:
+            want = ref.gen(p, 12).tokens
+        finally:
+            self.assertEqual(ref.close(), 0)
+        eng = Serve("tame", env={"DS4_NAN_INJECT": "1,20"})   # checks: request 1 = #1, request 2 = #2..#13, 3 = #14..
+        try:
+            r = eng.gen(p, 12)                       # the first checked pass (the prompt's last row) fires
+            self.assertEqual((r.finish, r.tokens), ("nonfinite", []))
+            r = eng.gen(p, 12)                       # read again from token 0: the fresh engine's reply
+            self.assertEqual((r.resume, r.tokens, r.finish), (0, want, "length"))
+            r = eng.gen(p + want + prompt(5, 421), 12)   # check #20 (this request's 7th) fires mid-reply
+            self.assertEqual(r.finish, "nonfinite")
+            self.assertEqual(len(r.tokens), 6)
+            r = eng.gen(p, 12)
+            self.assertEqual((r.resume, r.tokens), (0, want))
+            self.assertIn("non-finite logits", eng.log_tail())
+        finally:
+            self.assertEqual(eng.close(), 0)
+        off = Serve("tame", env={"DS4_NAN_INJECT": "1", "DS4_NAN_GUARD": "0"})
+        try:
+            self.assertEqual(off.gen(p, 12).tokens, want)
+        finally:
+            self.assertEqual(off.close(), 0)
+
     def test_context_clamp_and_flags(self):
         e = Serve("tame", "--ctx", 100000)   # the last --ctx wins: 100000, clamped to the model's 4096
         try:

@@ -20,7 +20,9 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -458,6 +460,36 @@ def _object_list(value, name: str) -> list[dict]:
     return value
 
 
+_TOOL_ORDERS: "OrderedDict[frozenset, tuple]" = OrderedDict()   # a set of tool names -> the order it first came in
+_TOOL_ORDERS_LOCK = threading.Lock()
+_TOOL_ORDERS_MAX = 64
+
+
+def _stable_tool_order(tools: list[dict], name_of) -> list[dict]:
+    """The same set of tools comes back in the order it was first seen.  Clients send their tools in the order their
+    MCP servers finished registering, which can differ from one request (or one client restart) to the next, and the
+    template renders the tool list before the system prompt: one swap moves the shared prefix back thousands of
+    tokens and the whole conversation is read again (opencode issue 23571).  A request's first sight of a tool set
+    is untouched (so its prompt is byte for byte what the client sent); later requests with the same names in
+    another order are put back in that first order.  Duplicate names, or a single tool: left as sent."""
+    if len(tools) < 2:
+        return tools
+    names = [name_of(t) for t in tools]
+    if len(set(names)) != len(names):
+        return tools
+    key = frozenset(names)
+    with _TOOL_ORDERS_LOCK:
+        order = _TOOL_ORDERS.get(key)
+        if order is None:
+            _TOOL_ORDERS[key] = tuple(names)
+            while len(_TOOL_ORDERS) > _TOOL_ORDERS_MAX:
+                _TOOL_ORDERS.popitem(last=False)
+            return tools
+        _TOOL_ORDERS.move_to_end(key)
+    pos = {n: k for k, n in enumerate(order)}
+    return sorted(tools, key=lambda t: pos[name_of(t)])
+
+
 def _tool_list(value, wrapper: str | None) -> list[dict]:
     """#592: a request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
     {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
@@ -485,7 +517,7 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
             # AttributeError in the request thread - after the 200 and whatever the model had said before the call
             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
                              f"parameters), not {type(schema).__name__}")
-    return tools
+    return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
 
 
 def tool_arguments(raw) -> dict:

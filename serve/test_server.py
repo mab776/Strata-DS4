@@ -22,7 +22,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
-from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, GpuBusy, MockEngine, PP_DONE_TAIL, Service,  # noqa: E402
+from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
+                          PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_timings, serve, start_failure_hint)
@@ -2040,6 +2041,129 @@ class RepeatStop(unittest.TestCase):
         self.assertEqual(done["finish"], "stop")
 
 
+class NonFiniteEngine(MockEngine):
+    """#879: each pass ends on the engine's `DONE ... nonfinite` after plan[i] tokens (None, or no plan left: the
+    script runs whole), as StrataEngine.generate raises it.  A pass that ends on it had reused all but the last
+    prompt token; the next one reads from token 0, as the engine does."""
+
+    def __init__(self, *a, plan=(), **kw):
+        super().__init__(*a, **kw)
+        self.plan, self.calls = list(plan), []
+        self.last, self.flushed = None, False
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.calls.append(list(ids))
+        cut = self.plan.pop(0) if self.plan else None
+        # (set before the tokens: the service closes a pass at its end-of-turn token, before the code after the loop)
+        self.last = {"prompt_tokens": len(ids), "reused": 0 if self.flushed else len(ids) - 1,
+                     "finish": "nonfinite" if cut is not None else "stop"}
+        self.flushed = False
+        for i, t in enumerate(super().generate(ids, max_new, sampling, cancel, embeddings)):
+            if cut is not None and i >= cut:
+                break
+            yield t
+        if cut is not None:
+            self.flushed = True
+            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+
+
+class NonFiniteLogits(unittest.TestCase):
+    """#879: non-finite logits before the first token -> the same request once more; after tokens went out -> the
+    reply ends as "length"; again on the retry -> an error, no loop."""
+
+    def run_reply(self, plan):
+        tok = ByteTokenizer()
+        eng = NonFiniteEngine(tok, "hello", max_context=CTX, plan=plan)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ids = tok.encode("hi")
+        events, done, error = [], None, None
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                for kind, x in svc.run(ids, False, None, 100, {}, threading.Event()):
+                    if kind == "done":
+                        done = x
+                    elif kind == "event":
+                        events.append(x)
+            except EngineNonFinite as e:
+                error = e
+        text = "".join(ev.text or "" for ev in events if ev.kind == "content")
+        return eng, svc, ids, done, error, text, out.getvalue()
+
+    def test_nothing_emitted_is_retried_once(self):
+        eng, svc, ids, done, error, text, log = self.run_reply([0])
+        self.assertIsNone(error)
+        self.assertEqual(eng.calls, [ids, ids])                  # the same request, once more
+        self.assertEqual(done["finish"], "stop")
+        self.assertEqual(text, "hello")
+        self.assertIn("non-finite before the first token", log)
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "stop")
+        self.assertEqual(svc.metrics()["requests"][0]["reused"], 0)  # the retry's DONE, not the failed pass's
+
+    def test_mid_reply_ends_without_retry(self):
+        eng, svc, ids, done, error, text, log = self.run_reply([3])    # "hel"
+        self.assertIsNone(error)
+        self.assertEqual(len(eng.calls), 1)
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 3))
+        self.assertEqual(text, "hel")
+        self.assertIn("non-finite after 3 tokens", log)
+
+    def test_twice_is_an_error(self):
+        eng, svc, ids, done, error, text, log = self.run_reply([0, 0, 0])
+        self.assertIsNotNone(error)
+        self.assertIn("twice in a row", str(error))
+        self.assertEqual(eng.calls, [ids, ids])                  # one retry, no loop
+        self.assertEqual(eng.plan, [0])
+        self.assertIsNone(done)
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_twice_over_http(self):
+        tok = ByteTokenizer()
+        svc = Service(NonFiniteEngine(tok, "ok", max_context=CTX, plan=[0, 0]), tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            for path, stream in (("/v1/chat/completions", False), ("/v1/chat/completions", True),
+                                 ("/v1/responses", False)):
+                svc.engine.plan = [0, 0]
+                body = {"model": "m", "max_tokens": 20, "stream": stream, "messages": [{"role": "user", "content": "hi"}]}
+                if path == "/v1/responses":
+                    body = {"model": "m", "max_output_tokens": 20, "input": "hi"}
+                req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with contextlib.redirect_stdout(io.StringIO()):
+                    try:
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            code, text = r.status, r.read().decode()
+                    except urllib.error.HTTPError as e:
+                        with e:
+                            code, text = e.code, e.read().decode()
+                self.assertEqual(code, 200 if stream else 503, text)
+                self.assertIn("twice in a row", text)
+                self.assertIn("server_error", text)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_engine_done_line_raises(self):
+        """StrataEngine.generate: `DONE ... nonfinite` raises EngineNonFinite after the tokens before it."""
+        import queue as queue_
+        eng = object.__new__(StrataEngine)
+        eng.lines = queue_.Queue()
+        for line in ("T 5", "T 6", "DONE 2 3 1.0 2.0 nonfinite 0 0 0"):
+            eng.lines.put(line)
+        eng.proc = SimpleNamespace(stdin=io.StringIO())
+        eng.alive = lambda: True
+        eng.silence_s, eng.can_stop, eng.last = 0, True, None
+        got = []
+        with self.assertRaises(EngineNonFinite):
+            for t in eng.generate([1, 2, 3], 10, {}, threading.Event()):
+                got.append(t)
+        self.assertEqual(got, [5, 6])
+        self.assertEqual(eng.last["finish"], "nonfinite")
+        self.assertNotIn("STOP", eng.proc.stdin.getvalue())   # the DONE was read: nothing to stop or drain
+
+
 class LayerSplit(unittest.TestCase):
     """#644: "layer_split" is the first layer of each later GPU; a list is accepted, counts per card are not."""
 
@@ -3329,6 +3453,41 @@ class ThinkingBudget(unittest.TestCase):
         code, b = self.openai(reasoning_budget_tokens=0)
         self.assertEqual(b["choices"][0]["message"]["reasoning_content"], ThinkingEngine.THOUGHT)
         self.assertEqual(len(self.engine.prompts), 3)
+
+    def test_a_budget_above_max_tokens_is_capped_to_leave_room_for_the_answer(self):
+        """#984: max_tokens 300 and a budget of 5000 never fired: the reply ended while still thinking.  The thinking
+        is closed at max_tokens less the answer's reserve (max 512 or a quarter, at most half), with one log line."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, b = self.openai(max_tokens=300, reasoning_budget_tokens=5000)
+        self.assertEqual(code, 200, b)
+        msg = b["choices"][0]["message"]
+        self.assertTrue(msg["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:150] + "\n"), msg)
+        self.assertEqual((msg["content"], b["choices"][0]["finish_reason"]), (ThinkingEngine.ANSWER, "stop"))
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertIn("thinking capped at 150 of max_tokens 300 to leave room for the answer (budget 5000)", out.getvalue())
+
+    def test_a_budget_well_below_max_tokens_is_not_capped(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code, b = self.openai(max_tokens=3000, reasoning_budget_tokens=20)
+        self.assertNotIn("thinking capped", out.getvalue())
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(b["choices"][0]["message"]["reasoning_content"].startswith(ThinkingEngine.THOUGHT[:20] + "\n"))
+
+    def test_the_thinking_progress_line_shows_the_budget_not_max_tokens(self):
+        """#984: 'thinking: x of max 6400' read as if the budget was ignored; while a budget applies the line shows it."""
+        st = {"phase": "thinking", "generated": 10, "first_token": time.time() - 1, "started": time.time() - 2,
+              "max_tokens": 6400, "thinking_budget": 2048}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.svc._progress(0, st=st)
+            self.svc._progress(0, st={**st, "phase": "answering"})
+            self.svc._progress(0, st={**st, "thinking_budget": None})
+        lines = out.getvalue().splitlines()
+        self.assertIn("thinking: 10 of budget 2048 (max 6400) tokens", lines[0])
+        self.assertIn("answering: 10 of max 6400 tokens", lines[1])
+        self.assertIn("thinking: 10 of max 6400 tokens", lines[2])
 
     def test_a_shared_budget_reaches_a_request_that_sets_none(self):
         """The Chat settings shared with other apps may carry a thinking budget too, like max_tokens and the effort."""
@@ -4836,6 +4995,36 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
         first = svc.encode_prompt(*anthropic_to_messages({"system": self.blocks(c="b145e"), "messages": turn1,
                                                          "tools": tools}))
         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+
+
+class ToolOrder(unittest.TestCase):
+    """A tool set that comes back in another order is put back in the order it was first seen (RealScaniX, #1624): the
+    template renders the tool list before the system prompt, so a client whose MCP tools register in a varying order
+    would move the shared prefix back thousands of tokens on every turn and have the conversation read again.  The
+    first request of a set is left exactly as sent."""
+
+    def names(self, tools, wrapper="function"):
+        from serve.frontend import _tool_list
+        return [t.get(wrapper, t)["name"] for t in _tool_list(tools, wrapper)]
+
+    def test_openai_shape_keeps_the_first_order(self):
+        a = [{"type": "function", "function": {"name": n}} for n in ("t1624_read", "t1624_rbash", "t1624_ctx7")]
+        self.assertEqual(self.names(a), ["t1624_read", "t1624_rbash", "t1624_ctx7"])      # the first sight: as sent
+        self.assertEqual(self.names(list(reversed(a))), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+        self.assertEqual(self.names(a[1:] + a[:1]), ["t1624_read", "t1624_rbash", "t1624_ctx7"])
+
+    def test_anthropic_shape_and_a_different_set(self):
+        a = [{"name": "t1624_read", "input_schema": {}}, {"name": "t1624_edit", "input_schema": {}}]
+        self.assertEqual(self.names(a, None), ["t1624_read", "t1624_edit"])
+        self.assertEqual(self.names(a[::-1], None), ["t1624_read", "t1624_edit"])
+        more = a[::-1] + [{"name": "t1624_new", "input_schema": {}}]       # another set: as sent, then remembered
+        self.assertEqual(self.names(more, None), ["t1624_edit", "t1624_read", "t1624_new"])
+
+    def test_duplicate_names_and_one_tool_are_left_alone(self):
+        d = [{"name": "t1624_x", "input_schema": {}}, {"name": "t1624_x", "input_schema": {"a": 1}}]
+        self.assertEqual(self.names(d, None), ["t1624_x", "t1624_x"])
+        one = [{"name": "t1624_only", "input_schema": {}}]
+        self.assertEqual(self.names(one, None), ["t1624_only"])
 
 
 class UntimedReads(unittest.TestCase):

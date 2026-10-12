@@ -19,7 +19,9 @@ docker run --rm --name ds4-build -e NVIDIA_VISIBLE_DEVICES=none --memory ${BUILD
     for p in tools/ds4/patches/*.patch; do
       [ -f \"\$p\" ] || continue
       if (cd third_party/llama.cpp && git apply --check -R /src/\$p 2>/dev/null); then echo \"ggml patch already in: \$p\";
-      else (cd third_party/llama.cpp && git apply /src/\$p) && echo \"ggml patch applied: \$p\"; fi
+      elif (cd third_party/llama.cpp && git apply --check /src/\$p 2>/dev/null); then
+        (cd third_party/llama.cpp && git apply /src/\$p) && echo \"ggml patch applied: \$p\";
+      else echo \"ggml patch neither applies nor reverts alone (a later patch edits next to it - in already?): \$p\"; fi
     done
     cmake -S . -B ${BUILD_DIR:-build-ds4-gpu} -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
       -DSTRATA_MMQ_KQUANTS=ON -DSTRATA_BUILD_TESTS=ON -DCMAKE_CUDA_ARCHITECTURES=120a -DSTRATA_GGML_DIR=/src/third_party/llama.cpp \

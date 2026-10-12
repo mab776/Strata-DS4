@@ -1,0 +1,457 @@
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -586,6 +586,8 @@
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
+         GGML_OP_DSV4_HC_GATES,
++        GGML_OP_DSV4_HC_MIX,
++        GGML_OP_DSV4_HC_PRE_NORM,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2740,6 +2742,27 @@
+             struct ggml_tensor  * base,
+             float                 eps);
+ 
++    // hc_mix (mab776 M13): hc_pre's mixes in one op - the RMS norm of the flattened streams and the [k, m] F16
++    // projection.  fn [k, m] F16, x [k, n_tokens] F32 (contiguous rows) -> [m, n_tokens]
++    //   result[i, t] = (sum_j fn[j, i]*x[j, t]) * rsqrt(mean_j x[j, t]^2 + eps)
++    //   the norm's scale applied after the dot product (not bit-identical to mul_mat(fn, rms_norm(x)))
++    //
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * fn,
++            struct ggml_tensor  * x,
++            float                 eps);
++
++    // hc_pre_norm (mab776 M13): rms_norm(dsv4_hc_pre(x, weights)) * norm_w in one op, rounded as the two ops do.
++    //   x [n_embd, hc, n_tokens], weights [hc, n_tokens], norm_w [n_embd] -> [n_embd, n_tokens]
++    //
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_pre_norm(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * weights,
++            struct ggml_tensor  * norm_w,
++            float                 eps);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1085,6 +1085,8 @@
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
+     "DSV4_HC_GATES",
++    "DSV4_HC_MIX",
++    "DSV4_HC_PRE_NORM",
+ 
+     "UNARY",
+ 
+@@ -1102,7 +1104,7 @@
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1201,6 +1203,8 @@
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
+     "dsv4_hc_gates(mixes, scale, base)",
++    "dsv4_hc_mix(fn, x)",
++    "dsv4_hc_pre_norm(x, weights, norm_w)",
+ 
+     "unary(x)",
+ 
+@@ -1218,7 +1222,7 @@
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6537,6 +6541,58 @@
+ 
+     return result;
+ }
++
++// ggml_dsv4_hc_mix (mab776 M13)
++
++struct ggml_tensor * ggml_dsv4_hc_mix(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * fn,
++        struct ggml_tensor  * x,
++        float                 eps) {
++    GGML_ASSERT(fn->type == GGML_TYPE_F16);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(fn->ne[0] == x->ne[0]);
++    GGML_ASSERT(fn->ne[2] == 1 && fn->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1);
++    GGML_ASSERT(ggml_is_contiguous_rows(x) && x->nb[0] == sizeof(float));
++    GGML_ASSERT(fn->nb[0] == ggml_type_size(GGML_TYPE_F16));
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, fn->ne[1], x->ne[1]);
++
++    ggml_set_op_params_f32(result, 0, eps);
++
++    result->op     = GGML_OP_DSV4_HC_MIX;
++    result->src[0] = fn;
++    result->src[1] = x;
++
++    return result;
++}
++
++// ggml_dsv4_hc_pre_norm (mab776 M13)
++
++struct ggml_tensor * ggml_dsv4_hc_pre_norm(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * weights,
++        struct ggml_tensor  * norm_w,
++        float                 eps) {
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(weights->type == GGML_TYPE_F32);
++    GGML_ASSERT(norm_w->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->ne[3] == 1);
++    GGML_ASSERT(weights->ne[0] == x->ne[1] && weights->ne[1] == x->ne[2]);
++    GGML_ASSERT(norm_w->ne[0] == x->ne[0] && ggml_nrows(norm_w) == 1);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[2]);
++
++    ggml_set_op_params_f32(result, 0, eps);
++
++    result->op     = GGML_OP_DSV4_HC_PRE_NORM;
++    result->src[0] = x;
++    result->src[1] = weights;
++    result->src[2] = norm_w;
++
++    return result;
++}
+ 
+ // ggml_dsv4_hc_pre
+ 
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1038,7 +1038,9 @@
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+             case GGML_OP_DSV4_HC_POST:
+-            case GGML_OP_DSV4_HC_GATES: {
++            case GGML_OP_DSV4_HC_GATES:
++            case GGML_OP_DSV4_HC_MIX:
++            case GGML_OP_DSV4_HC_PRE_NORM: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2113,6 +2113,14 @@
+             {
+                 ggml_compute_forward_dsv4_hc_gates(params, tensor);
+             } break;
++        case GGML_OP_DSV4_HC_MIX:
++            {
++                ggml_compute_forward_dsv4_hc_mix(params, tensor);
++            } break;
++        case GGML_OP_DSV4_HC_PRE_NORM:
++            {
++                ggml_compute_forward_dsv4_hc_pre_norm(params, tensor);
++            } break;
+         case GGML_OP_MAP_CUSTOM1:
+             {
+                 ggml_compute_forward_map_custom1(params, tensor);
+@@ -2297,6 +2305,8 @@
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+         case GGML_OP_DSV4_HC_GATES:
++        case GGML_OP_DSV4_HC_MIX:
++        case GGML_OP_DSV4_HC_PRE_NORM:
+             {
+                 n_tasks = n_threads;
+             } break;
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11128,6 +11128,52 @@
+     }
+ }
+ 
++// ggml_compute_forward_dsv4_hc_mix (mab776 M13): the reference form, one row of fn per task
++
++void ggml_compute_forward_dsv4_hc_mix(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * fn = dst->src[0];
++    const ggml_tensor * x  = dst->src[1];
++    const int64_t k = fn->ne[0], m = fn->ne[1], n_tokens = x->ne[1];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    for (int64_t i = params->ith; i < m; i += params->nth) {
++        const ggml_fp16_t * w = (const ggml_fp16_t *) ((const char *) fn->data + i*fn->nb[1]);
++        for (int64_t t = 0; t < n_tokens; ++t) {
++            const float * xv = (const float *) ((const char *) x->data + t*x->nb[1]);
++            double d = 0.0, q = 0.0;
++            for (int64_t j = 0; j < k; ++j) {
++                d += (double) GGML_CPU_FP16_TO_FP32(w[j]) * xv[j];
++                q += (double) xv[j] * xv[j];
++            }
++            *(float *) ((char *) dst->data + i*dst->nb[0] + t*dst->nb[1]) = (float) d / sqrtf((float) (q / k) + eps);
++        }
++    }
++}
++
++// ggml_compute_forward_dsv4_hc_pre_norm (mab776 M13): hc_pre then rms_norm * norm_w, as the two ops
++
++void ggml_compute_forward_dsv4_hc_pre_norm(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * x  = dst->src[0];
++    const ggml_tensor * wt = dst->src[1];
++    const ggml_tensor * nw = dst->src[2];
++    const int64_t n_embd = x->ne[0], hc = x->ne[1], n_tokens = x->ne[2];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
++        float * d = (float *) ((char *) dst->data + t*dst->nb[1]);
++        ggml_float sum2 = 0.0;
++        for (int64_t i = 0; i < n_embd; ++i) {
++            float s = 0.0f;
++            for (int64_t h = 0; h < hc; ++h)
++                s += *(const float *) ((const char *) x->data + i*x->nb[0] + h*x->nb[1] + t*x->nb[2]) *
++                     *(const float *) ((const char *) wt->data + h*wt->nb[0] + t*wt->nb[1]);
++            d[i] = s;
++            sum2 += (ggml_float) (s*s);
++        }
++        const float scale = 1.0f/sqrtf((float) (sum2/n_embd) + eps);
++        for (int64_t i = 0; i < n_embd; ++i)
++            d[i] = d[i]*scale * *(const float *) ((const char *) nw->data + i*nw->nb[0]);
++    }
++}
++
+ // ggml_compute_forward_dsv4_hc_comb
+ 
+ static void ggml_dsv4_hc_comb_norm_cols(float * comb, float eps) {
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -107,6 +107,8 @@
+ void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_gates(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv4_hc_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_dsv4_hc_pre_norm(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -255,6 +255,177 @@
+             eps);
+ }
+ 
++// mab776 M13: hc_pre's mixes in one launch - the flattened streams' RMS norm and the F16 projection were two kernels
++// (rms_norm_f32<1024> on n_tokens blocks: ~5 us at 3 tokens, then the [16384 x 24] matvec), three times a decode layer.
++// One block per output row: every thread reads its half2 weights once and both sums (x.w and x.x) for every token from
++// the same float2 loads; the scale is applied after the dot (so not bit-identical to the two ops).
++template <int nt>
++static __global__ void dsv4_hc_mix_f32(
++        const half  * fn,
++        const float * x,
++        float * dst,
++        int64_t k,
++        int64_t sf1,
++        int64_t sx1,
++        int64_t sd0,
++        int64_t sd1,
++        float   eps) {
++    ggml_cuda_pdl_lc();
++    const int64_t row = blockIdx.x;
++    const half2 * w2 = (const half2 *) (fn + row*sf1);
++    float dot[nt], ss[nt];
++#pragma unroll
++    for (int t = 0; t < nt; ++t) {
++        dot[t] = 0.0f;
++        ss[t]  = 0.0f;
++    }
++    ggml_cuda_pdl_sync();
++    for (int64_t j = threadIdx.x; j < k/2; j += blockDim.x) {
++        const float2 w = __half22float2(w2[j]);
++#pragma unroll
++        for (int t = 0; t < nt; ++t) {
++            const float2 v = ((const float2 *) (x + t*sx1))[j];
++            dot[t] += w.x*v.x + w.y*v.y;
++            ss[t]  += v.x*v.x + v.y*v.y;
++        }
++    }
++#pragma unroll
++    for (int t = 0; t < nt; ++t) {
++        dot[t] = warp_reduce_sum(dot[t]);
++        ss[t]  = warp_reduce_sum(ss[t]);
++    }
++    __shared__ float s_part[32][2*nt];
++    const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE, nwarps = blockDim.x / WARP_SIZE;
++    if (lane == 0) {
++#pragma unroll
++        for (int t = 0; t < nt; ++t) {
++            s_part[warp][2*t]     = dot[t];
++            s_part[warp][2*t + 1] = ss[t];
++        }
++    }
++    __syncthreads();
++    if (warp == 0) {
++#pragma unroll
++        for (int t = 0; t < nt; ++t) {
++            float d = lane < nwarps ? s_part[lane][2*t]     : 0.0f;
++            float q = lane < nwarps ? s_part[lane][2*t + 1] : 0.0f;
++            d = warp_reduce_sum(d);
++            q = warp_reduce_sum(q);
++            if (lane == 0) {
++                dst[row*sd0 + t*sd1] = d * rsqrtf(q / (float) k + eps);
++            }
++        }
++    }
++}
++
++void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * fn = dst->src[0];
++    const ggml_tensor * x  = dst->src[1];
++
++    GGML_ASSERT(fn->type == GGML_TYPE_F16);
++    GGML_ASSERT(x->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(fn->ne[0] % 2 == 0);
++    GGML_ASSERT((fn->nb[1] % 4) == 0 && (x->nb[1] % 8) == 0);
++    GGML_ASSERT(x->ne[1] >= 1 && x->ne[1] <= 8);
++
++    const int64_t k = fn->ne[0];
++    const int64_t m = fn->ne[1];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const dim3 block_dims(1024, 1, 1);
++    const dim3 grid_dims((unsigned) m, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
++    const half  * fd = (const half *) fn->data;
++    const float * xd = (const float *) x->data;
++    float * dd = (float *) dst->data;
++    const int64_t sf1 = fn->nb[1] / sizeof(half), sx1 = x->nb[1] / sizeof(float);
++    const int64_t sd0 = dst->nb[0] / sizeof(float), sd1 = dst->nb[1] / sizeof(float);
++    switch (x->ne[1]) {
++#define HC_MIX_CASE(NT) case NT: ggml_cuda_kernel_launch(dsv4_hc_mix_f32<NT>, launch_params, fd, xd, dd, k, sf1, sx1, sd0, sd1, eps); break;
++        HC_MIX_CASE(1) HC_MIX_CASE(2) HC_MIX_CASE(3) HC_MIX_CASE(4)
++        HC_MIX_CASE(5) HC_MIX_CASE(6) HC_MIX_CASE(7) HC_MIX_CASE(8)
++#undef HC_MIX_CASE
++        default: GGML_ABORT("dsv4_hc_mix: n_tokens");
++    }
++}
++
++// mab776 M13: rms_norm(hc_pre(x, weights)) * norm_w in one launch, rounded exactly as the two ops are: the weighted sum
++// is dsv4_hc_pre_f32's expression for every element, kept in registers, and the norm is rms_norm_f32<1024, true>'s
++// loop, block reduction and products (same block size, same order) - one block per token.  The intermediate never
++// goes to memory and one launch (~1.8 us at 3 tokens) is gone.
++static constexpr int DSV4_PN_BLOCK = 1024;
++static constexpr int DSV4_PN_MAXPER = 8;   // n_embd <= 8192
++
++static __global__ void dsv4_hc_pre_norm_f32(
++        const float * x,
++        const float * weights,
++        const float * norm_w,
++        float * dst,
++        int     n_embd,
++        int64_t hc,
++        int64_t sx0,
++        int64_t sx1,
++        int64_t sx2,
++        int64_t sw0,
++        int64_t sw1,
++        int64_t sn0,
++        int64_t sd0,
++        int64_t sd1,
++        float   eps) {
++    ggml_cuda_pdl_lc();
++    const int64_t it  = blockIdx.x;
++    const int     tid = threadIdx.x;
++    float y[DSV4_PN_MAXPER];
++    float tmp = 0.0f;
++    ggml_cuda_pdl_sync();
++    int j = 0;
++    for (int col = tid; col < n_embd; col += DSV4_PN_BLOCK, ++j) {
++        float sum = 0.0f;
++        for (int64_t ih = 0; ih < hc; ++ih) {
++            const float xv = x[col*sx0 + ih*sx1 + it*sx2];
++            const float wv = weights[ih*sw0 + it*sw1];
++            sum += xv * wv;
++        }
++        const float xi = 1.0f * sum;   // dsv4_hc_pre_f32 stores scale * sum (scale 1)
++        y[j] = xi;
++        tmp += xi * xi;
++    }
++    __shared__ float s_sum[32];
++    tmp = block_reduce<block_reduce_method::SUM, DSV4_PN_BLOCK>(tmp, s_sum);
++    const float mean  = tmp / n_embd;
++    const float scale = rsqrtf(mean + eps);
++    j = 0;
++    for (int col = tid; col < n_embd; col += DSV4_PN_BLOCK, ++j) {
++        dst[col*sd0 + it*sd1] = scale * y[j] * norm_w[col*sn0];
++    }
++}
++
++void ggml_cuda_op_dsv4_hc_pre_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * x       = dst->src[0];
++    const ggml_tensor * weights = dst->src[1];
++    const ggml_tensor * norm_w  = dst->src[2];
++
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && norm_w->type == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(x->ne[0] <= (int64_t) DSV4_PN_BLOCK*DSV4_PN_MAXPER);
++
++    const int64_t n_embd   = x->ne[0];
++    const int64_t hc       = x->ne[1];
++    const int64_t n_tokens = x->ne[2];
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const dim3 block_dims(DSV4_PN_BLOCK, 1, 1);
++    const dim3 grid_dims((unsigned) n_tokens, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
++    ggml_cuda_kernel_launch(dsv4_hc_pre_norm_f32, launch_params,
++            (const float *) x->data, (const float *) weights->data, (const float *) norm_w->data, (float *) dst->data,
++            (int) n_embd, hc,
++            (int64_t) (x->nb[0] / sizeof(float)), (int64_t) (x->nb[1] / sizeof(float)), (int64_t) (x->nb[2] / sizeof(float)),
++            (int64_t) (weights->nb[0] / sizeof(float)), (int64_t) (weights->nb[1] / sizeof(float)),
++            (int64_t) (norm_w->nb[0] / sizeof(float)),
++            (int64_t) (dst->nb[0] / sizeof(float)), (int64_t) (dst->nb[1] / sizeof(float)),
++            eps);
++}
++
+ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * mixes = dst->src[0];
+     const ggml_tensor * scale = dst->src[1];
+--- a/ggml/src/ggml-cuda/dsv4-hc.cuh
++++ b/ggml/src/ggml-cuda/dsv4-hc.cuh
+@@ -5,3 +5,5 @@
+ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_dsv4_hc_gates(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv4_hc_mix(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_op_dsv4_hc_pre_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2388,6 +2388,12 @@
+         case GGML_OP_DSV4_HC_GATES:
+             ggml_cuda_op_dsv4_hc_gates(ctx, dst);
+             break;
++        case GGML_OP_DSV4_HC_MIX:
++            ggml_cuda_op_dsv4_hc_mix(ctx, dst);
++            break;
++        case GGML_OP_DSV4_HC_PRE_NORM:
++            ggml_cuda_op_dsv4_hc_pre_norm(ctx, dst);
++            break;
+         case GGML_OP_DSV4_HC_PRE:
+             ggml_cuda_op_dsv4_hc_pre(ctx, dst);
+             break;
+@@ -5499,6 +5505,12 @@
+         case GGML_OP_DSV4_HC_PRE:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->type == GGML_TYPE_F32;
++        case GGML_OP_DSV4_HC_MIX:
++            return op->src[0]->type == GGML_TYPE_F16 && op->src[1]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                op->src[1]->ne[1] >= 1 && op->src[1]->ne[1] <= 8 && op->src[0]->ne[0] % 2 == 0;
++        case GGML_OP_DSV4_HC_PRE_NORM:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
++                op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] <= 8192;
+         case GGML_OP_DSV4_HC_POST:
+             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                 op->src[2]->type == GGML_TYPE_F32 && (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&

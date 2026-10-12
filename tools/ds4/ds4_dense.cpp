@@ -377,6 +377,8 @@ struct Ds4Dense::Impl {
     // with no host wait - a pageable source has the driver stage it synchronously
     ggml_backend_buffer_t dec_hbuf = nullptr;
     float * dec_routed = nullptr;
+    ggml_backend_buffer_t pf_in_buf = nullptr;   // mab776 M13 (DS4_PF_PINNED): a prompt chunk's inputs, pinned (kept)
+    size_t pf_in_n = 0;
     // mab776 M11b (DS4_OVL): the split predict's pinned readback and its event, and the event the expert tier records
     // after mixing into routed_sum (finish_layer_n waits on it on the card) - set up once, on CUDA only
     static constexpr size_t kPredHost = 64 * 1024;
@@ -528,6 +530,8 @@ struct Ds4Dense::Impl {
         ggml_gallocr_t allo_predict = nullptr;
         ggml_cgraph * gf_finish[kNtMax + 1] = {};      // by n
         ggml_gallocr_t allo_finish[kNtMax + 1] = {};
+        ggml_cgraph * gf_finish_f[kNtMax + 1] = {};    // mab776 M13: ... with shexp already in routed_sum (DS4_SH_FOLD)
+        ggml_gallocr_t allo_finish_f[kNtMax + 1] = {};
         std::vector<float> host_fn, host_attn_raw, host_attn, host_llast;   // [.., kNtMax]
         int  tap_n = 0;                   // the n of the pass the taps / host_fn hold
         bool have_attn = false, have_finish = false;
@@ -586,6 +590,7 @@ struct Ds4Dense::Impl {
         if (own_backend && backend) ggml_backend_synchronize(backend);   // mab776 M11: no async upload still reading
         // dec_hbuf (an outside owner frees - and so drains - its backend first: ds4_generate does, before this runs)
         if (dec_hbuf) ggml_backend_buffer_free(dec_hbuf);
+        if (pf_in_buf) ggml_backend_buffer_free(pf_in_buf);
         ovl_free();
         if (snapbuf) ggml_backend_buffer_free(snapbuf);
         if (snapctx) ggml_free(snapctx);
@@ -594,6 +599,7 @@ struct Ds4Dense::Impl {
         for (Layer & L : ly) {
             free_allo(L.allo_predict);
             for (ggml_gallocr_t a : L.allo_finish) free_allo(a);
+            for (ggml_gallocr_t a : L.allo_finish_f) free_allo(a);
         }
         for (ggml_gallocr_t a : allo_init) free_allo(a);
         for (ggml_gallocr_t a : allo_head) free_allo(a);
@@ -691,12 +697,27 @@ struct B {
         return acc;
     }
     // deepseek4.cpp:351-407
+    // mab776 M13 (upstream 0.1.43's "HC norm from registers" / QFUSE_HC, ported to our graph): on the GPU
+    // - DS4_HC_MIX (default on): a decode pass's mixes (<= kNtMax tokens) in ONE op, ggml_dsv4_hc_mix - the flattened
+    //   streams' RMS norm and the [16384 x 24] F16 projection were two kernels (the norm alone ~5 us on n blocks),
+    //   three times a layer.  The norm's scale is applied after the dot: not bit-identical (KL-gated).
+    // - DS4_HC_PRENORM (default on): with `norm_w`, the weighted stream mean and the RMS norm * norm_w that follows it
+    //   in one op, ggml_dsv4_hc_pre_norm, rounded exactly as the two ops (bit-identical; prompt chunks too).
+    // The CPU keeps the ops (its gate stays as is).  =0 = the separate ops as before.
+    static bool mix_on() { static const bool on = [] { const char * e = std::getenv("DS4_HC_MIX"); return !e || std::atoi(e) != 0; }(); return on; }
+    static bool prenorm_on() { static const bool on = [] { const char * e = std::getenv("DS4_HC_PRENORM"); return !e || std::atoi(e) != 0; }(); return on; }
     ggml_tensor * hc_pre(ggml_tensor * x, ggml_tensor * fn, ggml_tensor * sc, ggml_tensor * bs,
-                         ggml_tensor ** post, ggml_tensor ** comb) const {
+                         ggml_tensor ** post, ggml_tensor ** comb, ggml_tensor * norm_w = nullptr) const {
         const int64_t D = g->n_embd, hc = g->hc, nt = x->ne[2];
+        const bool gpu = !ggml_backend_is_cpu(im->backend);
         ggml_tensor * flat = ggml_reshape_2d(c, x, hc * D, nt);
-        ggml_tensor * flat_norm = ggml_rms_norm(c, flat, (float) g->rms_eps);
-        ggml_tensor * mixes = ggml_mul_mat(c, fn, flat_norm);
+        ggml_tensor * mixes = nullptr;
+        if (gpu && mix_on() && !unfused() && fn->type == GGML_TYPE_F16 && nt <= kNtMax && (hc * D) % 2 == 0) {
+            mixes = ggml_dsv4_hc_mix(c, fn, flat, (float) g->rms_eps);
+        } else {
+            ggml_tensor * flat_norm = ggml_rms_norm(c, flat, (float) g->rms_eps);
+            mixes = ggml_mul_mat(c, fn, flat_norm);
+        }
 
         ggml_tensor * scale_pre  = v1(sc, 1, 0);
         ggml_tensor * scale_post = v1(sc, 1, 1 * sizeof(float));
@@ -732,7 +753,10 @@ struct B {
             *comb = ggml_reshape_3d(c, *comb, hc, hc, nt);
             *comb = sinkhorn(*comb);
         }
-        return hc_mean(x, pre);
+        if (!norm_w) return hc_mean(x, pre);
+        if (gpu && prenorm_on() && !unfused() && D <= 8192)
+            return ggml_dsv4_hc_pre_norm(c, x, pre, norm_w, (float) g->rms_eps);
+        return rms_w(hc_mean(x, pre), norm_w);
     }
     // deepseek4.cpp:409-444
     ggml_tensor * hc_post(ggml_tensor * x, ggml_tensor * residual, ggml_tensor * post, ggml_tensor * comb) const {
@@ -824,6 +848,7 @@ static int64_t raw_block_n(int64_t n);   // DS4_RAW_BLOCK, ditto
 static bool pf_sparse_on();   // mab776 DS4_PF_SPARSE, ditto
 static bool fused_idx_on(bool cpu);     // DS4_FUSED_IDX, ditto
 static bool ovl_gather_on();            // DS4_OVL_GATHER, ditto
+static bool lean_on(const Ds4Dense::Impl & im);   // mab776 M13 DS4_LEAN, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -859,9 +884,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     // ---- attention hyper-connection -------------------------------------------------
     ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * post_a = nullptr, * comb_a = nullptr;
-    ggml_tensor * attn_pre = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
-                                      b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a);
-    ggml_tensor * xn = b.rms_w(attn_pre, b.BL(il, "attn_norm.weight"));
+    ggml_tensor * xn = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
+                                b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a, b.BL(il, "attn_norm.weight"));
 
     // ---- q latent (kept for the indexer's query) --------------------------------------
     ggml_tensor * qr2 = ggml_mul_mat(gc, b.BL(il, "attn_q_a.weight"), xn);
@@ -1119,6 +1143,10 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
                 ggml_tensor * mseln = ggml_cont(gc, ggml_reshape_2d(gc, ggml_get_rows(gc, visn,
                                                     ggml_reshape_2d(gc, seln, ntk, n)), ntk, n));          // [ntk, n]
                 ggml_tensor * mk = nullptr;
+                if (lean_on(im)) {   // M13: -inf everywhere, query j's column block j <- its ntk mask values
+                    mk = ggml_fill_inplace(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, ntk * n, n), NEG_INF);
+                    mk = ggml_set_2d_inplace(gc, mk, mseln, (size_t) (ntk * n + ntk) * sizeof(float), 0);
+                } else
                 for (int64_t j = 0; j < n; ++j) {
                     ggml_tensor * col = ggml_view_2d(gc, mseln, ntk, 1, mseln->nb[1], (size_t) j * mseln->nb[1]);
                     if (j > 0) col = ggml_concat(gc, b.fill_f32({ j * ntk, 1 }, NEG_INF), col, 0);
@@ -1416,9 +1444,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     // ---- feed-forward hyper-connection -------------------------------------------------
     ggml_tensor * hap = b.hc_post(attn_out, xin, post_a, comb_a);
     ggml_tensor * post_f = nullptr, * comb_f = nullptr;
-    ggml_tensor * ffn_pre = b.hc_pre(hap, b.BL(il, "hc_ffn_fn.weight"), b.BL(il, "hc_ffn_scale.weight"),
-                                     b.BL(il, "hc_ffn_base.weight"), &post_f, &comb_f);
-    ggml_tensor * fn = b.rms_w(ffn_pre, b.BL(il, "ffn_norm.weight"));
+    ggml_tensor * fn = b.hc_pre(hap, b.BL(il, "hc_ffn_fn.weight"), b.BL(il, "hc_ffn_scale.weight"),
+                                b.BL(il, "hc_ffn_base.weight"), &post_f, &comb_f, b.BL(il, "ffn_norm.weight"));
 
     // ---- MoE router (ds4_ref main():904-928) -------------------------------------------
     ggml_tensor * rlog = ggml_mul_mat(gc, b.BL(il, "ffn_gate_inp.weight"), fn);
@@ -1439,7 +1466,8 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
     ggml_tensor * probs3 = ggml_reshape_3d(gc, probs, 1, im.NEXP, n);
     ggml_tensor * wts = ggml_get_rows(gc, probs3, selected);              // [1, topk, n]
     wts = ggml_reshape_2d(gc, wts, im.NUSED, n);
-    ggml_tensor * wsum = ggml_add(gc, ggml_sum_rows(gc, wts), b.fill_f32({ 1, 1 }, 0.0f));
+    ggml_tensor * wsum = lean_on(im) ? ggml_sum_rows(gc, wts)   // M13: the +0 changes nothing (a positive sum)
+                                     : ggml_add(gc, ggml_sum_rows(gc, wts), b.fill_f32({ 1, 1 }, 0.0f));
     wsum = ggml_clamp(gc, wsum, 6.103515625e-5f, INFINITY);
     wts = ggml_div(gc, wts, wsum);
     wts = ggml_reshape_3d(gc, wts, 1, im.NUSED, n);
@@ -1487,7 +1515,7 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 }
 
 // finish_layer: ffn_out = routed_sum + shexp ; l_last = hc_post(ffn_out, hap, post_f, comb_f), per token
-static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl::Layer & L) {
+static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl::Layer & L, bool folded = false) {
     ggml_context * gc = im.gctx;
     ggml_cgraph * gf = ggml_new_graph_custom(gc, 512, false);
     B b { &im, gc, &im.g };
@@ -1495,7 +1523,7 @@ static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl
 
     ggml_tensor * shex2 = ggml_view_2d(gc, L.shexp, D, n, L.shexp->nb[1], 0);
     ggml_tensor * rs    = ggml_view_2d(gc, im.routed_sum, D, n, im.routed_sum->nb[1], 0);
-    ggml_tensor * ffn_out = ggml_add(gc, shex2, rs);
+    ggml_tensor * ffn_out = folded ? rs : ggml_add(gc, shex2, rs);   // M13: the tier added shexp (DS4_SH_FOLD)
 
     ggml_tensor * hap3 = ggml_view_3d(gc, L.hap, D, HC, n, L.hap->nb[1], L.hap->nb[2], 0);
     ggml_tensor * pf2  = ggml_view_2d(gc, L.post_f, HC, n, L.post_f->nb[1], 0);
@@ -1506,9 +1534,10 @@ static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl
     ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1],
                                                                  im.x_state->nb[2], 0)));
     if (im.pf) return gf;   // a chunk graph: no l_last tap, not registered
-    ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, L.t_llast, D, HC, n, L.t_llast->nb[1],
-                                                                 L.t_llast->nb[2], 0)));
-    L.gf_finish[n] = gf;
+    if (!L.host_llast.empty() || !lean_on(im))   // M13: the tap only for the gate's taps (nobody else reads it)
+        ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, L.t_llast, D, HC, n, L.t_llast->nb[1],
+                                                                     L.t_llast->nb[2], 0)));
+    (folded ? L.gf_finish_f : L.gf_finish)[n] = gf;
     return gf;
 }
 
@@ -1521,9 +1550,8 @@ static ggml_cgraph * build_predict(Ds4Dense::Impl & im, int il, Ds4Dense::Impl::
 
     ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, 1, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * post_a = nullptr, * comb_a = nullptr;
-    ggml_tensor * attn_pre = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
-                                      b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a);
-    ggml_tensor * fnp = b.rms_w(attn_pre, b.BL(il, "ffn_norm.weight"));
+    ggml_tensor * fnp = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
+                                 b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a, b.BL(il, "ffn_norm.weight"));
     ggml_tensor * rlog = ggml_mul_mat(gc, b.BL(il, "ffn_gate_inp.weight"), fnp);
     ggml_mul_mat_set_prec(rlog, GGML_PREC_F32);
     ggml_tensor * probs = ggml_sqrt(gc, ggml_softplus(gc, rlog));
@@ -1569,17 +1597,23 @@ static ggml_cgraph * build_head(Ds4Dense::Impl & im, int64_t n, bool mtp = false
                        : arg_col >= 0 ? (size_t) arg_col * im.x_state->nb[2] : 0;
     ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], x_off);
     ggml_tensor * flat = ggml_reshape_2d(gc, xin, HC * D, n);
-    ggml_tensor * flat_norm = ggml_rms_norm(gc, flat, (float) im.g.rms_eps);
     static const bool trunk_hc = [] { const char * e = std::getenv("DS4_MTP_TRUNK_HC"); return e && *e && *e != '0'; }();
     const std::string hp = mtp && !trunk_hc ? "mtp." : "";
-    ggml_tensor * mixes = ggml_mul_mat(gc, im.w.get(hp + "output_hc_fn.weight"), flat_norm);
+    ggml_tensor * hfn = im.w.get(hp + "output_hc_fn.weight");
+    const bool gpu = !ggml_backend_is_cpu(im.backend);
+    ggml_tensor * mixes = nullptr;   // mab776 M13: DS4_HC_MIX / DS4_HC_PRENORM here too (see B::hc_pre)
+    if (gpu && B::mix_on() && !B::unfused() && !im.pf && n <= kNtMax && hfn->type == GGML_TYPE_F16 && (HC * D) % 2 == 0)
+        mixes = ggml_dsv4_hc_mix(gc, hfn, flat, (float) im.g.rms_eps);
+    else
+        mixes = ggml_mul_mat(gc, hfn, ggml_rms_norm(gc, flat, (float) im.g.rms_eps));
     ggml_tensor * scale = im.w.get(hp + "output_hc_scale.weight");
     ggml_tensor * base  = im.w.get(hp + "output_hc_base.weight");
     ggml_tensor * pre = ggml_sigmoid(gc, b.hc_affine(mixes, b.v1(scale, 1, 0), b.v1(base, HC, 0)));
     pre = ggml_scale_bias(gc, pre, 1.0f, (float) im.g.hc_eps);
-    ggml_tensor * hc_head = b.hc_mean(xin, pre);
-    ggml_tensor * rn = b.rms_w(hc_head, mtp ? b.BL((int) im.il_mtp, "nextn.shared_head_norm.weight")
-                                            : im.w.get("output_norm.weight"));
+    ggml_tensor * onw = mtp ? b.BL((int) im.il_mtp, "nextn.shared_head_norm.weight") : im.w.get("output_norm.weight");
+    ggml_tensor * rn = gpu && B::prenorm_on() && !B::unfused() && D <= 8192
+                       ? ggml_dsv4_hc_pre_norm(gc, xin, pre, onw, (float) im.g.rms_eps)
+                       : b.rms_w(b.hc_mean(xin, pre), onw);
     ggml_tensor * lg = ggml_mul_mat(gc, im.w.get("output.weight"), rn);
     if (arg_col >= 0) {
         ggml_tensor * am = ggml_argmax(gc, lg);
@@ -1939,6 +1973,11 @@ bool Ds4Dense::Impl::ensure_n(int64_t n) {
         build_finish(*this, n, L);
         L.allo_finish[n] = make_allo();
         if (!L.allo_finish[n]) { err = "ggml_gallocr_new failed"; return false; }
+        if (!pf && !ggml_backend_is_cpu(backend)) {   // mab776 M13: the folded variant (DS4_SH_FOLD), GPU decode only
+            build_finish(*this, n, L, true);
+            L.allo_finish_f[n] = make_allo();
+            if (!L.allo_finish_f[n]) { err = "ggml_gallocr_new failed"; return false; }
+        }
     }
     return true;
 }
@@ -2046,6 +2085,16 @@ static bool fused_idx_on(bool cpu) {
 // DS4_OVL_GATHER (default on): the CSA overlap compressor gathers its prev/cur state halves with one get_rows over
 // half-rows (the host writes 2*slot / 2*slot+1 into i_idx_state for CSA layers) instead of whole rows + 4 strided
 // conts + 2 concats.  DS4_OVL_GATHER=0 restores the old graph and host indices for an A/B (same bits).
+// mab776 M13 (DS4_LEAN, default on; upstream 0.1.43's "lean verify graph" idea): decode graphs on the GPU drop nodes
+// whose work nobody needs - the l_last tap copy every finish made for the gate's taps only, the +0 (a filled constant
+// and an add) on the router's weight sum, and a verify pass's per-query compressed-key mask built as one -inf fill + one
+// strided copy instead of 2(n-1) fills and ~3(n-1) concats.  Same values (adding +0 to a positive sum, copying the
+// same floats).  =0: the old graphs.
+static bool lean_on(const Ds4Dense::Impl & im) {
+    static const bool on = [] { const char * e = std::getenv("DS4_LEAN"); return !e || std::atoi(e) != 0; }();
+    return on && !ggml_backend_is_cpu(im.backend);
+}
+
 static bool ovl_gather_on() {
     static const bool on = [] { const char * e = std::getenv("DS4_OVL_GATHER"); return !e || std::atoi(e) != 0; }();
     return on;
@@ -2380,6 +2429,9 @@ bool Ds4Dense::reserve_graphs(int n_max) {
                 }
             }
             if (!ggml_gallocr_reserve(L.allo_finish[n], L.gf_finish[n])) { im.err = "reserve: finish"; return false; }
+            if (L.gf_finish_f[n] && !ggml_gallocr_reserve(L.allo_finish_f[n], L.gf_finish_f[n])) {
+                im.err = "reserve: finish (folded)"; return false;
+            }
         }
         if (L.gf_predict && !ggml_gallocr_reserve(L.allo_predict, L.gf_predict)) { im.err = "reserve: predict"; return false; }
     }
@@ -2442,7 +2494,7 @@ void Ds4Dense::set_route_bias(int il, const float * bias) {
 
 bool Ds4Dense::finish_layer(int il, const float * routed_sum) { return finish_layer_n(il, 1, routed_sum); }
 
-bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event) {
+bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event, bool sh_folded) {
     Impl & im = *p_;
     // mab776 M11b: the tier's mix into routed_sum ran on its own stream and recorded ev_sum - the finish waits there.
     // Queued first, so even if a step below fails, the next dense sync (reset, alloc) also drains the tier's work.
@@ -2450,7 +2502,12 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait
     if (il < 0 || il >= (int) im.ly.size()) { im.err = "finish_layer: bad layer"; return false; }
     if (!im.ensure_n(n)) return false;
     Impl::Layer & L = im.ly[(size_t) il];
-    if (!alloc_graph(L.allo_finish[n], L.gf_finish[n], im.backend)) { im.err = "gallocr(finish) failed"; return false; }
+    sh_folded = sh_folded && !routed_sum && L.gf_finish_f[n];
+    ggml_cgraph * const gfin = sh_folded ? L.gf_finish_f[n] : L.gf_finish[n];
+    if (!alloc_graph(sh_folded ? L.allo_finish_f[n] : L.allo_finish[n], gfin, im.backend)) {
+        im.err = "gallocr(finish) failed";
+        return false;
+    }
     const size_t rbytes = (size_t) (im.D * n) * 4;
     if (!routed_sum) {}   // mab776 M11 (DS4_DEV_SUM): the expert tier mixed straight into im.routed_sum on the device
     else if (async_on() && !im.dec_routed) {   // once: D x kNtMax floats, pinned when the backend has a host buffer type
@@ -2465,7 +2522,7 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait
     } else {
         ggml_backend_tensor_set(im.routed_sum, routed_sum, 0, rbytes);
     }
-    if (!compute_dec(im.backend, L.gf_finish[n])) {
+    if (!compute_dec(im.backend, gfin)) {
         im.err = "finish graph compute failed";
         return false;
     }
@@ -2723,21 +2780,65 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
     ggml_backend_tensor_set(im.i_span, im.in_host.data(), 0, im.in_host.size());
     im.in_pos = -1;
 
+    // mab776 M13 (DS4_PF_PINNED, default on; upstream #1712's idea): the chunk's inputs go up from one pinned buffer
+    // with async copies on the backend's stream (the chunk's graphs run behind them on that stream) instead of ~14
+    // synchronous copies from pageable memory - the embeddings (D x n floats: 32 MiB at 2048) are written straight
+    // into it.  The previous chunk's graphs and readbacks finished before this call, so the buffer is free.  Same
+    // bytes.  DS4_PF_PINNED=0: the old uploads.
+    static const bool pinned_env = [] { const char * e = std::getenv("DS4_PF_PINNED"); return !e || std::atoi(e) != 0; }();
+    uint8_t * pin = nullptr;
+    size_t pin_off = 0;
+    if (pinned_env && !ggml_backend_is_cpu(im.backend)) {
+        const int64_t n_raw = im.SWA + n - 1;
+        size_t need = (size_t) (im.D * n) * 4 + (size_t) n * 8 + (size_t) n_raw * 4 + (size_t) (n_raw * n) * 2 + 64 * 1024;
+        // + the two ratios' position / slot / state-index lists (a state index list is ring <= 128 entries a row);
+        // anything that does not fit (the host visibility masks of DS4_VIS_DEV=0) goes up the plain way
+        need += (size_t) 2 * ((size_t) n * 20 + (size_t) n * 4 * 128) + (size_t) 2 * 1024 * 1024;
+        if (!im.pf_in_buf || im.pf_in_n < need) {
+            if (im.pf_in_buf) ggml_backend_buffer_free(im.pf_in_buf);
+            im.pf_in_buf = nullptr;
+            im.pf_in_n = 0;
+            if (ggml_backend_buffer_type_t hbt = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend)))
+                if ((im.pf_in_buf = ggml_backend_buft_alloc_buffer(hbt, need))) im.pf_in_n = need;
+        }
+        if (im.pf_in_buf) pin = (uint8_t *) ggml_backend_buffer_get_base(im.pf_in_buf);
+    }
+    // a slot of `bytes` in the pinned buffer (nullptr: none, or it is full - the caller uploads the plain way)
+    auto pin_slot = [&](size_t bytes) -> void * {
+        if (!pin || pin_off + bytes > im.pf_in_n) return nullptr;
+        void * p = pin + pin_off;
+        pin_off += (bytes + 255) & ~(size_t) 255;
+        return p;
+    };
+    auto up = [&](ggml_tensor * t, const void * src, size_t bytes) {
+        if (void * p = pin_slot(bytes)) {
+            std::memcpy(p, src, bytes);
+            ggml_backend_tensor_set_async(im.backend, t, p, 0, bytes);
+        } else {
+            ggml_backend_tensor_set(t, src, 0, bytes);
+        }
+    };
+
     std::vector<int32_t> t32((size_t) n), p32((size_t) n);
-    im.host_emb.resize((size_t) (im.D * n));
+    float * emb = (float *) pin_slot((size_t) (im.D * n) * 4);
+    if (!emb) {
+        im.host_emb.resize((size_t) (im.D * n));
+        emb = im.host_emb.data();
+    }
     for (int t = 0; t < n; ++t) {
         const int tid = tids[t];
         if (tid < 0 || tid >= im.g.vocab_size) { im.err = "token id out of range"; return false; }
         t32[(size_t) t] = tid;
         p32[(size_t) t] = pos0 + t;
         const uint8_t * row = im.embd_data + (size_t) tid * im.embd_row;
-        float * dst = im.host_emb.data() + (size_t) t * im.D;
+        float * dst = emb + (size_t) t * im.D;
         if (im.embd_type == GGML_TYPE_F32) std::memcpy(dst, row, (size_t) im.D * 4);
         else ggml_get_type_traits((ggml_type) im.embd_type)->to_float(row, dst, im.D);
     }
-    ggml_backend_tensor_set(P.i_tid, t32.data(), 0, t32.size() * 4);
-    ggml_backend_tensor_set(P.i_pos, p32.data(), 0, p32.size() * 4);
-    ggml_backend_tensor_set(P.i_emb, im.host_emb.data(), 0, im.host_emb.size() * 4);
+    up(P.i_tid, t32.data(), t32.size() * 4);
+    up(P.i_pos, p32.data(), p32.size() * 4);
+    if (emb == im.host_emb.data()) ggml_backend_tensor_set(P.i_emb, emb, 0, (size_t) (im.D * n) * 4);
+    else ggml_backend_tensor_set_async(im.backend, P.i_emb, emb, 0, (size_t) (im.D * n) * 4);
 
     // a ring row of position tok: before the chunk -> its slot in the ring, inside it -> ring_sz + (tok - pos0)
     auto ext = [&](int64_t tok, int64_t ring_sz) -> int32_t {
@@ -2763,9 +2864,9 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
             }
         }
         const std::vector<int32_t> sl = tail(im.RAW);
-        ggml_backend_tensor_set(P.i_idx_raw, idx.data(), 0, idx.size() * 4);
-        ggml_backend_tensor_set(P.i_mask_raw, msk.data(), 0, msk.size() * 2);
-        ggml_backend_tensor_set(P.i_slot_raw, sl.data(), 0, sl.size() * 4);
+        up(P.i_idx_raw, idx.data(), idx.size() * 4);
+        up(P.i_mask_raw, msk.data(), msk.size() * 2);
+        up(P.i_slot_raw, sl.data(), sl.size() * 4);
     }
     for (int64_t r : { (int64_t) 4, (int64_t) 128 }) {   // compressed layers: the same per ratio
         const Impl::Layer * L = pf_layer_of_ratio(im, r);
@@ -2798,13 +2899,13 @@ bool Ds4Dense::prefill_begin(const int * tids, int n, int pos0) {
         }
         const std::vector<int32_t> ss = tail(L->ring_sz);
         R.n_emit = (int64_t) sc.size();
-        ggml_backend_tensor_set(R.i_state_pos, sp.data(), 0, sp.size() * 4);
-        ggml_backend_tensor_set(R.i_comp_pos, cpp.data(), 0, cpp.size() * 4);
-        ggml_backend_tensor_set(R.i_slot_comp, sc.data(), 0, sc.size() * 4);
-        ggml_backend_tensor_set(R.i_idx_state, sidx.data(), 0, sidx.size() * 4);
-        ggml_backend_tensor_set(R.i_slot_state, ss.data(), 0, ss.size() * 4);
-        if (vis_dev_on()) ggml_backend_tensor_set(R.i_nvis, nvis.data(), 0, nvis.size() * 4);
-        else              ggml_backend_tensor_set(R.vis_full, vis.data(), 0, vis.size() * 4);
+        up(R.i_state_pos, sp.data(), sp.size() * 4);
+        up(R.i_comp_pos, cpp.data(), cpp.size() * 4);
+        up(R.i_slot_comp, sc.data(), sc.size() * 4);
+        up(R.i_idx_state, sidx.data(), sidx.size() * 4);
+        up(R.i_slot_state, ss.data(), ss.size() * 4);
+        if (vis_dev_on()) up(R.i_nvis, nvis.data(), nvis.size() * 4);
+        else              up(R.vis_full, vis.data(), vis.size() * 4);
     }
     im.pf_pos0 = pos0;
     im.pf_n = n;
@@ -2917,6 +3018,14 @@ void * Ds4Dense::record_attn_event() {
 void * Ds4Dense::decode_sum_event() {
     Impl & im = *p_;
     return im.ovl_setup() && im.ev_sum ? im.ev_sum->context : nullptr;   // ggml-cuda's event context: the cudaEvent_t
+}
+
+const void * Ds4Dense::shexp_device(int il, int64_t * stride) const {
+    const Impl & im = *p_;
+    if (ggml_backend_is_cpu(im.backend) || il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].shexp) return nullptr;
+    const ggml_tensor * t = im.ly[(size_t) il].shexp;
+    if (stride) *stride = (int64_t) (t->nb[1] / sizeof(float));
+    return t->data;
 }
 
 void * Ds4Dense::decode_routed_device() {

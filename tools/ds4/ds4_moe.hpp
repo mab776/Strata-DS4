@@ -350,6 +350,10 @@ public:
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out,
                    void* out_dev = nullptr, void* done_ev = nullptr);
     bool dev_sum_used() const;   ///< the last run_multi wrote out_dev (mab776 M11)
+    /// mab776 M13 (DS4_SH_FOLD): the NEXT run_multi that mixes on the card adds these device rows (nt rows,
+    /// `stride` floats apart: the dense half's shared-expert output) to its mix; mix_add_used() says whether it did
+    void set_mix_add(const void* add_dev, int64_t stride);
+    bool mix_add_used() const;
     bool event_used() const;     ///< ... and recorded done_ev in place of its stream sync (mab776 M11b)
     /// mab776 M12b (DS4_DEV_ROUTE): queue `layer`'s GPU 0 hits for an `nt`-token pass from the card, before the host
     /// reads the routing back: `router_dev` = the dense side's router block on GPU 0 (per token [fn | ids | wts], `blk`

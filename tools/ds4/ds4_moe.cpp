@@ -382,6 +382,9 @@ struct Ds4MoeImpl {
     std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     bool last_dev_sum = false;        ///< mab776 M11: the last run_multi mixed on the card (DS4_DEV_SUM)
+    const float* mix_add = nullptr;   ///< mab776 M13: set_mix_add's rows for the next mix on the card (then cleared)
+    int64_t mix_add_stride = 0;
+    bool last_mix_add = false;        ///< ... and the last run_multi added them
     bool last_ev = false;             ///< mab776 M11b: ... and recorded the caller's event instead of syncing
     int64_t pre_layer = -1;           ///< mab776 M12b: the layer whose hits prelaunch_hits queued (for pre_nt tokens)
     int pre_nt = 0;
@@ -2685,7 +2688,9 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         std::memcpy(gp.h_w, w, sizeof(float) * (size_t) NE);
         ck(cudaMemcpyAsync(gp.d_w, gp.h_w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "w h2d");
         strata::kernels::weighted_rows_sum_f64((const float*) gp.d_parts, (const float*) gp.d_w, (int) K, H, nt,
-                                               (float*) out_dev, gp.s);
+                                               (float*) out_dev, gp.s, check_devsum ? nullptr : im.mix_add,
+                                               im.mix_add_stride);
+        im.last_mix_add = im.mix_add != nullptr && !check_devsum;
         if (check_devsum)   // the card's own rows back for the host loop below (the uploaded ones are read from host)
             ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     } else {   // the readback queued before the one sync of the layer (as gpu_run)
@@ -3446,6 +3451,8 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
     if (!ids || !w || !x || !out || nt < 1 || nt > kMaxTok) return false;
     im_->last_dev_sum = false;
     im_->last_ev = false;
+    im_->last_mix_add = false;
+    struct ClearAdd { Ds4MoeImpl& m; ~ClearAdd() { m.mix_add = nullptr; } } clear_add{ *im_ };   // one call only
     if (!im_->g.routed(layer)) return false;
     if (im_->cfg.cpu_only) {   // the CPU tier: token by token (no sharing; it is not the verify path)
         const int64_t K = im_->g.top_k, H = im_->g.n_embd;
@@ -3469,6 +3476,12 @@ bool Ds4MoeTier::run_multi(int64_t layer, int nt, const int32_t* ids, const floa
 }
 
 bool Ds4MoeTier::dev_sum_used() const { return im_ && im_->last_dev_sum; }
+void Ds4MoeTier::set_mix_add(const void* add_dev, int64_t stride) {
+    if (!im_) return;
+    im_->mix_add = (const float*) add_dev;
+    im_->mix_add_stride = stride;
+}
+bool Ds4MoeTier::mix_add_used() const { return im_ && im_->last_mix_add; }
 
 bool Ds4MoeTier::prelaunch_hits(int64_t layer, int nt, const void* router_dev, int64_t blk, int64_t ids_off, void* attn_ev) {
 #if defined(DS4_MOE_CUDA)

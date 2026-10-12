@@ -2815,22 +2815,27 @@ void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int
 // mab776 M11: the same mix in DOUBLE, k in order, one rounding per multiply and per add (__dmul_rn / __dadd_rn: no
 // fused multiply-add) and a round-to-nearest cast - bit for bit the decode tier's host loop (gpu_run_n), which it
 // replaces so the parts no longer come back to the host
+// mab776 M13 (`add`, DS4_SH_FOLD): + add[t * add_stride + i] after the cast - the dense finish's own `shexp + routed`
+// float add (one rounding; float addition commutes bit for bit), so that graph node goes
 __global__ void weighted_rows_sum_f64_kernel(const float* __restrict__ parts, const float* __restrict__ w, int K,
-                                             int64_t H, int64_t n, float* __restrict__ out) {
+                                             int64_t H, int64_t n, float* __restrict__ out,
+                                             const float* __restrict__ add = nullptr, int64_t add_stride = 0) {
     const int64_t total = n * H;
     for (int64_t q = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (int64_t) gridDim.x * blockDim.x) {
         const int64_t t = q / H, i = q - t * H;
         double acc = 0.0;
         for (int k = 0; k < K; ++k)
             acc = __dadd_rn(acc, __dmul_rn((double) w[t * K + k], (double) parts[(t * K + k) * H + i]));
-        out[q] = __double2float_rn(acc);
+        const float r = __double2float_rn(acc);
+        out[q] = add ? __fadd_rn(add[t * add_stride + i], r) : r;
     }
 }
 
-void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream) {
+void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream,
+                           const float* add, int64_t add_stride) {
     const int64_t total = n * H;
     const unsigned blocks = (unsigned) std::min<int64_t>((total + 255) / 256, 65535);
-    weighted_rows_sum_f64_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out);
+    weighted_rows_sum_f64_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(parts, w, K, H, n, out, add, add_stride);
     check("weighted_rows_sum_f64");
 }
 
@@ -2870,12 +2875,74 @@ __global__ void ds4_route_hits_kernel(const uint8_t* __restrict__ rb, int64_t bl
     ng_out[0] = ng;
 }
 
+// mab776 M13 (DS4_ROUTE_PAR, default on; upstream #1737's "one warp per token" idea for its route kernel): the same
+// groups from 64 threads - each entry's id, its first occurrence, the distinct experts' table reads (one per thread,
+// all at once instead of a dependent chain) and every output position by counting, with no serial walk.  Identical
+// output to the one-thread kernel above (DS4_CHECK_ROUTE=1 compares the card's groups with the host's).
+__global__ void ds4_route_hits_par_kernel(const uint8_t* __restrict__ rb, int64_t blk, int64_t ids_off, int nt, int K,
+                                          const unsigned long long* __restrict__ tab, int64_t n_tab,
+                                          unsigned long long* __restrict__ ptr, int32_t* __restrict__ start,
+                                          int32_t* __restrict__ ng_out, int32_t* __restrict__ dst, int32_t* __restrict__ tok) {
+    __shared__ int32_t s_e[64], s_first[64], s_cnt[64];
+    __shared__ unsigned long long s_p[64];
+    const int j = threadIdx.x;
+    const int NE = nt * K;
+    if (j < NE) s_e[j] = ((const int32_t*) (rb + (int64_t) (j / K) * blk + ids_off))[j % K];
+    __syncthreads();
+    int first = j;
+    if (j < NE)
+        for (int i = 0; i < j; ++i)
+            if (s_e[i] == s_e[j]) { first = i; break; }
+    if (j < NE) s_first[j] = first;
+    unsigned long long p = 0ull;
+    if (j < NE && first == j) {
+        const int32_t e = s_e[j];
+        p = (e >= 0 && e < n_tab) ? tab[e] : 0ull;
+    }
+    s_p[j] = p;   // non-zero only at a distinct expert's first entry that the card holds
+    __syncthreads();
+    if (j < NE) {   // entries of the distinct expert first seen at j (0 unless j is a first occurrence)
+        int c = 0;
+        if (first == j)
+            for (int i = j; i < NE; ++i) c += s_first[i] == j;
+        s_cnt[j] = c;
+    }
+    __syncthreads();
+    if (j >= NE) return;
+    // this entry's group: the held distinct experts first seen before its own first occurrence; its row: the rows of
+    // those groups, then its own group's earlier entries
+    const int f = s_first[j];
+    if (s_p[f] != 0ull) {
+        int g = 0, row = 0;
+        for (int i = 0; i < f; ++i)
+            if (s_p[i] != 0ull) { ++g; row += s_cnt[i]; }
+        const int base = row;
+        for (int i = f; i < j; ++i) row += s_first[i] == f;
+        dst[row] = j;
+        tok[row] = j / K;
+        if (j == f) { ptr[g] = s_p[f]; start[g] = base; }
+    }
+    if (j == 0) {   // the group count and the end marker
+        int g = 0, rows = 0;
+        for (int i = 0; i < NE; ++i)
+            if (s_p[i] != 0ull) { ++g; rows += s_cnt[i]; }
+        start[g] = rows;
+        ng_out[0] = g;
+    }
+}
+
 void ds4_route_hits(const void* router_block, int64_t blk, int64_t ids_off, int nt, int K, const unsigned long long* tab,
                     int64_t n_tab, unsigned long long* grp_ptr, int32_t* grp_start, int32_t* n_groups, int32_t* ent_dst,
                     int32_t* ent_tok, void* stream) {
     if (nt * K > 64) { std::fprintf(stderr, "ds4_route_hits: %d entries > 64\n", nt * K); std::exit(1); }
-    ds4_route_hits_kernel<<<1, 32, 0, (cudaStream_t) stream>>>((const uint8_t*) router_block, blk, ids_off, nt, K, tab,
-                                                                n_tab, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+    static const bool par = [] { const char* e = std::getenv("DS4_ROUTE_PAR"); return !e || std::atoi(e) != 0; }();
+    if (par)
+        ds4_route_hits_par_kernel<<<1, 64, 0, (cudaStream_t) stream>>>((const uint8_t*) router_block, blk, ids_off, nt, K,
+                                                                        tab, n_tab, grp_ptr, grp_start, n_groups, ent_dst,
+                                                                        ent_tok);
+    else
+        ds4_route_hits_kernel<<<1, 32, 0, (cudaStream_t) stream>>>((const uint8_t*) router_block, blk, ids_off, nt, K, tab,
+                                                                    n_tab, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
     check("ds4_route_hits");
 }
 

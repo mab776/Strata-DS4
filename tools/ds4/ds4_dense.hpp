@@ -141,7 +141,12 @@ public:
     /// finish_layer for an n-token pass: `routed_sum` is n * n_embd floats (token-major).
     /// wait_sum_event (mab776 M11b, with routed_sum == NULL): the finish waits on the card for decode_sum_event(),
     /// which the expert tier recorded after its mix, instead of the host having waited for the tier
-    bool finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event = false);
+    /// sh_folded (mab776 M13, DS4_SH_FOLD, with routed_sum == NULL): the tier's mix already added shexp_device(il)
+    /// (Ds4MoeTier::set_mix_add): the finish skips its own `shexp + routed` add
+    bool finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event = false, bool sh_folded = false);
+    /// mab776 M13: layer il's shared-expert output on the device (kNtMax rows, *stride floats apart), written by its
+    /// attention graph; NULL on the CPU backend
+    const void * shexp_device(int il, int64_t * stride) const;
 
     /// Head for the current state: hc_head -> output_norm -> output.  Valid after the last layer's
     /// `finish_layer`.  `*out` is a borrowed [n_vocab] f32 host buffer.

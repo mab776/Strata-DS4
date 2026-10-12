@@ -143,6 +143,7 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+ANSWER_RESERVE_MIN = 512      # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
 # #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
@@ -306,6 +307,13 @@ class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
     EngineDied, so the request ends with an error and the next one starts the engine again."""
+
+
+class EngineNonFinite(ValueError):
+    """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
+    engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
+    request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
+    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
 
 
 class SessionRefused(ValueError):
@@ -1071,6 +1079,11 @@ class StrataEngine:
                 self._ctl_result = ("done", None)
                 return
 
+    def _done_finish(self) -> str | None:
+        """The finish field of the DONE line the control lines read last (None: none since it was cleared)."""
+        f = (getattr(self, "_last_done", None) or "").split()
+        return f[5] if len(f) > 5 else None
+
     def _drain_control(self, until: str, timeout: float = 300.0, born: int | None = None):
         """After a consumer left early: read the control lines up to the next `until` line (DONE or BADM) so the next
         request does not read this one's leftovers.  Returns that line (None: the engine ended or never answered).
@@ -1122,6 +1135,8 @@ class StrataEngine:
                     except (IndexError, ValueError):
                         tail = []
                 if line.startswith("BDONE "):
+                    if line.split()[3:4] == ["nonfinite"]:   # #879: the engine dropped the slot's state
+                        tail = []
                     break
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
@@ -1207,6 +1222,7 @@ class StrataEngine:
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+        carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
         ok = yield from self._take_control(cancel, len(prompt))
         if not ok:
             return
@@ -1227,6 +1243,7 @@ class StrataEngine:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
+                    self._last_done = None                  # (#879: this request's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1254,6 +1271,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -1268,6 +1287,8 @@ class StrataEngine:
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
+                        carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
+                                                            # the held prefix: prompt_read 1) and BDONE replace them
                         prompt = list(ids) + out            # promoted: it continues in a batch slot from here
                 while True:
                     if slot is None:
@@ -1313,6 +1334,7 @@ class StrataEngine:
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
+                    self._last_done = None                  # (#879: this admission's DONE decides below)
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
@@ -1336,6 +1358,8 @@ class StrataEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
+                    if not cont and self._done_finish() == "nonfinite":   # #879
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -1380,10 +1404,14 @@ class StrataEngine:
                                          "generated": int(f[2]) if f[2].isdigit() else self.last.get("generated")}
                         # what the slot's sessions hold now: the prompt and every token fed (all but the last one)
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
+                        if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
+                            self.slot_held[slot] = []
+                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in EOS_IDS)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
+                            carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
                             self.slot_live[slot] = None
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
@@ -1416,6 +1444,8 @@ class StrataEngine:
                 pass
             if reused0 is not None and isinstance(self.last, dict):
                 self.last = {**self.last, "reused": reused0}
+            if carry and isinstance(self.last, dict):
+                self.last = add_carry(carry, self.last)
             if holding:
                 self.ctl.release()
             if reserved is not None:
@@ -1571,6 +1601,8 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if self.last.get("finish") == "nonfinite":   # #879
+                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -3453,7 +3485,10 @@ class Service:
             print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[strata] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
+            limit = (f"budget {s['thinking_budget']} (max {s.get('max_tokens')})"
+                     if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
+            print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -3466,6 +3501,14 @@ class Service:
             sampling = {**defaults, **req_values}
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         budget = self.reasoning_budget(sampling) if thinking else None
+        if budget and max_new and max_new > 0:
+            # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
+            # it has no answer.  Close the thinking early enough to leave room for one.
+            reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
+            if budget > max_new - reserve:
+                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                      f"the answer (budget {budget})", flush=True)
+                budget = max(1, max_new - reserve)
         # mab776 (M4): a model family's own output parser and texts (DeepSeek: DSML calls, "</think>" closes)
         parser = (getattr(self.template, "output_parser", None) or OutputParser)(
             thinking=thinking, tools=tools, stream_tools=True, recover=self.tool_call_recovery)
@@ -3501,6 +3544,7 @@ class Service:
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
+        nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
@@ -3536,7 +3580,7 @@ class Service:
                     with self.status_lock:
                         st.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids),
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
-                                  max_tokens=max_new, reasoning_recoveries=0)
+                                  max_tokens=max_new, reasoning_recoveries=0, thinking_budget=budget)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -3549,10 +3593,12 @@ class Service:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
+                        segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             for t in gen:
@@ -3624,6 +3670,8 @@ class Service:
                                     elif parser.state == "content" and not parser.buf and not detok.pending():
                                         opens = True
                                         break
+                        except EngineNonFinite:
+                            nonfinite = True
                         except EngineDied as e:
                             finish = "error"
                             self._say_died(e)
@@ -3648,6 +3696,28 @@ class Service:
                             segment_done = getattr(self.engine, "last", None)
                             if segment_done is not None and segment_done is not segment_before:
                                 segments.append(dict(segment_done))
+                        if nonfinite and not cancel.is_set():
+                            # #879: the engine emitted none of the poisoned window's tokens and reads its next prompt
+                            # from token 0.  Nothing sent yet: the same request once more, unseen by the client
+                            if n == 0 and not nf_retried:
+                                nf_retried = True
+                                # the retry reads from token 0: its DONE, not this one's, says what was reused
+                                del segments[segments_before:]
+                                print("[strata] the engine's logits became non-finite before the first token (#879); it "
+                                      "dropped its cached state: sending the request again once", flush=True)
+                                continue
+                            if n == 0:
+                                finish = "error"
+                                print("[strata] the engine's logits became non-finite again on the retry (#879): the "
+                                      "request ends with an error", flush=True)
+                                raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
+                                                      "(#879); the engine has dropped its cached state - send the "
+                                                      "request again")
+                            print(f"[strata] the engine's logits became non-finite after {n} tokens (#879): the reply "
+                                  "ends here as \"length\"; the engine dropped its cached state, so the next request "
+                                  "reads its prompt from the start", flush=True)
+                            finish = "length"
+                            break
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at
@@ -3697,7 +3767,7 @@ class Service:
                         # A forced call (tool_choice) is opened the same way: after the wrap-up, or where the
                         # thinking ended, after the blank line the template puts before a call.
                         if wrap:
-                            budget = None
+                            budget = st["thinking_budget"] = None
                             text = wrap_text + (force or "")
                         else:                           # the blank line before a call is written here (mab776:
                             #                             an opening's own leading newlines - DeepSeek's - are not)
@@ -3842,6 +3912,27 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
 
 
+def carry_leg(carry: dict, leg: dict) -> None:
+    """#1869: a request that decoded in a batch slot and went back to the solo path ends with the solo path's DONE, which
+    replaces the engine's figures: keep the slot leg's decode time, tokens and prompt figures to add to it."""
+    carry["decode_ms"] = carry.get("decode_ms", 0.0) + float(leg.get("decode_ms") or 0.0)
+    carry["generated"] = carry.get("generated", 0) + int(leg.get("generated") or 0)
+    carry.setdefault("prompt_ms", float(leg.get("prompt_ms") or 0.0))
+    if leg.get("prompt_read") is not None:
+        carry.setdefault("prompt_read", int(leg["prompt_read"]))
+
+
+def add_carry(carry: dict, last: dict) -> dict:
+    """The request's totals: the earlier legs' decode time and tokens plus the final one's; the prompt figures of the leg
+    that read the prompt (the solo continuation reads next to nothing)."""
+    out = {**last, "decode_ms": float(last.get("decode_ms") or 0.0) + carry.get("decode_ms", 0.0),
+           "generated": int(last.get("generated") or 0) + carry.get("generated", 0),
+           "prompt_ms": max(float(last.get("prompt_ms") or 0.0), carry.get("prompt_ms", 0.0))}
+    if "prompt_read" in carry:
+        out["prompt_read"] = carry["prompt_read"]
+    return out
+
+
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the
@@ -3849,6 +3940,10 @@ def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | No
     if last.get("prompt_ms") is None:
         return None
     cache_n = int(last.get("reused") or 0)
+    if last.get("prompt_read") is not None and last.get("finish") != "cancel":
+        # #1870: the engine says how many prompt tokens it read: the slot's own session may have held the rest
+        # (not the conversation cache), so the rate is not made of tokens it never read
+        cache_n = max(cache_n, max(0, prompt_tokens - int(last["prompt_read"])))
     prompt_n, prompt_ms, decode_ms = max(0, prompt_tokens - cache_n), float(last["prompt_ms"]), float(last.get("decode_ms") or 0)
     decoded = int(last.get("generated") or generated)          # the engine's count gives its rate, as /metrics does
     return {"cache_n": cache_n, "prompt_n": prompt_n, "prompt_ms": round(prompt_ms, 1),
@@ -4762,6 +4857,10 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
+            except EngineNonFinite as e:                    # #879, twice: not the request's fault
+                print(f"[strata] 503: {e}", flush=True)
+                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -5131,6 +5230,8 @@ def make_handler(svc: Service):
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
+                except EngineNonFinite as e:                 # #879, twice: not the request's fault
+                    return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)

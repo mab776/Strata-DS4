@@ -15,7 +15,7 @@
 //   out  RESUME <reused>              before reading: the prompt tokens not read again (always <= n - 1)
 //   out  PP <pos> <n> <ms> <tok/s>    after every prompt chunk (every 64 tokens without chunks), and once at n
 //   out  T <id>                       per generated token - the stop token too
-//   out  DONE <gen> <n> <prompt_ms> <decode_ms> <stop|length|cancel> <accepted> <drafted> <reused> <hits> <lookups> 0
+//   out  DONE <gen> <n> <prompt_ms> <decode_ms> <stop|length|cancel|nonfinite> <accepted> <drafted> <reused> <hits> <lookups> 0
 //        <file_tier> 0
 //        <prompt_read>                exactly once per accepted GEN (15 fields: serve/server.py _parse_done)
 //   out  ERR <why>                    instead of DONE; the engine stays in step (nothing follows)
@@ -979,12 +979,20 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         // mab776 M11 (DS4_DEV_SUM): the tier mixes the experts' rows on the card straight into the dense half's
         // routed-sum tensor (bit for bit its host mix) - no rows back, no upload; M11b: and records `rev` after it
         // instead of waiting, the finish waits for it on the card
+        // mab776 M13 (DS4_SH_FOLD, default on): that mix also adds the layer's shared-expert rows (the finish's own
+        // float add, one rounding), and the finish graph drops its add node
+        static const bool sh_fold = [] { const char * e = std::getenv("DS4_SH_FOLD"); return !e || std::atoi(e) != 0; }();
+        if (sh_fold && rdev) {
+            int64_t sst = 0;
+            if (const void * sh = dense.shexp_device(l, &sst)) tier.set_mix_add(sh, sst);
+        }
         if (!tier.run_multi(l, n, ids32_n.data(), w_n.data(), x, routed_n.data(), rdev, rev)) {
             err = "tier.run_multi refused at layer " + std::to_string(l);
             return false;
         }
         const bool dsum = rdev && tier.dev_sum_used();
-        if (!dense.finish_layer_n(l, n, dsum ? nullptr : routed_n.data(), dsum && tier.event_used())) {
+        if (!dense.finish_layer_n(l, n, dsum ? nullptr : routed_n.data(), dsum && tier.event_used(),
+                                  dsum && tier.mix_add_used())) {
             err = dense.last_error();
             return false;
         }
@@ -1115,6 +1123,33 @@ Choice Server::choose(const std::vector<int> & ids) const {
     return best_reuse(live, ck, slots_ck, ids, dense.max_tokens());
 }
 
+// ---- mab776 M13: the NaN guard (upstream 0.1.43 #1892/#879, ported).  A pass whose logits rows hold a NaN or an
+// infinity emits none of its tokens; the request ends `DONE ... nonfinite` and every state that may carry the poison
+// (the live state, the checkpoints, the parked conversations) is dropped, so the next request reads from token 0.
+// The check is an integer scan of the exponent bits (vectorised; ~10 us a row from cache, the sampler reads the same
+// rows next).  DS4_NAN_GUARD=0 turns it off; DS4_NAN_INJECT=<k>[,<k>...] (debug) flags the k-th checked pass.
+static bool nan_guard_on() {
+    static const bool on = [] { const char * e = std::getenv("DS4_NAN_GUARD"); return !e || std::atoi(e) != 0; }();
+    return on;
+}
+static bool rows_nonfinite(const float * lg, int nv, int rows) {
+    if (!nan_guard_on()) return false;
+    static std::vector<long long> inject = [] {
+        std::vector<long long> v;
+        if (const char * e = std::getenv("DS4_NAN_INJECT"))
+            for (const char * q = e; *q;) { char * end = nullptr; v.push_back(std::strtoll(q, &end, 10)); q = *end ? end + 1 : end; }
+        return v;
+    }();
+    static long long checked = 0;
+    ++checked;
+    if (std::find(inject.begin(), inject.end(), checked) != inject.end()) return true;
+    const uint32_t * u = (const uint32_t *) lg;
+    const size_t m = (size_t) nv * (size_t) rows;
+    uint32_t e = 0;
+    for (size_t i = 0; i < m; ++i) e = std::max(e, u[i] & 0x7f800000u);
+    return e == 0x7f800000u;
+}
+
 // ---- conversation parking (mab776 M6)
 // The RAM a park may take: the budget (oldest parked conversations evicted first) and what the container and the
 // host have left - parking must never be what pushes the engine into the OOM killer (cgroup memory.max is the hard
@@ -1147,8 +1182,17 @@ bool Server::park_room(size_t need) {
             v = std::strtod(b, nullptr);
             return true;
         };
-        double mx = 0, cur = 0;
-        if (rd("/sys/fs/cgroup/memory.max", mx) && rd("/sys/fs/cgroup/memory.current", cur)) {
+        double mx = 0, cur = 0, hi = 0;
+        // mab776 M13 (upstream #1601's idea): the lower of memory.max and memory.high (the kernel throttles and reclaims
+        // at memory.high), and DS4_MEMORY_LIMIT_MIB = the RAM the operator gives the engine when the real cap sits on a
+        // parent cgroup the container cannot see
+        bool have_mx = rd("/sys/fs/cgroup/memory.max", mx);
+        if (rd("/sys/fs/cgroup/memory.high", hi) && (!have_mx || hi < mx)) { mx = hi; have_mx = true; }
+        if (const char * lm = std::getenv("DS4_MEMORY_LIMIT_MIB")) {
+            const double cap = std::strtod(lm, nullptr) * 1048576.0;
+            if (cap > 0 && (!have_mx || cap < mx)) { mx = cap; have_mx = true; }
+        }
+        if (have_mx && rd("/sys/fs/cgroup/memory.current", cur)) {
             // memory.current counts the page cache the cgroup's reads filled (the model file: tens of GB, reclaimed
             // under pressure) - only what cannot be reclaimed is in use
             double file = 0;
@@ -1333,6 +1377,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         for (int i = n - 2; i > R; --i)
             if (ids[(size_t) i] == a.turn_token) { user_at = i; break; }
     bool cancelled = false, failed = false, quit = false;
+    bool nonfinite = false;   // mab776 M13: a pass's logits held a NaN / an infinity (rows_nonfinite)
     std::string ferr;
     int pp_mark = R;   // the decode-loop PP cadence
     // mab776 M7b: the MTP window = the positions the first drafts attend to, of those this request reads
@@ -1427,6 +1472,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         lk.reset(LK > 0 ? a.lookup_ngram : 0, ids);
         const double td0 = now_ms();
         int pos = n;   // the position the next generated token is fed at
+        int nf_pos = -1;   // M13: where the guard fired
         // emits one token; true when the request ends with it (a stop id, or max_new)
         auto emit = [&](int tok, const float * row, int nv) -> bool {
             if (tokl) std::fwrite(row, 4, (size_t) nv, tokl);
@@ -1511,19 +1557,21 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
             passes = 0;
             t_pass = 0;
             if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(n - 1) + ": " + dense.last_error(); }
+            else if (rows_nonfinite(lg, nv, 1)) { nonfinite = true; nf_pos = n - 1; }
             else {
                 cur = forced(ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (n - 1), hist.data(), hist.size(), scratch));
                 done = emit(cur, lg, nv);
                 if (g.sp.penalty_last_n > 0) hist.push_back(cur);
                 if (!done && !next_drafts(&cur, 1, n - 1)) { failed = true; ferr = "MTP draft failed: " + err; }
             }
-            while (!failed && !done) {
+            while (!failed && !done && !nonfinite) {
                 if (stopped()) { finish = "cancel"; break; }
                 toks[0] = cur;
                 for (int j = 0; j < nd; ++j) toks[(size_t) j + 1] = dr[(size_t) j];
                 const double tp = now_ms();
                 if (!step_n(toks.data(), nd + 1, pos)) { failed = true; ferr = "verify pass failed at pos " + std::to_string(pos) + ": " + err; break; }
                 if (!dense.logits_n(nd + 1, &lg, &nv)) { failed = true; ferr = "verify logits failed: " + dense.last_error(); break; }
+                if (rows_nonfinite(lg, nv, nd + 1)) { nonfinite = true; nf_pos = pos; break; }   // none of its tokens
                 t_pass += now_ms() - tp;
                 ++passes;
                 live.push_back(cur);   // position pos holds `cur` now
@@ -1572,6 +1620,7 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
                 const float * lg = nullptr;
                 int nv = 0;
                 if (!dense.logits(&lg, &nv)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos - 1) + ": " + dense.last_error(); break; }
+                if (rows_nonfinite(lg, nv, 1)) { nonfinite = true; nf_pos = pos - 1; break; }
                 const int tok = forced(ds4serve::sample_row(lg, nv, g.sp, (uint64_t) (pos - 1), hist.data(), hist.size(), scratch));
                 if (emit(tok, lg, nv)) break;   // the last token needs no forward pass
                 if (!step(tok, pos)) { failed = true; ferr = "decode failed at pos " + std::to_string(pos) + ": " + err; break; }
@@ -1583,6 +1632,19 @@ void Server::serve_gen(const std::string & line, int64_t seq) {
         }
         dec_ms = now_ms() - td0;
         st = tier.stats();
+        if (nonfinite) {
+            finish = "nonfinite";
+            std::fprintf(stderr, "ds4_serve: non-finite logits (#879) in a pass at position %d after %d tokens: none of its "
+                                 "tokens emitted, the request ends (DONE nonfinite); the live state, %d checkpoints and "
+                                 "%zu parked conversations are dropped, the next request reads from token 0\n",
+                         nf_pos, gen, (int) std::count_if(ck, ck + slots_ck, [](const Ckpt & c) { return c.pos > 0; }),
+                         parked.size());
+            dense.reset();
+            live.clear();
+            forget_all();
+            parked.clear();
+            park_used = 0;
+        }
     }
     if (tokl) std::fclose(tokl);
     if (failed) {   // the state is unknown: start over; exactly one terminal line, and never "ERR verify..."

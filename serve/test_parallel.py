@@ -70,6 +70,7 @@ def window():        # one batch window: every active slot one token
         else:
             active[b] = [left, max_new, produced]
 log = open(args[args.index("--log") + 1], "a") if "--log" in args else None
+READF = "--readfield" in args   # DONE's 15th field: the prompt tokens the engine read (a continued prompt: the 1 it copies)
 REUSE = "--reuse" in args     # DONE's reused field as the engine gives it: a continued prompt is all held but its last
 def reused(ids):              # token (the request's own output included), a fresh one the first 3 tokens
     return 0 if not REUSE else len(ids) - 1 if continued(ids)[1] else 3
@@ -140,7 +141,8 @@ while True:
             out += 1
             time.sleep(STEP)
         fin = "stop" if out and toks[out - 1] == 257 else ("cancel" if stop.is_set() else "length")
-        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}", flush=True)
+        print(f"DONE {out} {len(ids)} 5.0 {out * STEP * 1000:.1f} {fin} 0 0 {reused(ids)}" +
+              (f" 0 0 0 0 0.0 {len(ids) - reused(ids)}" if READF else ""), flush=True)
         if slot is not None:
             cont = fin == "length" and max_new > 1
             if cont:

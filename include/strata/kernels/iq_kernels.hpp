@@ -70,7 +70,9 @@ size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
 /// out[t] = sum_k w[t*K + k] * parts[t*K + k] over rows of H floats, t < n (device pointers; the prompt chunk's mix).
 void weighted_rows_sum(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
 // mab776 M11: in double, k in order, no FMA - bit for bit the decode tier's host mix
-void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream);
+// mab776 M13: `add` (optional, rows add_stride floats apart): out = add + the mix, the float add after the cast
+void weighted_rows_sum_f64(const float* parts, const float* w, int K, int64_t H, int64_t n, float* out, void* stream,
+                           const float* add = nullptr, int64_t add_stride = 0);
 /// mab776 M12b: a DeepSeek verify layer's GPU 0 hits from the router block on the card (per token [fn | ids | wts],
 /// `blk` bytes apart, int32 ids at `ids_off`): the distinct experts in first-seen order that `tab[expert]` points to
 /// (0 = not on the card) as native_expert_grouped's groups (ptr / start / count / entry dst / entry token), on `stream`.
