@@ -5,6 +5,11 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
 ## STATUS 2026-10-12 - Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+- **M13 (10-12 afternoon, session notes at the end)**: upstream 0.1.42 / 0.1.43 / 0.1.43.1 ideas ported (no merge);
+  deployed in run/ (88bca4ea, run.prev = M12 eb162164): verify pass K=2 -4.3 / -3.6 / -5.8 % at 8k / 127k / 250k (24.9
+  / 25.9 / 26.7 ms), K=1 -5.6 / -3.4 / -5.1 %, prefill unchanged; the NaN guard; serve fixes #984 #1624 #1869/#1870
+  #2026 (+ quoted DSML stays text). New env switches (=0 = old path): DS4_HC_MIX, DS4_HC_PRENORM, DS4_LEAN,
+  DS4_ROUTE_PAR, DS4_PF_PINNED, DS4_NAN_GUARD; DS4_SH_FOLD=1 opt-in (a loss).
 - **Runs**: container `strata-ds4`, image `strata-ds4:cu13` (portainer/deepseek-strata/Dockerfile: Ubuntu 24.04 +
   Python + libnccl; nothing of the engine baked in), serve/server.py + `ds4_serve` from the DEPLOY SNAPSHOT
   `models/strata-ds4/run` (bind-mounted read-only at /app; the previous one is `run.prev`). A DROP-IN for llama.cpp
@@ -624,3 +629,73 @@ m9_release.sh) and `strata-coder/bench/swe/m9_swe.sh` -> `m9_swe2.sh`; SWE overl
   3G cap killed the chain; restarted with each issue in its own 4.5G scope; 9320's re-run was clean (299 MB).
 - **End**: GPUs released at 01:08 (Marc 10-11 22:40: mode page -> off after the agent phase, grading is CPU only) -
   stack 74 is STOPPED, not left running; other sessions took the GPUs.
+
+## Session 2026-10-12 afternoon - M13: upstream Strata 0.1.42 / 0.1.43 / 0.1.43.1 ideas (Marc via the portainer-91 session)
+Rules: port ideas only (no merge onto v0.1.41+), each change behind an env switch (0 = the old path), basic tests only.
+Code: 5cbd45a4 + 63377648 (+ bench kit 88bca4ea). Logs: bench/mab776-m2/work/m13/ (probe.log, chain.log, final.log,
+gate.log / gate2.log).
+- **Decode graph node cuts (upstream f-143-amdk / f-143-intel, CUDA translation)** - new ggml patch
+  tools/ds4/patches/ggml-zzz-dsv4-hc-fused.patch (two ops, CPU forms too; tools/ds4/test_hc_fused.cpp checks them on the
+  GPU):
+  - `DS4_HC_MIX` (upstream "HC norm from registers"): hc_pre's mixes = one kernel (the 16,384-wide RMS norm on n
+    blocks, ~5 us, plus the [16384 x 24] F16 matvec); the scale is applied after the dot, so float rounding only: vs
+    the deployed path (GGML_MMVF_F16_MAX=8) <= 2.5e-7 relative.  Teacher-forced KL at 127k vs an HC_MIX=0 reference:
+    0.0028-0.0033 vs the restart noise 0.0027-0.0035 (top-1 4-7 / 384 vs 5-8) - inside the noise.  8k ABBA pass
+    K=1 -0.7 %, K=2 -2.0 %.  Kept.
+  - `DS4_HC_PRENORM`: the stream mean + RMS norm * weight in one kernel, bit-identical (same reduction layout as
+    rms_norm_f32<1024>; test_hc_fused: 0 differing floats at n 1..2048).  8k ABBA +0.2 / +0.3 % (noise: one block a
+    token is as latency-bound as the norm it absorbs).  Kept (exact; in the measured set).
+  - `DS4_LEAN` (upstream "lean verify graph"): no l_last tap copy without the gate's taps, no +0 on the router weight
+    sum, a verify pass's compressed-key mask as one -inf fill + one strided copy (was 2(n-1) fills + ~3(n-1) concats).
+    Same values.  8k ABBA K=2 -1.2 % (K=1 +1.1 %, n=2, where only the +0 and the tap go).  Kept.
+  - `DS4_SH_FOLD` (upstream "moe_hit_add folded into the combine"): the tier's on-card mix adds the shared expert, the
+    finish drops its add.  Exact, but 8k ABBA K=1 22.1 -> 22.6 ms, K=2 24.7 -> 24.8: the add moves ONTO the tier's
+    critical path.  REJECTED: opt-in (=1).
+  - Attention graph nodes per (layer, pass size) variant: 180.8 -> 165.5 (-8.5 %; DS4_DBG_GRAPH census, probe.log).
+  - Not ported: host-flag waits folded into copies (our graphs have no host-flag waits), the gfx12 pipeline-window /
+    chunk rules (HIP/SYCL).
+- **#1737 route-resident swap one warp per token** -> `DS4_ROUTE_PAR`: our M12b route kernel (one thread, a serial walk
+  of up to 48 entries with a dependent table read per distinct expert) on 64 threads, every output by counting.
+  DS4_CHECK_ROUTE=1: 22,016 / 22,016 layer calls identical to the host's groups.  8k ABBA K=1 -0.7 %, K=2 -1.3 %.
+  Kept.  The swap itself (route a near-tie miss to a resident expert) changes the model's routing: not ported (our
+  misses are ~4 % of lookups after M7a).
+- **STRATA_ADAPT_OVERLAP**: not ported - our LRU admissions are a few us of device copies inside the tier (nsys: D2D
+  0.8 us average) and the prefetch DMAs already land under the attention (DS4_OVL); 0.1.43.1 made it opt-in again
+  (slower on a 5090 Laptop).
+- **PcieAuto**: not ported - our PCIe share is a fixed `--pcie 0.55` of the ~4 % misses; nothing to refine.
+- **#1892 NaN guard** -> `DS4_NAN_GUARD` (default on): each pass's logits rows checked on the host (an integer scan of
+  the exponent bits, before any of the pass's tokens is emitted); a fire ends the request `DONE ... nonfinite`, drops
+  the live state, checkpoints and parked conversations; serve/server.py (upstream #1892's server side) sends a request
+  that emitted nothing once more, ends a started one as "length".  DS4_NAN_INJECT=<k>,.. fires on the k-th check; CPU
+  gate test test_nonfinite_logits_drop_the_state.  No fire in the live gate.
+- **#1712 / #1996 pinned uploads** -> `DS4_PF_PINNED`: a prompt chunk's inputs (embeddings 32 MiB at 2048, masks,
+  indices) from one pinned buffer, async on the backend stream.  Prefill unchanged within noise (the uploads were ~0.3 %
+  of a chunk).  Kept (exact).  #1996's bounce ring for other pageable async copies: our decode's per-pass input span is
+  a few KB, not worth it.
+- **#1601 cgroup-aware RAM**: our park guard already read memory.max minus reclaimable file cache; it now also takes
+  memory.high and DS4_MEMORY_LIMIT_MIB.  **#1620** (a cancel keeps the restored conversation): already so in ds4_serve
+  (`live` is updated per chunk / token, never dropped on cancel).  **#2049 / #2065** (parking vs the watchdog): our
+  watchdog ends only an engine silent 90 s with < 0.5 s CPU and < 1 MB I/O; a park / unpark is a ~1 s memcpy (no swap
+  in the container) - nothing to do.
+- **serve/** (three-way applied, conflicts merged by hand): #1624 (a reordered tool set keeps its first order and the
+  prompt cache), #984 (a thinking budget capped below max_tokens + the progress line), #1869 / #1870 (leg timings;
+  timings.prompt_n = what the engine read), #1892's server side, #2026 (a quoted </tool_call> in a message is text) -
+  extended to DeepSeek: `｜DSML｜` is a type-4 token (matched anywhere), so a user message or tool result quoting DSML
+  handed the model call syntax; `<｜DSML｜` / `</｜DSML｜` are now marked as text outside assistant messages (the bare
+  marker overlaps itself and would turn off the one-pass tag scan).  #2037 not taken: tool_call_recovery is ignored
+  for DeepSeek.  Tests: serve suite 662 OK, CPU serve gate 47 / 47.
+- **Before / after (final.log)**, the same binary, every M13 switch off vs the shipped set, ABBA, greedy, same prompts:
+
+  | | 8k | 127k | 250k |
+  |---|---:|---:|---:|
+  | K=2 verify pass ms | 26.00 -> **24.88** (-4.3 %) | 26.88 -> **25.90** (-3.6 %) | 28.32 -> **26.68** (-5.8 %) |
+  | K=1 verify pass ms | 23.35 -> 22.05 (-5.6 %) | 23.80 -> 23.00 (-3.4 %) | 25.25 -> 23.95 (-5.1 %) |
+  | K=2 decode tok/s | 76.9 -> **78.7** | 73.8 -> **75.5** | 71.0 -> **74.8** |
+  | K=1 decode tok/s | 72.6 -> 73.9 | 70.7 -> 72.7 | 67.0 -> 70.2 |
+  | prefill tok/s | 1,300 -> 1,286 | 1,521 -> 1,523 | 1,438 -> 1,433 |
+
+- **Gate** (deployed snapshot, canonical config): smoke OK; needles 3/3 at ~241k (sampled, T 1.0; the haystack now
+  comes from strata-data/src-01402 - src-0140 was deleted; deepseek-v4/needle_ds4.py takes NEEDLE_ROOT); A-B-A: parked
+  chats back after 0.6-1.4 s (reused 92,787 / 19,272 / 93,008 / 9,772).
+- Lessons: two GPU windows must never overlap (the probe's final restore raced the next window's first arm; harmless
+  only because the arm's config write came second - verify the engine's /proc environ, as lib.sh's envline does).

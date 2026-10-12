@@ -70,13 +70,14 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 
 | context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
 |---|---:|---:|---:|---:|
-| 8k   | 1,100-1,250 | 1,011 | 76 / 72 | 40.8 |
-| 127k | **1,530**   | 843   | **73** / 70 | 39.0 |
-| 250k | **1,428**   | 693   | **71** / 68 | ~36 |
+| 8k   | 1,100-1,320 | 1,011 | 79 / 74 | 40.8 |
+| 127k | **1,520**   | 843   | **75.5** / 73 | 39.0 |
+| 250k | **1,433**   | 693   | **75** / 70 | ~36 |
 
-- **The table is the final one** (2026-10-11, after M12): the K=2 column averages three runs a depth, and the
-  prefill and K=1 figures match the same session's runs. Logs: `bench/mab776-m2/out/M12-final-before-after.log`.
-  A K=2 verify pass (3 tokens) yields 2.1-2.3 tokens on average.
+- **The table is the current one** (2026-10-12, after M13): K=2 averages four runs a depth, K=1 two, prefill two
+  reads. A K=2 verify pass now takes 24.9 / 25.9 / 26.7 ms at 8k / 127k / 250k (M12: 25.8 / 26.7 / 28.0) and yields
+  2.1-2.3 tokens on average, so tok/s moves a little with draft acceptance from run to run.
+  Logs: `bench/mab776-m2/work/m13/final.log` (M12's: `bench/mab776-m2/out/M12-final-before-after.log`).
 - **Without drafts**, decode was 47 / 45 / 43 tok/s at 8k / 127k / 250k, measured on 10-10 before M11 and M12
   made a verify pass ~15 % shorter. It has not been re-measured since, so it is probably a little higher now.
 - **K=2 for sampled requests, K=1 for greedy ones.** Clients normally sample. In sampled needle runs at 240k (T=1.0
