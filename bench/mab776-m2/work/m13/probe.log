@@ -1,0 +1,34 @@
+### probe on 13:21:22 5cbd45a4 5cbd45a4 snapshot 2026-10-12T13 env: DS4_CHECK_ROUTE=1 DS4_DBG_GRAPH=1 DS4_DEV_ROUTE=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1328.1 tok/s
+  depth   8192 K=2 decode  74.0 tok/s, 2.19 tok/pass, pass 26.9 ms, md5 7da5c9f109 | GPU0 86.5 GPU1 10.5 CPU 1.4 PCIe 1.6
+  depth   8192 K=2 decode  74.5 tok/s, 2.13 tok/pass, pass 25.9 ms, md5 6b9e6f18d5 | GPU0 86.4 GPU1 11.4 CPU 1.0 PCIe 1.2
+  depth   8192 K=1 decode  75.9 tok/s, 1.79 tok/pass, pass 22.2 ms, md5 438260d243 | GPU0 87.4 GPU1 11.1 CPU 0.7 PCIe 0.8
+[route-chk] layer 7: same (20992 of 20992 calls identical)
+[route-chk] layer 3: same (21504 of 21504 calls identical)
+[route-chk] layer 42: same (22016 of 22016 calls identical)
+  attention graph nodes per (layer, pass size) variant - total over the variants seen:
+  427 variants, 70655 nodes in all, mean 165.5
+[graph] attn layer 3 pos 0: 120 nodes | ADD:4 ARGSORT:1 CLAM
+[graph] attn layer 4 pos 0: 149 nodes | ADD:5 ARGSORT:2 CLAM
+[graph] attn layer 4 pos 3: 197 nodes | ADD:5 ARGSORT:2 CLAM
+[graph] attn layer 4 pos 4: 149 nodes | ADD:5 ARGSORT:2 CLAM
+[graph] attn layer 3 pos 8171: 120 nodes | ADD:4 ARGSORT:1 C
+[graph] attn layer 4 pos 8171: 197 nodes | ADD:5 ARGSORT:2 C
+[graph] attn layer 3 pos 8172: 144 nodes | ADD:4 ARGSORT:1 C
+[graph] attn layer 4 pos 8172: 202 nodes | ADD:5 ARGSORT:2 C
+### probe off 13:23:30 5cbd45a4 5cbd45a4 snapshot 2026-10-12T13 env: DS4_DBG_GRAPH=1 DS4_DEV_ROUTE=1 DS4_HC_MIX=0 DS4_HC_PRENORM=0 DS4_LEAN=0 DS4_PF_PINNED=0 DS4_ROUTE_PAR=0 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1309.2 tok/s
+  depth   8192 K=2 decode  74.7 tok/s, 2.23 tok/pass, pass 27.1 ms, md5 7e3361d177 | GPU0 86.0 GPU1 11.0 CPU 1.4 PCIe 1.6
+  depth   8192 K=2 decode  80.1 tok/s, 2.39 tok/pass, pass 27.1 ms, md5 19f0d5c8ea | GPU0 86.5 GPU1 11.2 CPU 1.0 PCIe 1.2
+  depth   8192 K=1 decode  75.9 tok/s, 1.83 tok/pass, pass 22.6 ms, md5 43da50fef9 | GPU0 87.0 GPU1 11.2 CPU 0.8 PCIe 1.0
+  attention graph nodes per (layer, pass size) variant - total over the variants seen:
+  471 variants, 85169 nodes in all, mean 180.8
+[graph] attn layer 3 pos 0: 128 nodes | ADD:5 ARGSORT:1 CLAM
+[graph] attn layer 4 pos 0: 157 nodes | ADD:6 ARGSORT:2 CLAM
+[graph] attn layer 4 pos 3: 205 nodes | ADD:6 ARGSORT:2 CLAM
+[graph] attn layer 4 pos 4: 157 nodes | ADD:6 ARGSORT:2 CLAM
+[graph] attn layer 3 pos 8171: 128 nodes | ADD:5 ARGSORT:1 C
+[graph] attn layer 4 pos 8171: 205 nodes | ADD:6 ARGSORT:2 C
+[graph] attn layer 3 pos 8172: 152 nodes | ADD:5 ARGSORT:1 C
+[graph] attn layer 4 pos 8172: 215 nodes | ADD:6 ARGSORT:2 C
+### restored (canonical config) 13:25:24

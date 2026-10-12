@@ -979,9 +979,10 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         // mab776 M11 (DS4_DEV_SUM): the tier mixes the experts' rows on the card straight into the dense half's
         // routed-sum tensor (bit for bit its host mix) - no rows back, no upload; M11b: and records `rev` after it
         // instead of waiting, the finish waits for it on the card
-        // mab776 M13 (DS4_SH_FOLD, default on): that mix also adds the layer's shared-expert rows (the finish's own
-        // float add, one rounding), and the finish graph drops its add node
-        static const bool sh_fold = [] { const char * e = std::getenv("DS4_SH_FOLD"); return !e || std::atoi(e) != 0; }();
+        // mab776 M13 (DS4_SH_FOLD=1, opt-in): that mix also adds the layer's shared-expert rows (the finish's own float
+        // add, one rounding: exact), and the finish graph drops its add node.  Measured 8k ABBA: K=1 pass 22.1 -> 22.6 ms,
+        // K=2 24.7 -> 24.8 - the add moves onto the tier's critical path instead of off it: off by default
+        static const bool sh_fold = [] { const char * e = std::getenv("DS4_SH_FOLD"); return e && std::atoi(e) != 0; }();
         if (sh_fold && rdev) {
             int64_t sst = 0;
             if (const void * sh = dense.shexp_device(l, &sst)) tier.set_mix_add(sh, sst);

@@ -1,0 +1,184 @@
+#### kl 13:24:04
+### ref HC_MIX=0 13:25:25 env: DS4_DEV_ROUTE=1 DS4_DUMP_TOKLOGITS=/data/logs/tl DS4_HC_MIX=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+== mix0-ref: reference of 384 rows at depth 130048 kept
+### mix0-again 13:28:48 env: DS4_DEV_ROUTE=1 DS4_DUMP_TOKLOGITS=/data/logs/tl DS4_HC_MIX=0 DS4_SERVE_TEST_FORCE=1 DS4_SERVE_TEST_ORACLE=/data/logs/oracle.txt GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+== mix0-again vs the reference (depth 130048, 384 rows)
+  plain : KL mean 0.00293 median 0.00084 p95 0.01157 max 0.1042, top-1 differs 6/384
+  K1    : KL mean 0.00296 median 0.00095 p95 0.01008 max 0.0841, top-1 differs 8/384
+  K2    : KL mean 0.00268 median 0.00074 p95 0.01113 max 0.0470, top-1 differs 6/384
+### mix1 13:31:49 env: DS4_DEV_ROUTE=1 DS4_DUMP_TOKLOGITS=/data/logs/tl DS4_SERVE_TEST_FORCE=1 DS4_SERVE_TEST_ORACLE=/data/logs/oracle.txt GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+== mix1 vs the reference (depth 130048, 384 rows)
+  plain : KL mean 0.00299 median 0.00082 p95 0.01269 max 0.1394, top-1 differs 4/384
+  K1    : KL mean 0.00278 median 0.00081 p95 0.00989 max 0.0695, top-1 differs 5/384
+  K2    : KL mean 0.00328 median 0.00088 p95 0.01186 max 0.1666, top-1 differs 7/384
+### m13-all-off 13:34:50 env: DS4_DEV_ROUTE=1 DS4_DUMP_TOKLOGITS=/data/logs/tl DS4_HC_MIX=0 DS4_HC_PRENORM=0 DS4_LEAN=0 DS4_PF_PINNED=0 DS4_ROUTE_PAR=0 DS4_SERVE_TEST_FORCE=1 DS4_SERVE_TEST_ORACLE=/data/logs/oracle.txt DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+== m13-all-off vs the reference (depth 130048, 384 rows)
+  plain : KL mean 0.00337 median 0.00084 p95 0.01294 max 0.1189, top-1 differs 8/384
+  K1    : KL mean 0.00349 median 0.00076 p95 0.01111 max 0.1374, top-1 differs 5/384
+  K2    : KL mean 0.00288 median 0.00074 p95 0.01297 max 0.0562, top-1 differs 7/384
+### restored (canonical config) 13:38:07
+#### ab DS4_HC_MIX 13:38:07
+### DS4_HC_MIX=0 13:39:39 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1213.5 tok/s
+  depth   8192 K=1 decode  75.2 tok/s, 1.8 tok/pass, pass 22.6 ms, md5 b21a3f2c3f | GPU0 86.8 GPU1 11.0 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  70.6 tok/s, 1.98 tok/pass, pass 25.4 ms, md5 c18470f4a7 | GPU0 86.5 GPU1 11.2 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  77.0 tok/s, 2.12 tok/pass, pass 25.0 ms, md5 b1127885db | GPU0 86.9 GPU1 10.9 CPU 1.0 PCIe 1.2
+### DS4_HC_MIX=1 13:41:52 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1186.9 tok/s
+  depth   8192 K=1 decode  77.0 tok/s, 1.86 tok/pass, pass 22.7 ms, md5 d005482b3d | GPU0 85.5 GPU1 11.2 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  75.7 tok/s, 2.08 tok/pass, pass 24.9 ms, md5 7e8fa49baf | GPU0 85.8 GPU1 11.7 CPU 1.2 PCIe 1.4
+  depth   8192 K=2 decode  78.1 tok/s, 2.1 tok/pass, pass 24.3 ms, md5 9a1afce0b8 | GPU0 86.7 GPU1 11.2 CPU 1.0 PCIe 1.1
+### DS4_HC_MIX=1 13:44:00 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1188.7 tok/s
+  depth   8192 K=1 decode  75.7 tok/s, 1.78 tok/pass, pass 22.1 ms, md5 aeabab6c01 | GPU0 86.6 GPU1 11.0 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  76.1 tok/s, 2.08 tok/pass, pass 24.7 ms, md5 22faced641 | GPU0 86.1 GPU1 11.6 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  79.1 tok/s, 2.16 tok/pass, pass 24.5 ms, md5 495ecfae9f | GPU0 86.6 GPU1 10.9 CPU 1.1 PCIe 1.3
+### DS4_HC_MIX=0 13:46:12 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1286.3 tok/s
+  depth   8192 K=1 decode  72.7 tok/s, 1.74 tok/pass, pass 22.5 ms, md5 af847fe0fa | GPU0 86.7 GPU1 11.0 CPU 1.0 PCIe 1.3
+  depth   8192 K=2 decode  77.7 tok/s, 2.15 tok/pass, pass 25.1 ms, md5 a15e617e10 | GPU0 86.9 GPU1 11.0 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  81.8 tok/s, 2.25 tok/pass, pass 24.9 ms, md5 9a70f713d6 | GPU0 86.4 GPU1 11.4 CPU 1.0 PCIe 1.2
+### restored (canonical config) 13:48:19
+#### ab DS4_HC_PRENORM 13:48:19
+### DS4_HC_PRENORM=0 13:49:56 env: DS4_DEV_ROUTE=1 DS4_HC_PRENORM=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1260.7 tok/s
+  depth   8192 K=1 decode  74.3 tok/s, 1.76 tok/pass, pass 22.2 ms, md5 3d6263c9c7 | GPU0 85.8 GPU1 11.5 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  82.9 tok/s, 2.31 tok/pass, pass 25.4 ms, md5 fa06391545 | GPU0 85.7 GPU1 11.2 CPU 1.5 PCIe 1.7
+  depth   8192 K=2 decode  79.0 tok/s, 2.22 tok/pass, pass 25.3 ms, md5 5b8a67dad9 | GPU0 86.0 GPU1 10.6 CPU 1.6 PCIe 1.8
+### DS4_HC_PRENORM=1 13:52:03 env: DS4_DEV_ROUTE=1 DS4_HC_PRENORM=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1329.4 tok/s
+  depth   8192 K=1 decode  74.2 tok/s, 1.76 tok/pass, pass 22.2 ms, md5 3d6263c9c7 | GPU0 85.8 GPU1 11.5 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  82.3 tok/s, 2.31 tok/pass, pass 25.6 ms, md5 fa06391545 | GPU0 85.7 GPU1 11.2 CPU 1.5 PCIe 1.7
+  depth   8192 K=2 decode  79.0 tok/s, 2.22 tok/pass, pass 25.4 ms, md5 5b8a67dad9 | GPU0 86.0 GPU1 10.6 CPU 1.6 PCIe 1.8
+### DS4_HC_PRENORM=1 13:54:19 env: DS4_DEV_ROUTE=1 DS4_HC_PRENORM=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1163.7 tok/s
+  depth   8192 K=1 decode  75.3 tok/s, 1.82 tok/pass, pass 22.7 ms, md5 4d017ced0c | GPU0 86.2 GPU1 10.5 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  75.8 tok/s, 2.1 tok/pass, pass 25.0 ms, md5 1cdf52322d | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.9 tok/s, 2.16 tok/pass, pass 24.5 ms, md5 fc5ae8098b | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+### DS4_HC_PRENORM=0 13:56:27 env: DS4_DEV_ROUTE=1 DS4_HC_PRENORM=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1343.3 tok/s
+  depth   8192 K=1 decode  75.7 tok/s, 1.82 tok/pass, pass 22.6 ms, md5 4d017ced0c | GPU0 86.2 GPU1 10.5 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  76.2 tok/s, 2.1 tok/pass, pass 24.9 ms, md5 1cdf52322d | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.8 tok/s, 2.16 tok/pass, pass 24.6 ms, md5 fc5ae8098b | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+### restored (canonical config) 13:58:39
+#### ab DS4_LEAN 13:58:39
+### DS4_LEAN=0 14:00:11 env: DS4_DEV_ROUTE=1 DS4_LEAN=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1340.6 tok/s
+  depth   8192 K=1 decode  75.2 tok/s, 1.75 tok/pass, pass 22.0 ms, md5 3830886cc0 | GPU0 86.9 GPU1 11.0 CPU 0.9 PCIe 1.1
+  depth   8192 K=2 decode  81.8 tok/s, 2.27 tok/pass, pass 25.1 ms, md5 8cca410531 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  77.7 tok/s, 2.14 tok/pass, pass 24.9 ms, md5 54b16c8469 | GPU0 86.4 GPU1 11.2 CPU 1.1 PCIe 1.3
+### DS4_LEAN=1 14:02:13 env: DS4_DEV_ROUTE=1 DS4_LEAN=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1293.5 tok/s
+  depth   8192 K=1 decode  73.7 tok/s, 1.76 tok/pass, pass 22.3 ms, md5 b909b7bfe1 | GPU0 85.9 GPU1 11.3 CPU 1.3 PCIe 1.5
+  depth   8192 K=2 decode  78.6 tok/s, 2.13 tok/pass, pass 24.6 ms, md5 1255b6cfb5 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  79.7 tok/s, 2.13 tok/pass, pass 24.3 ms, md5 0fde349b29 | GPU0 86.4 GPU1 11.6 CPU 0.9 PCIe 1.1
+### DS4_LEAN=1 14:04:25 env: DS4_DEV_ROUTE=1 DS4_LEAN=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1327.8 tok/s
+  depth   8192 K=1 decode  75.0 tok/s, 1.82 tok/pass, pass 22.7 ms, md5 4d017ced0c | GPU0 86.2 GPU1 10.5 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  74.0 tok/s, 2.1 tok/pass, pass 25.7 ms, md5 1cdf52322d | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.3 tok/s, 2.16 tok/pass, pass 24.7 ms, md5 fc5ae8098b | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+### DS4_LEAN=0 14:06:41 env: DS4_DEV_ROUTE=1 DS4_LEAN=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1283.9 tok/s
+  depth   8192 K=1 decode  73.3 tok/s, 1.76 tok/pass, pass 22.5 ms, md5 4aaac8fb28 | GPU0 85.8 GPU1 11.5 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  78.1 tok/s, 2.21 tok/pass, pass 25.5 ms, md5 1221865be9 | GPU0 86.6 GPU1 10.6 CPU 1.3 PCIe 1.5
+  depth   8192 K=2 decode  82.2 tok/s, 2.27 tok/pass, pass 25.0 ms, md5 b256118fb5 | GPU0 86.4 GPU1 10.9 CPU 1.2 PCIe 1.4
+### restored (canonical config) 14:08:53
+#### ab DS4_SH_FOLD 14:08:53
+### DS4_SH_FOLD=0 14:10:26 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1261.6 tok/s
+  depth   8192 K=1 decode  74.2 tok/s, 1.76 tok/pass, pass 22.2 ms, md5 4aaac8fb28 | GPU0 85.8 GPU1 11.5 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.4 tok/s, 2.21 tok/pass, pass 25.0 ms, md5 1221865be9 | GPU0 86.6 GPU1 10.6 CPU 1.3 PCIe 1.5
+  depth   8192 K=2 decode  83.4 tok/s, 2.27 tok/pass, pass 24.7 ms, md5 b256118fb5 | GPU0 86.4 GPU1 10.9 CPU 1.2 PCIe 1.4
+### DS4_SH_FOLD=1 14:12:33 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1333.1 tok/s
+  depth   8192 K=1 decode  75.5 tok/s, 1.82 tok/pass, pass 22.6 ms, md5 4d017ced0c | GPU0 86.2 GPU1 10.5 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  76.2 tok/s, 2.1 tok/pass, pass 24.9 ms, md5 1cdf52322d | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.8 tok/s, 2.16 tok/pass, pass 24.6 ms, md5 fc5ae8098b | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+### DS4_SH_FOLD=1 14:14:45 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1263.8 tok/s
+  depth   8192 K=1 decode  75.4 tok/s, 1.82 tok/pass, pass 22.6 ms, md5 4d017ced0c | GPU0 86.2 GPU1 10.5 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  75.7 tok/s, 2.1 tok/pass, pass 25.1 ms, md5 1cdf52322d | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.5
+  depth   8192 K=2 decode  79.9 tok/s, 2.16 tok/pass, pass 24.6 ms, md5 fc5ae8098b | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+### DS4_SH_FOLD=0 14:16:51 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1336.0 tok/s
+  depth   8192 K=1 decode  75.9 tok/s, 1.77 tok/pass, pass 22.0 ms, md5 9af3ac9b2c | GPU0 86.7 GPU1 11.0 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  78.7 tok/s, 2.16 tok/pass, pass 24.8 ms, md5 1a065f05c9 | GPU0 86.4 GPU1 11.1 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  78.9 tok/s, 2.12 tok/pass, pass 24.4 ms, md5 69b694a049 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+### restored (canonical config) 14:19:03
+#### ab DS4_ROUTE_PAR 14:19:03
+### DS4_ROUTE_PAR=0 14:20:01 env: DS4_DEV_ROUTE=1 DS4_ROUTE_PAR=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1337.3 tok/s
+  depth   8192 K=1 decode  75.4 tok/s, 1.75 tok/pass, pass 21.9 ms, md5 3830886cc0 | GPU0 86.9 GPU1 11.0 CPU 0.9 PCIe 1.1
+  depth   8192 K=2 decode  81.9 tok/s, 2.27 tok/pass, pass 25.1 ms, md5 8cca410531 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  77.5 tok/s, 2.14 tok/pass, pass 24.9 ms, md5 54b16c8469 | GPU0 86.4 GPU1 11.2 CPU 1.1 PCIe 1.3
+### DS4_ROUTE_PAR=1 14:21:47 env: DS4_DEV_ROUTE=1 DS4_ROUTE_PAR=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1244.3 tok/s
+  depth   8192 K=1 decode  77.9 tok/s, 1.87 tok/pass, pass 22.7 ms, md5 bff8508cb2 | GPU0 85.5 GPU1 11.2 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  82.1 tok/s, 2.25 tok/pass, pass 24.8 ms, md5 c35474bfa2 | GPU0 86.7 GPU1 10.8 CPU 1.2 PCIe 1.4
+  depth   8192 K=2 decode  80.8 tok/s, 2.15 tok/pass, pass 24.1 ms, md5 a7b0d77750 | GPU0 87.2 GPU1 10.8 CPU 0.9 PCIe 1.1
+### DS4_ROUTE_PAR=1 14:23:49 env: DS4_DEV_ROUTE=1 DS4_ROUTE_PAR=1 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1323.5 tok/s
+  depth   8192 K=1 decode  76.4 tok/s, 1.76 tok/pass, pass 21.8 ms, md5 30913ef469 | GPU0 86.8 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  82.1 tok/s, 2.32 tok/pass, pass 25.6 ms, md5 4a8e91bd72 | GPU0 85.7 GPU1 11.1 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  81.4 tok/s, 2.22 tok/pass, pass 24.6 ms, md5 e7f75f10e3 | GPU0 86.6 GPU1 10.8 CPU 1.2 PCIe 1.4
+### DS4_ROUTE_PAR=0 14:25:30 env: DS4_DEV_ROUTE=1 DS4_ROUTE_PAR=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1241.3 tok/s
+  depth   8192 K=1 decode  77.1 tok/s, 1.87 tok/pass, pass 22.9 ms, md5 fb0c5c8099 | GPU0 85.5 GPU1 11.2 CPU 1.5 PCIe 1.8
+  depth   8192 K=2 decode  76.3 tok/s, 2.15 tok/pass, pass 25.6 ms, md5 5c7ae58968 | GPU0 86.3 GPU1 10.9 CPU 1.3 PCIe 1.5
+  depth   8192 K=2 decode  80.5 tok/s, 2.21 tok/pass, pass 24.8 ms, md5 4a24ddac42 | GPU0 86.3 GPU1 11.3 CPU 1.1 PCIe 1.3
+### restored (canonical config) 14:27:32
+#### final 14:27:32
+### before 14:29:10 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=0 DS4_HC_PRENORM=0 DS4_LEAN=0 DS4_PF_PINNED=0 DS4_ROUTE_PAR=0 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1289.3 tok/s
+  depth   8192 K=1 decode  72.7 tok/s, 1.8 tok/pass, pass 23.3 ms, md5 826a3f34c0 | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.4
+  depth   8192 K=2 decode  78.1 tok/s, 2.25 tok/pass, pass 26.1 ms, md5 4881b490db | GPU0 86.1 GPU1 11.6 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  76.4 tok/s, 2.16 tok/pass, pass 25.7 ms, md5 3b519b1079 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth 130048 read at 1518.8 tok/s
+  depth 130048 K=1 decode  71.2 tok/s, 1.8 tok/pass, pass 23.8 ms, md5 e675496165 | GPU0 86.8 GPU1 10.9 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  74.1 tok/s, 2.19 tok/pass, pass 26.9 ms, md5 2f61a767e2 | GPU0 86.9 GPU1 10.6 CPU 1.1 PCIe 1.4
+  depth 130048 K=2 decode  73.5 tok/s, 2.16 tok/pass, pass 26.7 ms, md5 12df891bd8 | GPU0 87.0 GPU1 10.7 CPU 1.0 PCIe 1.3
+  depth 250000 read at 1435.5 tok/s
+  depth 250000 K=1 decode  67.5 tok/s, 1.77 tok/pass, pass 25.0 ms, md5 e56985ad14 | GPU0 87.2 GPU1 10.5 CPU 1.1 PCIe 1.3
+  depth 250000 K=2 decode  69.7 tok/s, 2.13 tok/pass, pass 28.1 ms, md5 3c9fe3894c | GPU0 86.2 GPU1 11.4 CPU 1.1 PCIe 1.4
+  depth 250000 K=2 decode  73.2 tok/s, 2.25 tok/pass, pass 28.0 ms, md5 cdc4100000 | GPU0 86.8 GPU1 10.7 CPU 1.1 PCIe 1.3
+### after 14:36:35 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1324.7 tok/s
+  depth   8192 K=1 decode  74.2 tok/s, 1.74 tok/pass, pass 22.0 ms, md5 7beed2d901 | GPU0 87.1 GPU1 10.7 CPU 1.0 PCIe 1.2
+  depth   8192 K=2 decode  78.7 tok/s, 2.19 tok/pass, pass 25.1 ms, md5 53ed6cebf0 | GPU0 86.7 GPU1 10.9 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  80.1 tok/s, 2.2 tok/pass, pass 24.8 ms, md5 cc8bd690e0 | GPU0 86.3 GPU1 11.2 CPU 1.1 PCIe 1.4
+  depth 130048 read at 1524.9 tok/s
+  depth 130048 K=1 decode  73.6 tok/s, 1.79 tok/pass, pass 23.0 ms, md5 6ddce6ca6f | GPU0 86.2 GPU1 11.4 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  74.9 tok/s, 2.12 tok/pass, pass 25.8 ms, md5 b363cc163d | GPU0 86.6 GPU1 10.8 CPU 1.1 PCIe 1.4
+  depth 130048 K=2 decode  76.4 tok/s, 2.16 tok/pass, pass 25.9 ms, md5 65409ab172 | GPU0 86.8 GPU1 10.6 CPU 1.2 PCIe 1.4
+  depth 250000 read at 1444.2 tok/s
+  depth 250000 K=1 decode  70.3 tok/s, 1.77 tok/pass, pass 24.0 ms, md5 91bfd74957 | GPU0 86.8 GPU1 11.1 CPU 0.9 PCIe 1.1
+  depth 250000 K=2 decode  77.4 tok/s, 2.28 tok/pass, pass 26.9 ms, md5 381d9e5e98 | GPU0 86.9 GPU1 10.7 CPU 1.1 PCIe 1.3
+  depth 250000 K=2 decode  75.2 tok/s, 2.18 tok/pass, pass 26.6 ms, md5 2cf57896fb | GPU0 87.0 GPU1 10.7 CPU 1.0 PCIe 1.2
+### after 14:44:36 env: DS4_DEV_ROUTE=1 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1247.3 tok/s
+  depth   8192 K=1 decode  73.6 tok/s, 1.74 tok/pass, pass 22.1 ms, md5 2a9410900e | GPU0 86.3 GPU1 11.4 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  76.9 tok/s, 2.13 tok/pass, pass 25.2 ms, md5 f3780c064e | GPU0 85.5 GPU1 11.8 CPU 1.2 PCIe 1.4
+  depth   8192 K=2 decode  79.0 tok/s, 2.12 tok/pass, pass 24.4 ms, md5 618cbf5f73 | GPU0 86.7 GPU1 11.2 CPU 1.0 PCIe 1.1
+  depth 130048 read at 1520.5 tok/s
+  depth 130048 K=1 decode  71.8 tok/s, 1.75 tok/pass, pass 23.0 ms, md5 4c381ba917 | GPU0 86.7 GPU1 11.0 CPU 1.1 PCIe 1.3
+  depth 130048 K=2 decode  74.4 tok/s, 2.13 tok/pass, pass 26.2 ms, md5 b16982dcfe | GPU0 86.5 GPU1 10.8 CPU 1.3 PCIe 1.5
+  depth 130048 K=2 decode  76.1 tok/s, 2.14 tok/pass, pass 25.7 ms, md5 af956e6c2f | GPU0 86.5 GPU1 11.1 CPU 1.1 PCIe 1.3
+  depth 250000 read at 1421.6 tok/s
+  depth 250000 K=1 decode  70.1 tok/s, 1.76 tok/pass, pass 23.9 ms, md5 ebb4a4cd82 | GPU0 86.3 GPU1 11.7 CPU 0.9 PCIe 1.1
+  depth 250000 K=2 decode  73.3 tok/s, 2.14 tok/pass, pass 26.6 ms, md5 6464c413f2 | GPU0 86.6 GPU1 11.3 CPU 1.0 PCIe 1.2
+  depth 250000 K=2 decode  73.1 tok/s, 2.12 tok/pass, pass 26.6 ms, md5 6f4b447465 | GPU0 86.5 GPU1 11.3 CPU 1.0 PCIe 1.2
+### before 14:52:12 env: DS4_DEV_ROUTE=1 DS4_HC_MIX=0 DS4_HC_PRENORM=0 DS4_LEAN=0 DS4_PF_PINNED=0 DS4_ROUTE_PAR=0 DS4_SH_FOLD=0 GGML_LI_I8=1 GGML_MMVF_F16_MAX=8 
+  depth   8192 read at 1310.4 tok/s
+  depth   8192 K=1 decode  72.5 tok/s, 1.8 tok/pass, pass 23.4 ms, md5 826a3f34c0 | GPU0 86.0 GPU1 11.3 CPU 1.2 PCIe 1.4
+  depth   8192 K=2 decode  77.3 tok/s, 2.25 tok/pass, pass 26.3 ms, md5 4881b490db | GPU0 86.1 GPU1 11.6 CPU 1.1 PCIe 1.3
+  depth   8192 K=2 decode  75.8 tok/s, 2.16 tok/pass, pass 25.9 ms, md5 3b519b1079 | GPU0 86.7 GPU1 11.1 CPU 1.0 PCIe 1.2
+  depth 130048 read at 1522.6 tok/s
+  depth 130048 K=1 decode  70.1 tok/s, 1.76 tok/pass, pass 23.8 ms, md5 5700ca901b | GPU0 86.8 GPU1 10.9 CPU 1.0 PCIe 1.2
+  depth 130048 K=2 decode  73.7 tok/s, 2.18 tok/pass, pass 27.0 ms, md5 983e647848 | GPU0 86.7 GPU1 10.7 CPU 1.2 PCIe 1.4
+  depth 130048 K=2 decode  74.1 tok/s, 2.17 tok/pass, pass 26.9 ms, md5 fc388a9202 | GPU0 86.5 GPU1 11.0 CPU 1.1 PCIe 1.4
+  depth 250000 read at 1439.4 tok/s
+  depth 250000 K=1 decode  66.4 tok/s, 1.78 tok/pass, pass 25.5 ms, md5 2659128d55 | GPU0 86.2 GPU1 11.0 CPU 1.3 PCIe 1.5
+  depth 250000 K=2 decode  69.3 tok/s, 2.12 tok/pass, pass 28.2 ms, md5 5987a3dabf | GPU0 86.5 GPU1 11.1 CPU 1.1 PCIe 1.3
+  depth 250000 K=2 decode  72.0 tok/s, 2.27 tok/pass, pass 29.0 ms, md5 26a28d64af | GPU0 85.8 GPU1 11.0 CPU 1.5 PCIe 1.7
+### restored (canonical config) 14:59:58
+#### chain done 14:59:58

@@ -230,6 +230,14 @@ THINK_TAGS = {"<think>": "\U000F0E01", "</think>": "\U000F0E02"}
 # the same special ids, so text with <|vision_start|><|image_pad|> before a picture took that picture's embeddings
 VISION_TAGS = {"<|vision_start|>": "\U000F0E03", "<|image_pad|>": "\U000F0E04", "<|vision_end|>": "\U000F0E05",
                "<|video_pad|>": "\U000F0E06"}
+# #2026: `</tool_call>` the same way.  A user asking for the string verbatim handed the model the real end-of-call token
+# (type 4, matched everywhere); it copied that token into its answer and the reply came back empty.  An assistant
+# message keeps its own: a client replaying the model's raw call text sends the tokens the model wrote.
+# mab776 M13: DeepSeek's `｜DSML｜` marker the same way (type 4 in its vocabulary, not a control token): a user message
+# or a tool result quoting DSML - an agent reading a file that documents it - no longer hands the model call syntax.
+# Marked as the two forms every DSML tag starts with: `｜DSML｜` alone overlaps itself (its suffix `｜` is its prefix),
+# which turns off the one-pass scan (_overlap_free).
+TOOL_LITERAL_TAGS = {"</tool_call>": "\U000F0E07", "<｜DSML｜": "\U000F0E08", "</｜DSML｜": "\U000F0E09"}
 CONTROL_MARK0 = 0xF0E10      # the control tokens' marks start here, clear of the two sets above
 SPARE_MARK0 = 0x100000       # mab776: a tag whose usual mark the request itself contains takes one from here (plane 16)
 _PRIVATE_USE = re.compile("[\U000F0000-\U000FFFFD\U00100000-\U0010FFFD]")
@@ -285,7 +293,7 @@ class LiteralTags(dict):
         return [t for t in self if t in found] if found else []
 
 
-LITERAL_TAGS = LiteralTags({**THINK_TAGS, **VISION_TAGS})
+LITERAL_TAGS = LiteralTags({**THINK_TAGS, **VISION_TAGS, **TOOL_LITERAL_TAGS})
 THINK_MARKS = {v: k for k, v in LITERAL_TAGS.items()}
 
 
@@ -385,17 +393,19 @@ def mark_think_literals(messages: list[dict], tools: list[dict] | None, tags: di
         return messages, tools, {}
     tags = _request_marks(present, tags, strings)
     out = []
+    own = {t: v for t, v in tags.items() if t not in TOOL_LITERAL_TAGS}     # what an assistant message keeps as written
     for m in messages:
         m = dict(m)
         content = m.get("content")
+        mine = own if m.get("role") == "assistant" else tags
         for k, v in m.items():
             if k != "role":
-                m[k] = _mark_deep(v, tags)
+                m[k] = _mark_deep(v, mine)
         if m.get("role") == "assistant" and isinstance(content, str) and content.lstrip().startswith("<think>") \
                 and "</think>" in content:
             i, j = content.index("<think>") + len("<think>"), content.index("</think>")
-            m["content"] = (content[:i] + _mark(content[i:j], tags) + "</think>" +
-                            _mark(content[j + len("</think>"):], tags))
+            m["content"] = (content[:i] + _mark(content[i:j], own) + "</think>" +
+                            _mark(content[j + len("</think>"):], own))
         out.append(m)
     return out, _mark_deep(tools, tags), tags
 

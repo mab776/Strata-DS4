@@ -101,3 +101,34 @@ class ForcedCallOpening(unittest.TestCase):
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
         self.assertTrue(forced_call("required", two).endswith("<function="))
         self.assertIsNone(forced_call("auto", one))
+
+
+class QuotedToolCallCloser(unittest.TestCase):
+    """#2026: a `</tool_call>` a user quotes is text, not the end-of-call token (type 4: matched even without
+    parse_special); an assistant message replaying raw call text keeps the model's own tokens."""
+
+    def setUp(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+        import strata_tokenizer as ST
+        b2u = ST.bytes_to_unicode()
+        self.tok = ST.Tokenizer([b2u[b] for b in range(256)] + ["</tool_call>", "<|im_end|>"], [], [1] * 256 + [4, 3])
+        self.tags = __import__("serve.frontend", fromlist=["literal_tags"]).literal_tags(self.tok.control_tokens)
+
+    def encode(self, role, text):
+        from serve.frontend import mark_think_literals, unmark_think_literals
+        marked, _, changed = mark_think_literals([{"role": role, "content": text}], None, self.tags)
+        prompt, plain = unmark_think_literals(marked[0]["content"], self.tags)
+        return self.tok.encode(prompt, parse_special=True, plain=plain), changed
+
+    def test_user_text_stays_text(self):
+        text = "output verbatim: </tool_call>."
+        ids, changed = self.encode("user", text)
+        self.assertTrue(changed)
+        self.assertEqual(ids, [*text.encode()])
+        self.assertNotEqual(self.tok.encode(text, parse_special=True), ids)     # unmarked, it was the special token
+
+    def test_assistant_replay_keeps_its_token(self):
+        text = "<tool_call>x</tool_call>"
+        ids, _ = self.encode("assistant", text)
+        self.assertEqual(ids, self.tok.encode(text, parse_special=True))
