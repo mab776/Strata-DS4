@@ -1,0 +1,6 @@
+ds4s-m12-32k-t1-resample-a abc391_d medium PASS pass
+ds4s-m12-32k-t1-resample-a abc394_c medium PASS pass
+ds4s-m12-32k-t1-resample-a abc400_d medium PASS pass
+ds4s-m12-32k-t1-resample-a abc394_g hard PASS pass
+ds4s-m12-32k-t1-resample-a abc400_g hard fail no code
+ds4s-m12-32k-t1-resample-a arc192_e hard PASS pass

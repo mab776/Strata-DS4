@@ -1,0 +1,39 @@
+ds4s-m12-32k-t1 abc387_c medium PASS pass
+ds4s-m12-32k-t1 abc388_c medium PASS pass
+ds4s-m12-32k-t1 abc388_d medium PASS pass
+ds4s-m12-32k-t1 abc389_d medium PASS pass
+ds4s-m12-32k-t1 abc390_c medium PASS pass
+ds4s-m12-32k-t1 abc390_d medium PASS pass
+ds4s-m12-32k-t1 abc391_d medium fail wrong test 8
+ds4s-m12-32k-t1 abc392_c medium PASS pass
+ds4s-m12-32k-t1 abc392_d medium fail wrong test 2
+ds4s-m12-32k-t1 abc394_c medium fail wrong test 3
+ds4s-m12-32k-t1 abc394_d medium PASS pass
+ds4s-m12-32k-t1 abc395_c medium PASS pass
+ds4s-m12-32k-t1 abc396_c medium PASS pass
+ds4s-m12-32k-t1 abc396_d medium PASS pass
+ds4s-m12-32k-t1 abc397_b medium PASS pass
+ds4s-m12-32k-t1 abc397_c medium PASS pass
+ds4s-m12-32k-t1 abc398_b medium PASS pass
+ds4s-m12-32k-t1 abc398_c medium PASS pass
+ds4s-m12-32k-t1 abc399_c medium PASS pass
+ds4s-m12-32k-t1 abc399_d medium PASS pass
+ds4s-m12-32k-t1 abc400_c medium PASS pass
+ds4s-m12-32k-t1 abc400_d medium fail no code
+ds4s-m12-32k-t1 arc191_a medium fail no code
+ds4s-m12-32k-t1 arc192_a medium PASS pass
+ds4s-m12-32k-t1 abc387_f hard PASS pass
+ds4s-m12-32k-t1 abc389_e hard PASS pass
+ds4s-m12-32k-t1 abc390_f hard PASS pass
+ds4s-m12-32k-t1 abc391_g hard PASS pass
+ds4s-m12-32k-t1 abc393_e hard PASS pass
+ds4s-m12-32k-t1 abc394_g hard PASS pass
+ds4s-m12-32k-t1 abc396_f hard PASS pass
+ds4s-m12-32k-t1 abc397_f hard PASS pass
+ds4s-m12-32k-t1 abc398_g hard fail no code
+ds4s-m12-32k-t1 abc400_g hard fail no code
+ds4s-m12-32k-t1 arc191_c hard fail wrong test 0
+ds4s-m12-32k-t1 arc192_e hard fail no code
+ds4s-m12-32k-t1 arc194_b hard PASS pass
+ds4s-m12-32k-t1 arc195_b hard PASS pass
+ds4s-m12-32k-t1 arc196_a hard PASS pass

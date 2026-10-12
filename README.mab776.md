@@ -4,7 +4,7 @@ Fork of https://github.com/Indras-Mirror/Strata-DS4 (one developer, no releases,
 https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster than our llama.cpp stack (stack 73
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
-## STATUS 2026-10-11 morning - LIVE as Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+## STATUS 2026-10-12 - Portainer stack 74 `deepseek-strata` (read this, then the session notes)
 - **Runs**: container `strata-ds4`, image `strata-ds4:cu13` (portainer/deepseek-strata/Dockerfile: Ubuntu 24.04 +
   Python + libnccl; nothing of the engine baked in), serve/server.py + `ds4_serve` from the DEPLOY SNAPSHOT
   `models/strata-ds4/run` (bind-mounted read-only at /app; the previous one is `run.prev`). A DROP-IN for llama.cpp
@@ -35,7 +35,10 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
   chat back in 0.6-1.3 s; agent turns read only what they appended.
 - **Clients**: OpenHands host profile `DeepSeek`; VS Code block portainer/deepseek-strata/vscode-copilot.txt; Open
   WebUI via **llm-router** (stack `llm-router`, :8340, portainer/llm-router) - OWUI's ONLY OpenAI connection now.
-- **Open**: M9 (LCB 39 at 32k t1.0, SWE Verified-mini vs stack 73) = a night session Marc triggers; M10 next targets
+- **Coding (M9, 10-11/12, session notes at the end)**: LCB 39 at 32k T 1.0 = Strata 30/39 vs stack 73 34/39 pass@1,
+  noise (the 6 disagreements resampled: 10/18 vs 12/18); SWE Verified-mini Strata **35/50**; paired first 10 = 8/10 on
+  both, Strata 7.4 vs 9.7 min and 26.3k vs 17.4k output tokens per solved issue.
+- **Open**: M10 next targets
   (250k profile of the fp16-indexer build, bench/mab776-m2/work/prof/p250k-m10c; done since: the indexer on int8,
   emit-only compressors, batched HCA blocks): expert MMQ ~15 % + the Strata MMQ plumbing ~9 % (copy16 / scatter /
   quantize), dense Q8_0 7 %; M11 DONE (10-10/11 night, session notes below): shipped lookup drafts, async hand-offs,
@@ -590,3 +593,34 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
 
   tok/s moves with each run's draft acceptance (tok/pass 2.02-2.30, restarts are not deterministic); the pass time is
   the engine's own change.
+
+## Session 2026-10-11/12 - M9 coding benchmarks vs stack 73 (Marc via the DeepSeek session; no engine work)
+Engine = stack 74 on the deployed M12 config, untouched. Both engines: temperature 1.0, top_p 1.0, no top_k (both
+servers then apply top_k 40 / min_p 0.05 by default), the template's default reasoning (thinking on), same harness.
+Every host job memory-capped (systemd-run MemoryMax / docker --memory), tasks one at a time, chain = detached user
+units. Scripts + tables: `bench/m9/` (m9_chain.sh, m9_resample.sh, m9_resample73.sh, m9_memguard.sh,
+m9_release.sh) and `strata-coder/bench/swe/m9_swe.sh` -> `m9_swe2.sh`; SWE overlay `strata-coder/bench/swe/ds4.yaml`.
+- **LiveCodeBench** (strata-coder/bench/lcb_eval.py, ab-gsq-20260926, 39 = 24 medium + 15 hard, 32k cap): Strata
+  `ds4s-m12-32k-t1` **30/39** (19 + 11; 5 cap hits; mean 15,134 tokens; 2 h 28 of generation) vs stack 73
+  `ds4-iq2m-32k-t1` (on file) **34/39** (22 + 12; 3 cap hits; mean 15,602; ~6 h 12). Only 73: abc391_d, abc394_c,
+  abc400_d, abc400_g, arc192_e; only Strata: abc394_g. Noise check (Marc): each disagreement sampled 2 more times on
+  BOTH engines (`-resample-a/-b`, LCB_IDS): Strata 10/18, stack 73 12/18 -> expected ~32.3 vs 33.0 of 39 = noise;
+  abc400_g is hard for both (0/3 vs 1/3). Table: bench/m9/lcb-resample-table.txt. Official pass@1 = first sample.
+- **SWE-bench Verified-mini** (mini-swe-agent 2.4.6, offline sandbox --memory 4g --cpus 4, step 250 / 45 min caps,
+  graded with 1 worker): Strata all 50 = **35/50** (281 min agent time, 8.0 min + 29.5k output tokens per solved issue,
+  median 10.8k tokens a run); stack 73 first 10 only (Marc: 10-12 h for 50). Paired 10: **8/10 both, the same 8**;
+  wall 60 vs 77 min, **7.4 vs 9.7 min per solved**, 26.3k vs 17.4k tokens per solved, mean steps 58 vs 44 (Strata
+  had 4 runs > 60 steps vs 2). Reference: Qwen Next Strata medium T 0.85 = 37/50, 130 min, 3.5 min + 19.8k tokens per
+  solved (summary-temp-1001.md); GLM-5.3 = 12/22. Summary: strata-coder/bench/swe/summary-m9-1011.md.
+- **Failure patterns**: 50/50 submitted, 0 step/time-cap hits, 0 malformed tool calls, 0 repeated-action loops,
+  0 empty patches; 1 reply spent its 32k tokens without a tool call (sphinx-7748, recovered, unresolved); 6 runs
+  > 100 steps (max 150). Stack 73: 1 command timeout, nothing else.
+- **Incidents (all harness/host, none engine)**: (1) stack 73's resample first ran while llama.cpp was still loading
+  (it answers /v1/models then 503s every chat) -> scripts now wait for a real chat reply; 73's django-12276 that
+  overlapped the load was re-run (old one kept as `.503-load`). (2) 20:46: stack 73's llama-server crept from ~44 to
+  ~51 GB RSS over its 4 h window (anon ~9 GB, likely its prompt RAM cache); host down to 0.7 GiB -> systemd-oomd killed
+  the `claude-portainer` Remote Control tmux scope (restarted 21:07; the relay session died). m9_memguard.sh added.
+  (3) 22:21: one sphinx-9320 trajectory ballooned mini-extra to 3.1 GB (a huge command output) and the chain unit's own
+  3G cap killed the chain; restarted with each issue in its own 4.5G scope; 9320's re-run was clean (299 MB).
+- **End**: GPUs released at 01:08 (Marc 10-11 22:40: mode page -> off after the agent phase, grading is CPU only) -
+  stack 74 is STOPPED, not left running; other sessions took the GPUs.

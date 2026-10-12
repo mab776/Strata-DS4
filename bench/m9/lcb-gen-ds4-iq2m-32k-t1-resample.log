@@ -1,0 +1,12 @@
+ds4-iq2m-32k-t1-resample-a abc391_d medium stop 20061 683.9
+ds4-iq2m-32k-t1-resample-a abc394_c medium stop 12884 463.0
+ds4-iq2m-32k-t1-resample-a abc400_d medium stop 29384 966.6
+ds4-iq2m-32k-t1-resample-a abc394_g hard stop 26112 875.5
+ds4-iq2m-32k-t1-resample-a abc400_g hard length 32768 1196.9
+ds4-iq2m-32k-t1-resample-a arc192_e hard stop 30890 996.1
+ds4-iq2m-32k-t1-resample-b abc391_d medium stop 20699 710.3
+ds4-iq2m-32k-t1-resample-b abc394_c medium stop 17068 602.5
+ds4-iq2m-32k-t1-resample-b abc400_d medium stop 29319 1009.7
+ds4-iq2m-32k-t1-resample-b abc394_g hard stop 27643 927.6
+ds4-iq2m-32k-t1-resample-b abc400_g hard length 32768 1231.8
+ds4-iq2m-32k-t1-resample-b arc192_e hard length 32768 1056.3

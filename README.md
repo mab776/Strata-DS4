@@ -116,8 +116,24 @@ Strata then passes 10 of 18 samples and llama.cpp passes 12 of 18. That puts the
 33.0 of 39. abc400_g is the one problem both find hard (Strata 0/3, llama.cpp 1/3). Per-problem table:
 `bench/m9/lcb-resample-table.txt`.
 
-**SWE-bench Verified-mini** (50 issues, mini-swe-agent, offline sandbox): in progress. Strata runs all 50;
-llama.cpp runs the first 10 as a paired block, because at its decode speed all 50 would take 10-12 h.
+**SWE-bench Verified-mini** (50 issues, mini-swe-agent, offline sandbox, 250-step / 45-min caps). Strata ran all 50.
+llama.cpp ran only the first 10 as a paired block, because at its decode speed all 50 would take 10-12 h.
+
+| first 10 issues (paired) | Strata-DS4 | llama.cpp |
+|---|---:|---:|
+| solved | 8/10 | 8/10 (the same 8) |
+| agent wall time, all 10 | **60 min** | 77 min |
+| minutes per solved issue | **7.4** | 9.7 |
+| output tokens per solved issue | 26.3k | **17.4k** |
+| mean steps (solved / failed) | 38.5 / 136.5 | 32.1 / 93.0 |
+
+On all 50, Strata solved **35/50**: 281 min of agent time, 8.0 min and 29.5k output tokens per solved issue. For
+comparison, Qwen3.8-Flash-Next IQ3_S on Strata (the live coder, medium effort, T 0.85) solved 37/50 in 130 min.
+The two failures the engines share are sphinx-8638 and sphinx-9229.
+
+All 50 runs submitted a patch. None hit the step or time cap, and none produced a malformed tool call or a repeated
+action loop. One reply ran out of its 32k tokens before calling a tool (sphinx-7748); the agent recovered and
+submitted a patch, but the issue stayed unresolved. Six runs took more than 100 steps. Summary: `strata-coder` `bench/swe/summary-m9-1011.md`.
 
 ## Running it
 

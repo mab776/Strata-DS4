@@ -1,0 +1,40 @@
+Traceback (most recent call last):
+  File "/home/mab776/Documents/portainer/strata-coder/bench/lcb_eval.py", line 131, in <module>
+    {"gen": lambda: gen(sys.argv[2], sys.argv[3]), "grade": lambda: grade(sys.argv[2]),
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     "compare": lambda: compare(sys.argv[2], sys.argv[3])}[sys.argv[1]]()
+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "/home/mab776/Documents/portainer/strata-coder/bench/lcb_eval.py", line 131, in <lambda>
+    {"gen": lambda: gen(sys.argv[2], sys.argv[3]), "grade": lambda: grade(sys.argv[2]),
+                    ~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/mab776/Documents/portainer/strata-coder/bench/lcb_eval.py", line 58, in gen
+    j = json.load(urllib.request.urlopen(req, timeout=7200))
+                  ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 189, in urlopen
+    return opener.open(url, data, timeout)
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 495, in open
+    response = meth(req, response)
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 604, in http_response
+    response = self.parent.error(
+        'http', request, response, code, msg, hdrs)
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 533, in error
+    return self._call_chain(*args)
+           ~~~~~~~~~~~~~~~~^^^^^^^
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 466, in _call_chain
+    result = func(*args)
+  File "/home/mab776/miniconda3/lib/python3.13/urllib/request.py", line 613, in http_error_default
+    raise HTTPError(req.full_url, code, msg, hdrs, fp)
+urllib.error.HTTPError: HTTP Error 503: Service Unavailable
+ds4s-m12-32k-t1-resample-a abc391_d medium stop 19590 362.3
+ds4s-m12-32k-t1-resample-a abc394_c medium stop 14231 220.4
+ds4s-m12-32k-t1-resample-a abc400_d medium stop 25432 392.1
+ds4s-m12-32k-t1-resample-a abc394_g hard stop 30363 467.7
+ds4s-m12-32k-t1-resample-a abc400_g hard length 32768 519.3
+ds4s-m12-32k-t1-resample-a arc192_e hard stop 27654 400.5
+ds4s-m12-32k-t1-resample-b abc391_d medium length 32768 486.5
+ds4s-m12-32k-t1-resample-b abc394_c medium stop 21929 306.2
+ds4s-m12-32k-t1-resample-b abc400_d medium stop 25963 388.8
+ds4s-m12-32k-t1-resample-b abc394_g hard stop 29662 450.7
+ds4s-m12-32k-t1-resample-b abc400_g hard length 32768 518.8
+ds4s-m12-32k-t1-resample-b arc192_e hard stop 32497 467.5

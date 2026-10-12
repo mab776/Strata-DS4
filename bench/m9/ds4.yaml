@@ -1,0 +1,22 @@
+# M9 (2026-10-11) overlay on benchmarks/swebench.yaml: DeepSeek-V4-Flash on :8330 - whichever DeepSeek engine the mode
+# page runs (stack 74 Strata-DS4 or stack 73 llama.cpp: same port, same model id), so both get THIS file unchanged.
+# DeepSeek's sampling (temperature 1.0 passed per run, top_p 1.0, no top_k), no reasoning_effort = the template's
+# default thinking on both engines (no shared effort set on Strata-DS4).
+model:
+  model_name: openai/deepseek-v4-flash
+  cost_tracking: ignore_errors
+  model_kwargs:
+    api_base: http://127.0.0.1:8330/v1
+    api_key: none
+    drop_params: true
+    parallel_tool_calls: true
+    top_p: 1.0
+    max_tokens: 32768
+    timeout: 2400
+agent:
+  step_limit: 250
+  wall_time_limit_seconds: 2700
+environment:
+  container_timeout: 2h
+  # no network (as strata.yaml); + a memory / CPU cap: the sandbox runs beside a ~42-44 GiB DeepSeek server (10-11 oomd)
+  run_args: ["--rm", "--network", "none", "--memory", "4g", "--memory-swap", "4g", "--cpus", "4"]

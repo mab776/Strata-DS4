@@ -1,0 +1,184 @@
+== 2026-10-11 14:15:09 LCB: 39 answers - grading
+medium  n= 24  ds4-iq2m-32k-t1=22  ds4s-m12-32k-t1=19  only-ds4-iq2m-32k-t1=3  only-ds4s-m12-32k-t1=0
+hard    n= 15  ds4-iq2m-32k-t1=12  ds4s-m12-32k-t1=11  only-ds4-iq2m-32k-t1=2  only-ds4s-m12-32k-t1=1
+ALL     n= 39  ds4-iq2m-32k-t1=34  ds4s-m12-32k-t1=30  only-ds4-iq2m-32k-t1=5  only-ds4s-m12-32k-t1=1
+ds4-iq2m-32k-t1: mean tokens 15602, hit max_tokens 3
+ds4s-m12-32k-t1: mean tokens 15134, hit max_tokens 5
+== 2026-10-11 14:15:48 SWE paired blocks
+== 2026-10-11 14:15:48 resample ids: abc391_d,abc394_c,abc394_g,abc400_d,abc400_g,arc192_e
+| problem | diff | stack 73 | Strata 1st | resample a | resample b | Strata k/3 |
+|---|---|---|---|---|---|---|
+| abc391_d | medium | pass | fail | pass | fail | 1/3 |
+| abc394_c | medium | pass | fail | pass | pass | 2/3 |
+| abc394_g | hard | fail | pass | pass | pass | 3/3 |
+| abc400_d | medium | pass | fail | pass | pass | 2/3 |
+| abc400_g | hard | pass | fail | fail | fail | 0/3 |
+| arc192_e | hard | pass | fail | pass | pass | 2/3 |
+
+Strata pass@1 (first sample): 30/39; stack 73: 34/39
+== 2026-10-11 15:39:29 resample done
+2026-10-11 15:39:39 engine strata ready (running)
+2026-10-11 15:39:39 run django__django-12276 strata
+2026-10-11 15:41:10   -> Submitted in 1 min
+2026-10-11 15:41:10 run django__django-11815 strata
+2026-10-11 15:44:02   -> Submitted in 2 min
+2026-10-11 15:44:02 run sphinx-doc__sphinx-7757 strata
+2026-10-11 15:45:51   -> Submitted in 1 min
+2026-10-11 15:45:51 run sphinx-doc__sphinx-8638 strata
+2026-10-11 16:01:17   -> Submitted in 15 min
+2026-10-11 16:01:17 run django__django-11880 strata
+2026-10-11 16:01:52   -> Submitted in 0 min
+2026-10-11 16:01:52 run sphinx-doc__sphinx-8056 strata
+2026-10-11 16:10:59   -> Submitted in 9 min
+2026-10-11 16:10:59 run django__django-12713 strata
+2026-10-11 16:12:06   -> Submitted in 1 min
+2026-10-11 16:12:07 run sphinx-doc__sphinx-9230 strata
+2026-10-11 16:18:16   -> Submitted in 6 min
+2026-10-11 16:18:16 STOP-M9 - ending
+2026-10-11 16:18:26 engine strata ready (running)
+2026-10-11 16:18:26 agent phase done - grading (1 worker)
+2026-10-11 16:18:44 engine strata ready (running)
+2026-10-11 16:18:44 run sphinx-doc__sphinx-9229 strata
+2026-10-11 16:36:56   -> Submitted in 18 min
+2026-10-11 16:36:57 run sphinx-doc__sphinx-8035 strata
+2026-10-11 16:40:41   -> Submitted in 3 min
+2026-10-11 16:40:41 engine -> lcpp
+2026-10-11 16:41:06 engine lcpp ready (running)
+== 2026-10-11 16:41:06 73 resample ids: abc391_d,abc394_c,abc394_g,abc400_d,abc400_g,arc192_e
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+  File "<stdin>", line 3, in <lambda>
+FileNotFoundError: [Errno 2] No such file or directory: '/home/mab776/Documents/portainer/strata-coder/bench/ab-gsq-20260926/grade-ds4-iq2m-32k-t1-resample-a.json'
+== 2026-10-11 16:41:08 73 resample FAILED (all requests 503: stack 73 still loading; rerun 16:5x)
+2026-10-11 16:41:08 run django__django-12276 lcpp
+2026-10-11 16:44:21   -> Submitted in 3 min
+2026-10-11 16:44:21 run django__django-11815 lcpp
+2026-10-11 16:46:14 engine lcpp ready (running)
+== 2026-10-11 16:46:14 73 resample ids: abc391_d,abc394_c,abc394_g,abc400_d,abc400_g,arc192_e
+== 2026-10-11 16:57:40 chain3 stopped at a resample boundary to re-queue 73's django-12276 (503 during load); chain4 resumes
+2026-10-11 16:57:50 engine lcpp ready (running)
+== 2026-10-11 16:57:50 73 resample ids: abc391_d,abc394_c,abc394_g,abc400_d,abc400_g,arc192_e
+| problem | diff | Strata 1st | Strata a | Strata b | Strata k/3 | 73 1st | 73 a | 73 b | stack 73 k/3 |
+|---|---|---|---|---|---|---|---|---|---|
+| abc391_d | medium | fail | pass | fail | 1/3 | pass | fail | pass | 2/3 |
+| abc394_c | medium | fail | pass | pass | 2/3 | pass | pass | fail | 2/3 |
+| abc394_g | hard | pass | pass | pass | 3/3 | fail | pass | pass | 2/3 |
+| abc400_d | medium | fail | pass | pass | 2/3 | pass | pass | pass | 3/3 |
+| abc400_g | hard | fail | fail | fail | 0/3 | pass | fail | fail | 1/3 |
+| arc192_e | hard | fail | pass | pass | 2/3 | pass | pass | fail | 2/3 |
+
+pass@1 (first sample, official): Strata 30/39, stack 73 34/39
+== 2026-10-11 19:45:15 73 resample done
+2026-10-11 19:45:15 run django__django-12276 lcpp
+2026-10-11 19:46:33   -> Submitted in 1 min
+2026-10-11 19:46:33 run django__django-11815 lcpp
+2026-10-11 19:50:25   -> Submitted in 3 min
+2026-10-11 19:50:25 run sphinx-doc__sphinx-7757 lcpp
+2026-10-11 19:55:33   -> Submitted in 5 min
+2026-10-11 19:55:33 run sphinx-doc__sphinx-8638 lcpp
+2026-10-11 20:12:00   -> Submitted in 16 min
+2026-10-11 20:12:00 run django__django-11880 lcpp
+2026-10-11 20:13:05   -> Submitted in 1 min
+2026-10-11 20:13:05 run sphinx-doc__sphinx-8056 lcpp
+2026-10-11 20:22:40   -> Submitted in 9 min
+2026-10-11 20:22:40 run django__django-12713 lcpp
+2026-10-11 20:25:27   -> Submitted in 2 min
+2026-10-11 20:25:27 run sphinx-doc__sphinx-9230 lcpp
+2026-10-11 20:28:56   -> Submitted in 3 min
+2026-10-11 20:28:56 run sphinx-doc__sphinx-9229 lcpp
+2026-10-11 20:57:55   -> Submitted in 28 min
+2026-10-11 20:57:55 run sphinx-doc__sphinx-8035 lcpp
+2026-10-11 21:03:57   -> Submitted in 6 min
+2026-10-11 21:03:58 engine -> strata
+2026-10-11 21:05:35 engine strata ready (running)
+2026-10-11 21:05:35 run sphinx-doc__sphinx-7748 strata
+2026-10-11 21:21:19   -> Submitted in 15 min
+2026-10-11 21:21:19 run django__django-12325 strata
+2026-10-11 21:25:09   -> Submitted in 3 min
+2026-10-11 21:25:09 run sphinx-doc__sphinx-9367 strata
+2026-10-11 21:26:01   -> Submitted in 0 min
+2026-10-11 21:26:02 run django__django-11951 strata
+2026-10-11 21:27:04   -> Submitted in 1 min
+2026-10-11 21:27:04 run sphinx-doc__sphinx-8265 strata
+2026-10-11 21:32:40   -> Submitted in 5 min
+2026-10-11 21:32:40 run django__django-12262 strata
+2026-10-11 21:36:17   -> Submitted in 3 min
+2026-10-11 21:36:17 run sphinx-doc__sphinx-9698 strata
+2026-10-11 21:37:21   -> Submitted in 1 min
+2026-10-11 21:37:21 run sphinx-doc__sphinx-10435 strata
+2026-10-11 21:41:06   -> Submitted in 3 min
+2026-10-11 21:41:06 run sphinx-doc__sphinx-9461 strata
+2026-10-11 21:49:08   -> Submitted in 8 min
+2026-10-11 21:49:08 run django__django-12304 strata
+2026-10-11 21:59:25   -> Submitted in 10 min
+2026-10-11 21:59:35 engine strata ready (running)
+2026-10-11 21:59:35 run sphinx-doc__sphinx-8721 strata
+2026-10-11 22:01:44   -> Submitted in 2 min
+2026-10-11 22:01:44 run django__django-11790 strata
+2026-10-11 22:03:29   -> Submitted in 1 min
+2026-10-11 22:03:29 run django__django-12143 strata
+2026-10-11 22:04:03   -> Submitted in 0 min
+2026-10-11 22:04:03 run sphinx-doc__sphinx-7590 strata
+2026-10-11 22:18:59   -> Submitted in 14 min
+2026-10-11 22:18:59 run sphinx-doc__sphinx-9320 strata
+== 2026-10-11 22:34:10 chain4 OOM-killed at 22:21 (its own 3G cap; mini-extra 3.1 GB on sphinx-9320); chain5 = per-issue 4.5G scopes
+2026-10-11 22:34:21 engine strata ready (running)
+2026-10-11 22:34:21 run sphinx-doc__sphinx-9320 strata
+2026-10-11 22:35:33   -> Submitted in 1 min
+2026-10-11 22:35:33 run sphinx-doc__sphinx-8548 strata
+2026-10-11 22:49:04   -> Submitted in 13 min
+2026-10-11 22:49:04 run sphinx-doc__sphinx-10466 strata
+2026-10-11 22:53:43   -> Submitted in 4 min
+2026-10-11 22:53:43 run sphinx-doc__sphinx-9281 strata
+2026-10-11 22:55:55   -> Submitted in 2 min
+2026-10-11 22:55:55 run sphinx-doc__sphinx-10673 strata
+2026-10-11 23:05:38   -> Submitted in 9 min
+2026-10-11 23:05:38 run django__django-12308 strata
+2026-10-11 23:07:04   -> Submitted in 1 min
+2026-10-11 23:07:14 engine strata ready (running)
+2026-10-11 23:07:14 run django__django-11964 strata
+2026-10-11 23:17:10   -> Submitted in 9 min
+2026-10-11 23:17:10 run django__django-12708 strata
+2026-10-11 23:21:48   -> Submitted in 4 min
+2026-10-11 23:21:48 run django__django-12209 strata
+2026-10-11 23:43:54   -> Submitted in 22 min
+2026-10-11 23:43:54 run django__django-9296 strata
+2026-10-11 23:44:15   -> Submitted in 0 min
+2026-10-11 23:44:15 run sphinx-doc__sphinx-11510 strata
+2026-10-12 00:00:03   -> Submitted in 15 min
+2026-10-12 00:00:03 run django__django-12155 strata
+2026-10-12 00:01:16   -> Submitted in 1 min
+2026-10-12 00:01:16 run django__django-11848 strata
+2026-10-12 00:02:23   -> Submitted in 1 min
+2026-10-12 00:02:23 run django__django-12039 strata
+2026-10-12 00:04:53   -> Submitted in 2 min
+2026-10-12 00:04:53 run django__django-11885 strata
+2026-10-12 00:21:47   -> Submitted in 16 min
+2026-10-12 00:21:47 run django__django-12193 strata
+2026-10-12 00:23:33   -> Submitted in 1 min
+2026-10-12 00:23:43 engine strata ready (running)
+2026-10-12 00:23:43 run django__django-12050 strata
+2026-10-12 00:25:18   -> Submitted in 1 min
+2026-10-12 00:25:18 run sphinx-doc__sphinx-8475 strata
+2026-10-12 00:25:48   -> Submitted in 0 min
+2026-10-12 00:25:48 run django__django-11999 strata
+2026-10-12 00:28:28   -> Submitted in 2 min
+2026-10-12 00:28:28 run sphinx-doc__sphinx-10323 strata
+2026-10-12 00:29:28   -> Submitted in 1 min
+2026-10-12 00:29:28 run sphinx-doc__sphinx-8551 strata
+2026-10-12 00:33:03   -> Submitted in 3 min
+2026-10-12 00:33:03 run sphinx-doc__sphinx-8269 strata
+2026-10-12 00:34:55   -> Submitted in 1 min
+2026-10-12 00:34:55 run sphinx-doc__sphinx-7985 strata
+2026-10-12 00:46:30   -> Submitted in 11 min
+2026-10-12 00:46:31 run django__django-12774 strata
+2026-10-12 00:48:01   -> Submitted in 1 min
+2026-10-12 00:48:01 run django__django-12406 strata
+2026-10-12 00:58:33   -> Submitted in 10 min
+2026-10-12 00:58:33 run django__django-12273 strata
+2026-10-12 01:07:22   -> Submitted in 8 min
+2026-10-12 01:07:32 engine strata ready (running)
+2026-10-12 01:07:32 agent phase done - grading (1 worker)
+== 2026-10-12 01:08:15 GPUs released: mode page -> off (strata-ds4 exited)
+2026-10-12 01:26:43 all done
+== 2026-10-12 01:26:43 M9 chain5 done
