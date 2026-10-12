@@ -74,8 +74,11 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 | 127k | **1,530**   | 843   | **73** / 70 | 39.0 |
 | 250k | **1,428**   | 693   | **71** / 68 | ~36 |
 
-- **Without drafts**, decode is 47 / 45 / 43 tok/s at 8k / 127k / 250k. A K=2 verify pass (3 tokens) yields 2.1-2.3
-  tokens on average.
+- **The table is the final one** (2026-10-11, after M12): the K=2 column averages three runs a depth, and the
+  prefill and K=1 figures match the same session's runs. Logs: `bench/mab776-m2/out/M12-final-before-after.log`.
+  A K=2 verify pass (3 tokens) yields 2.1-2.3 tokens on average.
+- **Without drafts**, decode was 47 / 45 / 43 tok/s at 8k / 127k / 250k, measured on 10-10 before M11 and M12
+  made a verify pass ~15 % shorter. It has not been re-measured since, so it is probably a little higher now.
 - **K=2 for sampled requests, K=1 for greedy ones.** Clients normally sample. In sampled needle runs at 240k (T=1.0
   and T=0.6, 60 per K) neither K ever looped. In greedy (temperature 0) runs, K=2 fell into repetition loops a little
   more often (11/106 vs 3/95). Teacher-forced checks show K=2's logits are as close to plain decoding as plain decoding
