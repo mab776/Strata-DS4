@@ -94,6 +94,28 @@ All numbers are tok/s, measured through the HTTP API: code generation, 512 token
 - **Not bit-deterministic.** Which tier computes an expert depends on the cache state, and the CPU's Q8_K and the
   GPU's q8_1 activations round differently. Two runs of the same greedy request can therefore diverge at a near-tie.
 
+## How well does it code?
+
+M9, 2026-10-11. Same GGUF and sampling on both engines: temperature 1.0, top_p 1.0, no top_k, the template's default
+reasoning, 32k-token cap.
+
+**LiveCodeBench** (39 problems: 24 medium, 15 hard):
+
+| | Strata-DS4 | llama.cpp |
+|---|---:|---:|
+| pass@1 (first sample) | 30/39 | **34/39** |
+| medium / hard | 19/24 · 11/15 | 22/24 · 12/15 |
+| mean tokens per answer (hit the 32k cap) | 15,134 (5) | 15,602 (3) |
+| wall time for the 39 | **2 h 28** | ~6 h 12 |
+
+The gap is mostly sampling noise. The engines disagree on 6 problems, and each engine sampled those 6 twice more.
+Strata then passes 10 of 18 samples and llama.cpp passes 12 of 18. That puts the expected scores at about 32.3 vs
+33.0 of 39. abc400_g is the one problem both find hard (Strata 0/3, llama.cpp 1/3). Per-problem table:
+`bench/m9/lcb-resample-table.txt`.
+
+**SWE-bench Verified-mini** (50 issues, mini-swe-agent, offline sandbox): in progress. Strata runs all 50;
+llama.cpp runs the first 10 as a paired block, because at its decode speed all 50 would take 10-12 h.
+
 ## Running it
 
 Requirements: Linux, Docker with the NVIDIA runtime, and an NVIDIA GPU with sm_120 (the build targets `sm_120a`;

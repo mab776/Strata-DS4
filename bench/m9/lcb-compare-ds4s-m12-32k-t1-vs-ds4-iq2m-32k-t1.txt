@@ -1,0 +1,5 @@
+medium  n= 24  ds4-iq2m-32k-t1=22  ds4s-m12-32k-t1=19  only-ds4-iq2m-32k-t1=3  only-ds4s-m12-32k-t1=0
+hard    n= 15  ds4-iq2m-32k-t1=12  ds4s-m12-32k-t1=11  only-ds4-iq2m-32k-t1=2  only-ds4s-m12-32k-t1=1
+ALL     n= 39  ds4-iq2m-32k-t1=34  ds4s-m12-32k-t1=30  only-ds4-iq2m-32k-t1=5  only-ds4s-m12-32k-t1=1
+ds4-iq2m-32k-t1: mean tokens 15602, hit max_tokens 3
+ds4s-m12-32k-t1: mean tokens 15134, hit max_tokens 5

@@ -1,0 +1,10 @@
+| problem | diff | Strata 1st | Strata a | Strata b | Strata k/3 | 73 1st | 73 a | 73 b | stack 73 k/3 |
+|---|---|---|---|---|---|---|---|---|---|
+| abc391_d | medium | fail | pass | fail | 1/3 | pass | fail | pass | 2/3 |
+| abc394_c | medium | fail | pass | pass | 2/3 | pass | pass | fail | 2/3 |
+| abc394_g | hard | pass | pass | pass | 3/3 | fail | pass | pass | 2/3 |
+| abc400_d | medium | fail | pass | pass | 2/3 | pass | pass | pass | 3/3 |
+| abc400_g | hard | fail | fail | fail | 0/3 | pass | fail | fail | 1/3 |
+| arc192_e | hard | fail | pass | pass | 2/3 | pass | pass | fail | 2/3 |
+
+pass@1 (first sample, official): Strata 30/39, stack 73 34/39
