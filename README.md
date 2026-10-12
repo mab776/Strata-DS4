@@ -133,7 +133,7 @@ The two failures the engines share are sphinx-8638 and sphinx-9229.
 
 All 50 runs submitted a patch. None hit the step or time cap, and none produced a malformed tool call or a repeated
 action loop. One reply ran out of its 32k tokens before calling a tool (sphinx-7748); the agent recovered and
-submitted a patch, but the issue stayed unresolved. Six runs took more than 100 steps. Summary: `strata-coder` `bench/swe/summary-m9-1011.md`.
+submitted a patch, but the issue stayed unresolved. Six runs took more than 100 steps. Summary: `bench/m9/swe-summary-m9-1011.md`.
 
 ## Running it
 
