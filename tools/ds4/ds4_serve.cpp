@@ -968,7 +968,8 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         // mab776 M11b (DS4_OVL): token 0's hint is queued with its readback, the attention queued behind it, and the
         // hint collected (+ the prefetch DMAs issued) under the attention - the card runs predict -> attention back
         // to back instead of idling while the host picks the prefetch and launches the attention
-        ahead = pfo && dense.predict_launch(l);
+        // mab776 M14 (DS4_FUSE_PREDICT): layer l - 1's finish graph already queued this hint and its readback
+        ahead = pfo && ((l > 0 && dense.predict_queued(l)) || dense.predict_launch(l));
         if (pfo && !ahead && dense.predict(l, pred_i.data(), kPredW)) prefetch();   // token 0's hint
         const float * x = nullptr;
         if (!dense.attn_router_n(l, pos0, n, ids_n.data(), w_n.data(), &x, ahead || route ? &hook : nullptr)) {
@@ -993,7 +994,7 @@ bool Server::step_n(const int * toks, int n, int pos0) {
         }
         const bool dsum = rdev && tier.dev_sum_used();
         if (!dense.finish_layer_n(l, n, dsum ? nullptr : routed_n.data(), dsum && tier.event_used(),
-                                  dsum && tier.mix_add_used())) {
+                                  dsum && tier.mix_add_used(), pfo && l + 1 < n_layer)) {
             err = dense.last_error();
             return false;
         }

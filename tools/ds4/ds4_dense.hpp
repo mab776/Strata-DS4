@@ -122,6 +122,9 @@ public:
     /// returns false when unavailable (CPU backend, no events, DS4_OVL=0, DS4_ASYNC=0): use predict().
     bool predict_launch(int il);
     bool predict_collect(int il, int * top_ids, int n_top);
+    /// mab776 M14: true when layer il's hint is already queued (the previous layer's finish_layer_n(predict_next)):
+    /// predict_collect(il) reads it, no predict_launch needed
+    bool predict_queued(int il) const;
 
     /// Attention for layer `il` at position `pos` + the layer's MoE router + the shared expert.
     /// `routed_ids`/`routed_w` must hold n_expert_used entries; `routed_w` is the final normalised,
@@ -143,7 +146,10 @@ public:
     /// which the expert tier recorded after its mix, instead of the host having waited for the tier
     /// sh_folded (mab776 M13, DS4_SH_FOLD, with routed_sum == NULL): the tier's mix already added shexp_device(il)
     /// (Ds4MoeTier::set_mix_add): the finish skips its own `shexp + routed` add
-    bool finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event = false, bool sh_folded = false);
+    /// predict_next (mab776 M14, DS4_FUSE_PREDICT): the same graph also queues layer il + 1's predict and its readback
+    /// (= predict_launch(il + 1)); predict_queued(il + 1) says whether it did
+    bool finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event = false, bool sh_folded = false,
+                        bool predict_next = false);
     /// mab776 M13: layer il's shared-expert output on the device (kNtMax rows, *stride floats apart), written by its
     /// attention graph; NULL on the CPU backend
     const void * shexp_device(int il, int64_t * stride) const;

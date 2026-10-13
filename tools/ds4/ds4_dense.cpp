@@ -550,6 +550,10 @@ struct Ds4Dense::Impl {
         ggml_gallocr_t allo_finish[kNtMax + 1] = {};
         ggml_cgraph * gf_finish_f[kNtMax + 1] = {};    // mab776 M13: ... with shexp already in routed_sum (DS4_SH_FOLD)
         ggml_gallocr_t allo_finish_f[kNtMax + 1] = {};
+        // mab776 M14 (DS4_FUSE_PREDICT): this layer's finish + the NEXT layer's predict in one graph, by n
+        ggml_cgraph * gf_finpred[kNtMax + 1] = {};
+        ggml_gallocr_t allo_finpred[kNtMax + 1] = {};
+        ggml_tensor * finpred_out[kNtMax + 1] = {};       // = the next layer's predict_out, computed in gf_finpred[n]
         std::vector<float> host_fn, host_attn_raw, host_attn, host_llast;   // [.., kNtMax]
         int  tap_n = 0;                   // the n of the pass the taps / host_fn hold
         bool have_attn = false, have_finish = false;
@@ -867,6 +871,7 @@ static bool pf_sparse_on();   // mab776 DS4_PF_SPARSE, ditto
 static bool fused_idx_on(bool cpu);     // DS4_FUSED_IDX, ditto
 static bool ovl_gather_on();            // DS4_OVL_GATHER, ditto
 static bool lean_on(const Ds4Dense::Impl & im);   // mab776 M13 DS4_LEAN, ditto
+static bool fuse_predict_on(const Ds4Dense::Impl & im);   // mab776 M14 DS4_FUSE_PREDICT, ditto
 
 static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_t n, Ds4Dense::Impl::Layer & L,
                                bool emit = true) {
@@ -1533,9 +1538,10 @@ static ggml_cgraph * build_attn(Ds4Dense::Impl & im, int il, int64_t cap, int64_
 }
 
 // finish_layer: ffn_out = routed_sum + shexp ; l_last = hc_post(ffn_out, hap, post_f, comb_f), per token
-static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl::Layer & L, bool folded = false) {
+// the finish's ops appended to gf: ffn_out = shexp + routed_sum -> hc_post -> x_state (+ the l_last tap the gate reads);
+// returns the x_state copy (a view of x_state, so a consumer appended after it is ordered after the write)
+static ggml_tensor * finish_ops(Ds4Dense::Impl & im, ggml_cgraph * gf, int64_t n, Ds4Dense::Impl::Layer & L, bool folded) {
     ggml_context * gc = im.gctx;
-    ggml_cgraph * gf = ggml_new_graph_custom(gc, 512, false);
     B b { &im, gc, &im.g };
     const int64_t D = im.D, HC = im.HC;
 
@@ -1549,24 +1555,27 @@ static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl
     ggml_tensor * llast = b.hc_post(ffn_out, hap3, pf2, cf3);
     ggml_tensor * ll3 = ggml_reshape_3d(gc, llast, D, HC, n);
 
-    ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1],
-                                                                 im.x_state->nb[2], 0)));
-    if (im.pf) return gf;   // a chunk graph: no l_last tap, not registered
+    ggml_tensor * st = ggml_cpy(gc, ll3, ggml_view_3d(gc, im.x_state, D, HC, n, im.x_state->nb[1], im.x_state->nb[2], 0));
+    ggml_build_forward_expand(gf, st);
+    if (im.pf) return st;   // a chunk graph: no l_last tap
     if (!L.host_llast.empty() || !lean_on(im))   // M13: the tap only for the gate's taps (nobody else reads it)
         ggml_build_forward_expand(gf, ggml_cpy(gc, ll3, ggml_view_3d(gc, L.t_llast, D, HC, n, L.t_llast->nb[1],
                                                                      L.t_llast->nb[2], 0)));
+    return st;
+}
+
+static ggml_cgraph * build_finish(Ds4Dense::Impl & im, int64_t n, Ds4Dense::Impl::Layer & L, bool folded = false) {
+    ggml_cgraph * gf = ggml_new_graph_custom(im.gctx, 512, false);
+    finish_ops(im, gf, n, L, folded);
+    if (im.pf) return gf;   // a chunk graph: not registered
     (folded ? L.gf_finish_f : L.gf_finish)[n] = gf;
     return gf;
 }
 
-// predict: the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight  (prefetch hint "A"), token 0 of the pass
-static ggml_cgraph * build_predict(Ds4Dense::Impl & im, int il, Ds4Dense::Impl::Layer & L) {
+// predict's ops on xin (one token's [D, HC] state): the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight
+static ggml_tensor * predict_ops(Ds4Dense::Impl & im, int il, ggml_tensor * xin) {
     ggml_context * gc = im.gctx;
-    ggml_cgraph * gf = ggml_new_graph_custom(gc, 512, false);
     B b { &im, gc, &im.g };
-    const int64_t D = im.D, HC = im.HC;
-
-    ggml_tensor * xin = ggml_view_3d(gc, im.x_state, D, HC, 1, im.x_state->nb[1], im.x_state->nb[2], 0);
     ggml_tensor * post_a = nullptr, * comb_a = nullptr;
     ggml_tensor * fnp = b.hc_pre(xin, b.BL(il, "hc_attn_fn.weight"), b.BL(il, "hc_attn_scale.weight"),
                                  b.BL(il, "hc_attn_base.weight"), &post_a, &comb_a, b.BL(il, "ffn_norm.weight"));
@@ -1582,8 +1591,33 @@ static ggml_cgraph * build_predict(Ds4Dense::Impl & im, int il, Ds4Dense::Impl::
         out = ggml_add(gc, probs, b.BL(il, "exp_probs_b.bias"));
     }
     ggml_set_output(out);
+    return out;
+}
+
+// predict: the layer's router on rms_norm(hc_attn_pre) * ffn_norm.weight  (prefetch hint "A"), token 0 of the pass
+static ggml_cgraph * build_predict(Ds4Dense::Impl & im, int il, Ds4Dense::Impl::Layer & L) {
+    ggml_cgraph * gf = ggml_new_graph_custom(im.gctx, 512, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * xin = ggml_view_3d(im.gctx, im.x_state, D, HC, 1, im.x_state->nb[1], im.x_state->nb[2], 0);
+    ggml_tensor * out = predict_ops(im, il, xin);
     ggml_build_forward_expand(gf, out);
     L.predict_out = out;
+    return gf;
+}
+
+// mab776 M14 (DS4_FUSE_PREDICT): layer il's finish for n tokens and layer il + 1's predict on token 0 of the state it
+// writes, in ONE graph - the same ops as finish(il) then predict(il + 1), one graph launch a layer fewer.  (The idea is
+// upstream Strata-DSV4.1's finish_predict, 3d4328cd, here on the async path: the output is read back like
+// predict_launch's.)  The prediction is only a prefetch hint: it never changes a token.
+static ggml_cgraph * build_finish_predict(Ds4Dense::Impl & im, int64_t n, int il, Ds4Dense::Impl::Layer & L) {
+    ggml_cgraph * gf = ggml_new_graph_custom(im.gctx, 1024, false);
+    const int64_t D = im.D, HC = im.HC;
+    ggml_tensor * st = finish_ops(im, gf, n, L, false);
+    ggml_tensor * xin = ggml_view_3d(im.gctx, st, D, HC, 1, st->nb[1], st->nb[2], 0);
+    ggml_tensor * out = predict_ops(im, il + 1, xin);
+    ggml_build_forward_expand(gf, out);
+    L.gf_finpred[n] = gf;
+    L.finpred_out[n] = out;
     return gf;
 }
 
@@ -1986,7 +2020,8 @@ bool Ds4Dense::Impl::ensure_n(int64_t n) {
         allo_mtp_head[n] = make_allo();
         if (!allo_mtp_in[n] || !allo_mtp_head[n]) { err = "ggml_gallocr_new failed"; return false; }
     }
-    for (Layer & L : ly) {
+    for (size_t il = 0; il < ly.size(); ++il) {
+        Layer & L = ly[il];
         if (L.gf_finish[n]) continue;
         build_finish(*this, n, L);
         L.allo_finish[n] = make_allo();
@@ -1995,6 +2030,11 @@ bool Ds4Dense::Impl::ensure_n(int64_t n) {
             build_finish(*this, n, L, true);
             L.allo_finish_f[n] = make_allo();
             if (!L.allo_finish_f[n]) { err = "ggml_gallocr_new failed"; return false; }
+        }
+        if (!pf && fuse_predict_on(*this) && (int64_t) il + 1 < n_trunk) {   // mab776 M14: finish + the next predict
+            build_finish_predict(*this, n, (int) il, L);
+            L.allo_finpred[n] = make_allo();
+            if (!L.allo_finpred[n]) { err = "ggml_gallocr_new failed"; return false; }
         }
     }
     return true;
@@ -2111,6 +2151,15 @@ static bool fused_idx_on(bool cpu) {
 static bool lean_on(const Ds4Dense::Impl & im) {
     static const bool on = [] { const char * e = std::getenv("DS4_LEAN"); return !e || std::atoi(e) != 0; }();
     return on && !ggml_backend_is_cpu(im.backend);
+}
+
+// mab776 M14, DS4_FUSE_PREDICT=1 (opt-in; finish_layer_n's predict_next): the finish graph also computes the next
+// layer's prefetch hint (build_finish_predict).  GPU decode with the async hand-offs only.  Measured 8k ABBA: K=1 pass
+// 22.40 -> 22.40 ms, K=2 24.73 -> 24.82 - neutral (the launch it saves was already off the card's critical path, as
+// upstream found for its host-side launch cuts), so off by default: separate graphs as before
+static bool fuse_predict_on(const Ds4Dense::Impl & im) {
+    static const bool on = [] { const char * e = std::getenv("DS4_FUSE_PREDICT"); return e && std::atoi(e) != 0; }();
+    return on && !ggml_backend_is_cpu(im.backend) && async_on();
 }
 
 static bool ovl_gather_on() {
@@ -2247,6 +2296,8 @@ bool Ds4Dense::predict_launch(int il) {
     im.pred_il = il;
     return true;
 }
+
+bool Ds4Dense::predict_queued(int il) const { return il >= 0 && p_->pred_il == il; }
 
 bool Ds4Dense::predict_collect(int il, int * top_ids, int n_top) {
     Impl & im = *p_;
@@ -2450,6 +2501,9 @@ bool Ds4Dense::reserve_graphs(int n_max) {
             if (L.gf_finish_f[n] && !ggml_gallocr_reserve(L.allo_finish_f[n], L.gf_finish_f[n])) {
                 im.err = "reserve: finish (folded)"; return false;
             }
+            if (L.gf_finpred[n] && !ggml_gallocr_reserve(L.allo_finpred[n], L.gf_finpred[n])) {
+                im.err = "reserve: finish + predict"; return false;
+            }
         }
         if (L.gf_predict && !ggml_gallocr_reserve(L.allo_predict, L.gf_predict)) { im.err = "reserve: predict"; return false; }
     }
@@ -2512,7 +2566,8 @@ void Ds4Dense::set_route_bias(int il, const float * bias) {
 
 bool Ds4Dense::finish_layer(int il, const float * routed_sum) { return finish_layer_n(il, 1, routed_sum); }
 
-bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event, bool sh_folded) {
+bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait_sum_event, bool sh_folded,
+                              bool predict_next) {
     Impl & im = *p_;
     // mab776 M11b: the tier's mix into routed_sum ran on its own stream and recorded ev_sum - the finish waits there.
     // Queued first, so even if a step below fails, the next dense sync (reset, alloc) also drains the tier's work.
@@ -2521,8 +2576,11 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait
     if (!im.ensure_n(n)) return false;
     Impl::Layer & L = im.ly[(size_t) il];
     sh_folded = sh_folded && !routed_sum && L.gf_finish_f[n];
-    ggml_cgraph * const gfin = sh_folded ? L.gf_finish_f[n] : L.gf_finish[n];
-    if (!alloc_graph(sh_folded ? L.allo_finish_f[n] : L.allo_finish[n], gfin, im.backend)) {
+    // mab776 M14 (DS4_FUSE_PREDICT): the variant that also predicts layer il + 1 (its readback queued like predict_launch)
+    const bool fused = predict_next && !sh_folded && L.gf_finpred[n] && L.finpred_out[n] &&
+                       ggml_nbytes(L.finpred_out[n]) <= Impl::kPredHost && im.ovl_setup();
+    ggml_cgraph * const gfin = fused ? L.gf_finpred[n] : sh_folded ? L.gf_finish_f[n] : L.gf_finish[n];
+    if (!alloc_graph(fused ? L.allo_finpred[n] : sh_folded ? L.allo_finish_f[n] : L.allo_finish[n], gfin, im.backend)) {
         im.err = "gallocr(finish) failed";
         return false;
     }
@@ -2543,6 +2601,11 @@ bool Ds4Dense::finish_layer_n(int il, int n, const float * routed_sum, bool wait
     if (!compute_dec(im.backend, gfin)) {
         im.err = "finish graph compute failed";
         return false;
+    }
+    if (fused) {
+        ggml_backend_tensor_get_async(im.backend, L.finpred_out[n], im.pred_host, 0, ggml_nbytes(L.finpred_out[n]));
+        ggml_backend_event_record(im.ev_pred, im.backend);
+        im.pred_il = il + 1;
     }
     // the async window stays INSIDE a pass: its last trunk layer and the MTP block wait, so whatever follows a pass
     // (plain copies of the state - prefill_state_to_decode writes x_state, which the MTP block's finish writes too -
