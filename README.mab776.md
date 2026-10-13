@@ -4,7 +4,11 @@ Fork of https://github.com/Indras-Mirror/Strata-DS4 (one developer, no releases,
 https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster than our llama.cpp stack (stack 73
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
-## STATUS 2026-10-12 - Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+## STATUS 2026-10-13 - Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+- **M14 (10-12 night, session notes at the end)**: upstream Strata-DSV4.1 (the DS4 author's renamed repo, remote `dsv41`)
+  reviewed; ported: the stale-graph unbind fix (verbatim), the warp top-k router (ggml patch, GGML_CUDA_RANK_ARGSORT=0 =
+  old sort, K=2 pass -0.9 % @8k), fused finish+predict (DS4_FUSE_PREDICT=1, opt-in: neutral); deploy config `--pf-b 0`
+  (prefetch hints off: K=2 pass -2.1 % @8k / -2.9 % @127k on this box; rollback 0.7).  Not merged (22 files conflict).
 - **M13 (10-12 afternoon, session notes at the end)**: upstream 0.1.42 / 0.1.43 / 0.1.43.1 ideas ported (no merge);
   deployed in run/ (88bca4ea, run.prev = M12 eb162164): verify pass K=2 -4.3 / -3.6 / -5.8 % at 8k / 127k / 250k (24.9
   / 25.9 / 26.7 ms), K=1 -5.6 / -3.4 / -5.1 %, prefill unchanged; the NaN guard; serve fixes #984 #1624 #1869/#1870
@@ -699,3 +703,60 @@ gate.log / gate2.log).
   chats back after 0.6-1.4 s (reused 92,787 / 19,272 / 93,008 / 9,772).
 - Lessons: two GPU windows must never overlap (the probe's final restore raced the next window's first arm; harmless
   only because the arm's config write came second - verify the engine's /proc environ, as lib.sh's envline does).
+
+## Session 2026-10-12 night - M14: upstream Strata-DSV4.1 review (Marc via the portainer-91 session)
+Upstream renamed Strata-DS4 -> **Strata-DSV4.1** (remote `dsv41`, fetch only; 1,700 commits past our merge base
+924516a0 incl. their merge of upstream Strata past v0.1.41).  Almost all of it is the new **V4.1 engine**
+(`tools/v41/engine/ds41_*`, a fork of our ds4_dense / ds4_moe for DeepSeek-V4.1-Flash: 40 layers x 384 experts,
+Engram, per-expert ternary/Q2_0/Q3_K tiers) - `tools/ds4` itself only got REAP pruning, the stale-graph fix and fork
+isolation (fork code moved into fork/*.cuh + tools/ds4/cmake/fork.cmake).  Their own docs/ds4/V41_START_HERE.md is the
+map; V41_DECODE_OVERLAP_PLAN.md has the attribution.  Same rules as M13: env switch per change, basic tests only.
+
+| idea (upstream commit) | applies to us? | measured / expected | ported? |
+|---|---|---|---|
+| tier graph capture, STRATA_TIER_GRAPH (66773c2a) | no: built for V4.1's 9 per-expert format classes (3 kernels each); our layer has one class per site and DS4_DEV_ROUTE already queues the hits from the card | upstream: neutral (239 -> 52 launches/token, device busy under them) | no |
+| demand copies on a copy stream, STRATA_DMA_OVERLAP (8ad94b23) | barely: our PCIe share is ~1.5 % of a pass | upstream: neutral | no |
+| --pf-b sweep, "the prefetch earns its traffic" (5e5f4c16) | yes, but the verdict flips here: their 4090 misses to NVMe, our two cards hold nearly every hot expert | our sweep (6 arms, mirrored): K=2 pass @8k 0 / 0.7 / 1.43 = **23.38** / 23.88 / 24.00 ms, @127k **24.30** / 25.02 / 25.27; K=1 21.20 / 21.45 / 21.55, 22.00 / 22.55 / 22.40; prefill same | config `--pf-b 0` |
+| warp top-k / rank argsort, rank-argsort.patch (75009c03) | yes: router top-6 of 256 per layer was a bitonic sort | 8k ABBA: K=2 24.65 -> 24.43 ms (-0.9 %), K=1 22.05 -> 22.10; KL in noise | yes, default on (GGML_CUDA_RANK_ARGSORT=0 = old) |
+| fused finish + predict (3d4328cd) | yes, adapted to our async path (the readback rides like predict_launch's) | 8k ABBA: K=1 22.40 -> 22.40, K=2 24.73 -> 24.82: neutral | yes, opt-in DS4_FUSE_PREDICT=1 |
+| stale-graph unbind compares recorded buffer pointers (42c77429) | yes: alloc_graph asked a possibly-freed buffer its usage (use after free when the shared arena grows) | correctness | yes, verbatim, no switch |
+| x-skip, S4 sync removal, one metadata copy, routed sum on the card, one-sync readbacks (75009c03, 66e63458, a966904c, 59920d80) | already ours (DS4_DEV_ROUTE skips the x upload, DS4_DEV_SUM / DS4_OVL / DS4_ASYNC) | - | n/a |
+| REAP soft prune + --arena-adapt (s37) | lossy (+0.3 % ppl, -72..115 % on uncalibrated languages if hard); our hit rate leaves little to gain | upstream: decode +10 % on their box | no (Marc decides lossy) |
+| mmq-deterministic.patch | did not restore prefill exactness upstream either | - | no |
+| DSpark harness fix (wo_a FP8 32x32 block scale dropped, 3813b587) | V4.1 only: 2.58 accepted drafts/pass on teacher states, not yet in their engine | - | noted |
+| vision encoder (tools/v41/vision, 3813b587) | V4.1 only, Python/CPU, slice 1 of 2 | - | noted |
+
+- **Gates**: CPU serve gate 47 / 47 (stale-graph fix in); teacher-forced KL at 127k vs an M14-off reference: M14 on
+  plain / K=1 / K=2 = 0.0025 / 0.0026 / 0.0024, restart noise 0.0023 / 0.0025 / 0.0026 (top-1 differs 7-9 vs 7-12 of
+  384).  Logs: bench/mab776-m2/work/m14/chain14.log (scripts lib14.sh, ab14.sh, pfb.sh, kl14.sh, summ14.py).
+- **Deploy**: run/ = this build (warp top-k on, fused predict off) + `--pf-b 0`; run.prev = M13 88bca4ea.  No smoke on
+  the final binary: the window ended with the mode page All off (00:11:06, Marc's request); it differs from the tested
+  binary only by DS4_FUSE_PREDICT's default (the =0 arms ran it).
+- **Why the prefetch now loses**: since M7a (GPU 1's static tier) + the elastic GPU 0 cache, almost every routed expert
+  is resident; a hint's DMA then competes with the tier for the copy engine and the predict graph is a launch a layer.
+  Upstream's verdict holds for a box that misses to NVMe (and will for us on V4.1 if it ever streams).  Unmeasured: long
+  agent sessions whose routing drifts - if those decode slower, `--pf-b 0.7` is the one-word rollback.
+
+### V4.1 note (Marc may try DeepSeek-V4.1-Flash after the 128 GB RAM upgrade)
+- **Their release** (HF IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored, from dealignai's abliterated FP8): V41-GSQ.gguf
+  = 16 parts, **163 GB (152 GiB)** - experts 42.8 % ternary PTQ1_0 / 39.2 % Q2_0 / 18 % Q3_K = 2.25 bpw, dense Q8_0 -
+  + V41-MTP-Vision.gguf 8.4 GB (DSpark drafts + vision) + tokenizer/rank.bin.  **Engram is NOT in it**: shards 47/48 of
+  the FP8 checkpoint (~203 GB) must be downloaded separately and live on NVMe (read per token at layers 1 and 14).  Not a
+  llama.cpp/ollama GGUF (per-expert quant types): their engine only.  Disk: ~375 GB (+163 GB while reassembling the
+  parts); the models drive has 657 GB free.
+- **Fit after the upgrade** (128 GB = ~119 GiB, minus ~8 GiB kept free and ~10 GiB for the box): ~100 GiB pinned arena +
+  GPU 0 ~30 GiB of experts beside dense + KV = ~130 of ~142 GiB experts resident (~90 %); with a GPU 1 tier (~13 GiB) ~97 %.
+  Upstream runs it on a 4090 + 90 GB with ~57 % resident at ~26 tok/s decode / ~250 tok/s prefill; ours would stream
+  little from NVMe, so decode should land well above that - a guess, not measured: ~35-45 tok/s plain decode.
+- **What merging toward V4.1 takes**: a trial merge of dsv41/main into mab776-main conflicts in **22 files (~70 hunks)**:
+  serve/ (frontend 15, server 31, tests ~8: their base is upstream Strata past v0.1.41, ours 0.1.40.x + cherry-picks),
+  README* (docs), engine 9 (CMakeLists 1, iq_kernels.{cu,hpp} 3, ds4_dense 1, ds4_moe 4, ds4_generate 1, a test 1).  Not
+  done: M13's rule was "no merge onto v0.1.41+", and the V4.1 engine is a separate tree (tools/v41) - our tools/ds4 work
+  (GPU 1 tier, MTP draft/verify, async/OVL, DEV_SUM/ROUTE, parking, M13 ops) does NOT carry into it by merging; each piece
+  would be ported into ds41_* by hand.  Their V4.1 engine today: ONE GPU, no draft/verify (DSpark offline only), served
+  by upstream Strata's server through serve_ds41.py (hard-codes ~/AI/Strata; V4.1 effort is numeric 1-100, DSML with a
+  leading space, joyai-llm pre-split).  Shortest path when the RAM lands: run their engine as-is on GPU 0 (a test stack),
+  measure, then decide whether to port the GPU 1 tier + MTP verify.  To stay mergeable meanwhile: our ggml changes stay
+  patch files (theirs: tools/v41/ggml/, ours: tools/ds4/patches/ - the argsort patch = theirs + a 3-line header), our engine
+  changes stay env-switched, and a future merge resolves serve/ by taking theirs + re-applying our serve commits.
+
