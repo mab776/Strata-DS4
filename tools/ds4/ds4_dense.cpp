@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <thread>
@@ -75,6 +76,10 @@ bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr)
     static const bool reuse = [] { const char * e = std::getenv("DS4_GRAPH_REUSE"); return !e || std::atoi(e) != 0; }();
     static std::map<const void *, uint64_t> epoch;                  // per allocator
     static std::map<const ggml_cgraph *, uint64_t> graph_epoch;     // the epoch each graph was allocated in
+    // compute buffers seen bound to a graph, recorded right after a successful allocation (when every buffer the graph
+    // points at is alive).  The stale path below only compares pointers against this set: a buffer the shared
+    // allocator outgrew is already freed, so asking it for its usage would read freed memory.
+    static std::set<const void *> compute_bufs;
     uint64_t & ep = epoch[a];
     auto it = graph_epoch.find(g);
     if (reuse && g->uid != 0 && it != graph_epoch.end() && it->second == ep) return true;
@@ -82,9 +87,7 @@ bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr)
         // allocated before the shared buffer moved: ggml-alloc never re-binds a tensor that has data, so unbind this
         // graph's compute-buffer tensors (and views of them) first.  Persistent state, inputs and weights live in
         // other buffers and keep theirs.
-        auto computed = [](const ggml_tensor * t) {
-            return t && t->buffer && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
-        };
+        auto computed = [](const ggml_tensor * t) { return t && t->buffer && compute_bufs.count(t->buffer); };
         auto unbind = [&](ggml_tensor * t) {
             if (computed(t) || (t->view_src && computed(t->view_src))) { t->data = nullptr; t->buffer = nullptr; }
         };
@@ -98,9 +101,24 @@ bool alloc_graph(ggml_gallocr_t a, ggml_cgraph * g, ggml_backend_t be = nullptr)
     }
     if (be && async_on()) ggml_backend_synchronize(be);
     if (f16_acc32_on()) f16_acc32(g);   // mab776 M12c: op params only, before the graph's first (re)capture
+    const bool fresh = it == graph_epoch.end() || it->second != ep;   // new bindings to record (not per token)
     const size_t before = ggml_gallocr_get_buffer_size(a, 0);
     if (!ggml_gallocr_alloc_graph(a, g)) return false;
-    if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++ep;   // the buffer moved
+    const bool moved = ggml_gallocr_get_buffer_size(a, 0) != before && before != 0;
+    if (moved) ++ep;   // the buffer moved
+    if (fresh || moved) {
+        auto note = [](const ggml_tensor * t) {
+            if (!t || !t->buffer) return;
+            if (ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) compute_bufs.insert(t->buffer);
+            else compute_bufs.erase(t->buffer);   // a persistent buffer that reuses a freed compute buffer's address
+        };
+        for (int i = 0; i < ggml_graph_n_nodes(g); ++i) {
+            const ggml_tensor * t = ggml_graph_node(g, i);
+            note(t);
+            for (int j = 0; j < GGML_MAX_SRC; ++j) note(t->src[j]);
+        }
+        for (int i = 0; i < g->n_leafs; ++i) note(g->leafs[i]);
+    }
     graph_epoch[g] = ep;
     if (reuse) g->uid = ggml_graph_next_uid();
     return true;
