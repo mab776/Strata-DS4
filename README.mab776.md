@@ -721,7 +721,7 @@ map; V41_DECODE_OVERLAP_PLAN.md has the attribution.  Same rules as M13: env swi
 | fused finish + predict (3d4328cd) | yes, adapted to our async path (the readback rides like predict_launch's) | 8k ABBA: K=1 22.40 -> 22.40, K=2 24.73 -> 24.82: neutral | yes, opt-in DS4_FUSE_PREDICT=1 |
 | stale-graph unbind compares recorded buffer pointers (42c77429) | yes: alloc_graph asked a possibly-freed buffer its usage (use after free when the shared arena grows) | correctness | yes, verbatim, no switch |
 | x-skip, S4 sync removal, one metadata copy, routed sum on the card, one-sync readbacks (75009c03, 66e63458, a966904c, 59920d80) | already ours (DS4_DEV_ROUTE skips the x upload, DS4_DEV_SUM / DS4_OVL / DS4_ASYNC) | - | n/a |
-| REAP soft prune + --arena-adapt (s37) | lossy (+0.3 % ppl, -72..115 % on uncalibrated languages if hard); our hit rate leaves little to gain | upstream: decode +10 % on their box | no (Marc decides lossy) |
+| REAP soft prune + --arena-adapt (s37) | lossy (+0.3 % ppl, -72..115 % on uncalibrated languages if hard); our hit rate leaves little to gain | upstream: decode +10 % on their box | **no - REJECTED by Marc 2026-10-13: lossy, do not port or trial; don't re-pitch** |
 | mmq-deterministic.patch | did not restore prefill exactness upstream either | - | no |
 | DSpark harness fix (wo_a FP8 32x32 block scale dropped, 3813b587) | V4.1 only: 2.58 accepted drafts/pass on teacher states, not yet in their engine | - | noted |
 | vision encoder (tools/v41/vision, 3813b587) | V4.1 only, Python/CPU, slice 1 of 2 | - | noted |
