@@ -49,6 +49,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace strata;
@@ -227,6 +228,53 @@ bool spec_accept(const std::vector<std::pair<int, double>> & dist, int d, std::m
     out = last >= 0 ? last : d;   // rounding: the last candidate (d only if it was the sole candidate - then pd was 1)
     return false;
 }
+
+// mab776 (the V4 fork's M11, tools/ds4/ds4_serve.cpp Lookup, ported as is): prompt-lookup drafts.  The context (the
+// prompt + every emitted token) indexed by its G-grams; propose() finds the latest EARLIER occurrence of the context's
+// last G tokens and returns the (up to L) tokens that followed it.  It must match at least G + 1 tokens back (a bare
+// G-gram is too often a coincidence in fresh code), and a match of M tokens drafts M - G + 1 (a file being copied: L).
+struct Lookup {
+    int G = 0;
+    std::vector<int> seq;
+    std::unordered_map<uint64_t, int> last;   // G-gram ending at e (with seq[e + 1] known) -> the latest such e
+
+    uint64_t key(int e) const {
+        uint64_t h = 0x84222325cbf29ce4ull;
+        for (int i = e - G + 1; i <= e; ++i) h = (h ^ (uint64_t) (uint32_t) seq[(size_t) i]) * 0x100000001b3ull;
+        return h;
+    }
+    void reset(int g, const std::vector<int> & ids) {
+        G = g;
+        seq.clear();
+        last.clear();
+        if (G <= 0) return;
+        seq.reserve(ids.size() + 8192);
+        last.reserve(ids.size());
+        for (int t : ids) push(t);
+    }
+    void push(int t) {   // the G-gram that ended just before t now has a continuation
+        if (G <= 0) return;
+        seq.push_back(t);
+        const int e = (int) seq.size() - 2;
+        if (e >= G - 1) last[key(e)] = e;
+    }
+    int propose(int L, int * out) const {
+        const int n = (int) seq.size();
+        if (G <= 0 || L <= 0 || n < G) return 0;
+        const auto it = last.find(key(n - 1));
+        if (it == last.end()) return 0;
+        const int e = it->second;
+        for (int i = 0; i < G; ++i)
+            if (seq[(size_t) (e - i)] != seq[(size_t) (n - 1 - i)]) return 0;
+        int M = G;
+        while (M < 64 && e - M >= 0 && seq[(size_t) (e - M)] == seq[(size_t) (n - 1 - M)]) ++M;
+        if (M < G + 1) return 0;
+        const int want = std::min(L, M - G + 1);
+        int m = 0;
+        while (m < want && e + 1 + m < n) { out[m] = seq[(size_t) (e + 1 + m)]; ++m; }
+        return m;
+    }
+};
 
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
@@ -1329,14 +1377,30 @@ int main(int argc, char ** argv) {
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
+            // mab776 STRATA_LOOKUP=L (0 = off, <= 7; the V4 fork's --lookup): prompt-lookup drafts for sampled requests,
+            // STRATA_LOOKUP_GREEDY=L for temperature 0 (default 0, as --lookup-greedy), STRATA_LOOKUP_NGRAM=G (3),
+            // STRATA_LOOKUP_AGREE (1: a copy goes ahead only when it starts with DSpark's first draft).  A copied block is
+            // verified in the pass instead of DSpark's chain; spec_accept treats every draft as a deterministic proposal,
+            // so the output distribution is unchanged (greedy: the same tokens).  A lookup pass with less than half right
+            // sits the lookup out 1, 2, 4 .. 64 passes.
+            static const int lk_env = std::getenv("STRATA_LOOKUP") ? std::max(0, std::min(7, std::atoi(std::getenv("STRATA_LOOKUP")))) : 0;
+            static const int lk_env_g = std::getenv("STRATA_LOOKUP_GREEDY") ? std::max(0, std::min(7, std::atoi(std::getenv("STRATA_LOOKUP_GREEDY")))) : 0;
+            static const int lk_ngram = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM")))) : 3;
+            static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
+            const int LK = temp > 0 ? lk_env : lk_env_g;
+            long lk_passes = 0, lk_drafts = 0, lk_acc = 0;
             if (sp_t >= 0) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
                 std::vector<int> vt;
                 std::vector<std::pair<int, double>> dist;
+                Lookup lkp;
+                int lk_skip = 0, lk_fail = 0;
+                if (LK > 0) lkp.reset(lk_ngram, ids);
                 auto emit = [&](int tok) -> bool {   // false = stop here
                     std::printf("T %d\n", tok);
                     std::fflush(stdout);
+                    if (LK > 0) lkp.push(tok);
                     ++gen;
                     if (is_stop(tok)) { finish = "stop"; return false; }
                     if (max_new > 0 && gen >= max_new) return false;
@@ -1356,31 +1420,52 @@ int main(int argc, char ** argv) {
                         while (kk < k && 1.0f / (1.0f + std::exp(-sp_conf[kk])) >= conf_tau_s) ++kk;
                         k = kk;
                     }
+                    // mab776 STRATA_LOOKUP: the context's last G tokens occurred before -> this pass verifies the (2..LK) tokens
+                    // that followed them instead of DSpark's k drafts
+                    int lk_n = 0, lk_ids[8];
+                    if (LK > 0) {
+                        if (lk_skip > 0) --lk_skip;
+                        else {
+                            int Lc = LK;
+                            if (max_new > 0) Lc = std::min(Lc, max_new - gen);
+                            Lc = std::min(Lc, ctxv - (P + 3));
+                            if (Lc >= 2 && (lk_n = lkp.propose(Lc, lk_ids)) < 2) lk_n = 0;   // one copied token: not worth it
+                            if (lk_n > 0 && lk_agree && lk_ids[0] != sp_ids[0]) lk_n = 0;
+                        }
+                    }
+                    const bool lk_pass = lk_n > 0;
+                    const int nd = lk_pass ? lk_n : k;
+                    int dr[8];
+                    for (int i = 0; i < nd; ++i) dr[i] = lk_pass ? lk_ids[i] : sp_ids[i];
                     const bool refeed = dirty && ((P + 1) & 1);
                     vt.clear();
                     if (refeed) vt.push_back(prev);
                     vt.push_back(t);
-                    for (int i = 0; i < k; ++i) vt.push_back(sp_ids[i]);
+                    for (int i = 0; i < nd; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
                     int acc = 0, tn = -1;
-                    for (; acc < k; ++acc) {
+                    for (; acc < nd; ++acc) {
                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
-                        if (!spec_accept(dist, sp_ids[acc], rng, tn)) break;
+                        if (!spec_accept(dist, dr[acc], rng, tn)) break;
                     }
-                    if (acc == k) tn = sample_p(vlog.data() + (size_t) (r0 + k) * nv, nv, temp, tk, top_p, min_p, rng);
+                    if (acc == nd) tn = sample_p(vlog.data() + (size_t) (r0 + nd) * nv, nv, temp, tk, top_p, min_p, rng);
                     ++rq_pass; rq_acc += acc;
-                    int spos[6];
+                    if (lk_pass) {
+                        ++lk_passes; lk_drafts += nd; lk_acc += acc;
+                        if (2 * acc < nd) lk_skip = 1 << std::min(lk_fail++, 6);
+                        else lk_fail = 0;
+                    }
+                    int spos[9];
                     for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
-                    const int drafts[5] = { sp_ids[0], sp_ids[1], sp_ids[2], sp_ids[3], sp_ids[4] };
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
                     hist.push_back(t);
                     bool more = true;
-                    for (int i = 0; i < acc && more; ++i) { hist.push_back(drafts[i]); more = emit(drafts[i]); }
-                    prev = acc == 0 ? t : drafts[acc - 1];
-                    dirty = acc < k;
+                    for (int i = 0; i < acc && more; ++i) { hist.push_back(dr[i]); more = emit(dr[i]); }
+                    prev = acc == 0 ? t : dr[acc - 1];
+                    dirty = acc < nd;
                     P += 1 + acc;
                     t = tn;
                     if (!more) break;
@@ -1417,6 +1502,9 @@ int main(int argc, char ** argv) {
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
                              1.0 + (double) rq_acc / rq_pass, 1.0 + (double) sv_acc / std::max(1L, sv_pass));
+            if (lk_passes > 0)   // mab776 STRATA_LOOKUP
+                std::fprintf(stderr, "serve: lookup %ld of the passes, %ld drafted, %ld accepted (%.0f %%)\n", lk_passes,
+                             lk_drafts, lk_acc, 100.0 * (double) lk_acc / std::max(1L, lk_drafts));
 #endif
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
