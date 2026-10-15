@@ -490,6 +490,16 @@ public:
     /// expert until the next seed_from_ranked, which reopens the cache (sized by set_slot_gib) and refills it; the
     /// arena is kept (an LRU-demoted expert stays in the arena slot it took).  No-op without a cache.
     void release_cache();
+    /// mab776 STRATA_KEEP_CACHE=<max new tokens> (opt-in, --serve): the VRAM cache stays open through a short prompt batch.
+    /// With the env set the cache is opened segmented (CUDA VMM, STRATA_KEEP_CACHE_SEG_MIB, default 256); shrink_cache
+    /// gives `free_gib` of its tail back for the batch buffers (those slots' experts become arena / file-tier experts),
+    /// regrow_cache maps the tail again and refills the same experts into the same slots, so decode sees the cache it had.
+    /// set_keep_batch(true) while such a batch runs: run_chunk then copies the resident experts it routes device to
+    /// device into its MMQ-strided stage halves instead of launching them in place (a slot is not at the MMQ stride).
+    static bool keep_cache_on();
+    bool shrink_cache(double free_gib, std::string& err);
+    bool regrow_cache(std::string& err);
+    void set_keep_batch(bool on);
     /// REAP accumulators (Ds41MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
     const std::vector<double>& saliency_sum() const;
     const std::vector<int64_t>& saliency_count() const;

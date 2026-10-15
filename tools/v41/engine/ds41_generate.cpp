@@ -1144,9 +1144,26 @@ int main(int argc, char ** argv) {
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
+            // mab776 STRATA_KEEP_CACHE=<max new tokens> (opt-in): a batch of at most that many tokens keeps the decode cache
+            // - shrunk by STRATA_KEEP_CACHE_FREE_GIB (default 10) for the batch's buffers, regrown + refilled with the same
+            // experts right after (no 0.75 s re-seed, and the batch copies its resident experts on the card instead of
+            // streaming them over PCIe).  Larger batches release the cache as before.
+            static const int keep_max = std::getenv("STRATA_KEEP_CACHE") ? std::atoi(std::getenv("STRATA_KEEP_CACHE")) : 0;
+            static const double keep_free = std::getenv("STRATA_KEEP_CACHE_FREE_GIB") ? std::atof(std::getenv("STRATA_KEEP_CACHE_FREE_GIB")) : 10.0;
+            bool kept = false;
+            double ph_shrink = 0;
             if (!by_step && defer_vram && cache_open && dh >= 2) {
-                tier.release_cache();
-                cache_open = false;
+                std::string kerr;
+                const double tk0 = now_ms();
+                if (keep_max > 0 && dh <= keep_max && Ds41MoeTier::keep_cache_on() && tier.shrink_cache(keep_free, kerr)) {
+                    kept = true;
+                    tier.set_keep_batch(true);
+                } else {
+                    if (keep_max > 0 && dh <= keep_max) std::fprintf(stderr, "keep-cache: shrink refused (%s) - released\n", kerr.c_str());
+                    tier.release_cache();
+                    cache_open = false;
+                }
+                ph_shrink = now_ms() - tk0;
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
@@ -1182,6 +1199,22 @@ int main(int argc, char ** argv) {
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
+            double ph_regrow = 0;
+            if (kept) {   // mab776 STRATA_KEEP_CACHE: the batch buffers went back (feed's release_chunk); refill the tail
+                const double tr0 = now_ms();
+                tier.set_keep_batch(false);
+                dense.release_pass();   // the pass allocator grew for the batch graphs: its VRAM is the tail's
+                std::string kerr;
+                if (!tier.regrow_cache(kerr)) {
+                    std::fprintf(stderr, "keep-cache: regrow failed (%s) - the cache reopens\n", kerr.c_str());
+                    tier.release_cache();
+                    cache_open = false;
+                } else {
+                    bias_now = true;   // decode biases back on (open_cache does this on the release path)
+                    apply_bias();
+                }
+                ph_regrow = now_ms() - tr0;
+            }
             int sp_t = -1;   // DSpark: the first decode token (sampled from the last prompt row), its drafts in sp_ids
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
@@ -1231,9 +1264,10 @@ int main(int argc, char ** argv) {
             }
 #endif
             std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
-                         "(cache open %.2f s, seed %.2f s)\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
+                         "(cache open %.2f s, seed %.2f s)%s\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
                          (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
-                         bcap > 0 ? bcap_got : sp_tail, bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0);
+                         bcap > 0 ? bcap_got : sp_tail, bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0,
+                         kept ? (" [cache kept: shrink " + std::to_string((int) ph_shrink) + " ms, regrow " + std::to_string((int) ph_regrow) + " ms]").c_str() : "");
             if (Ds41Dense::prof_on()) {   // mab776 STRATA_DENSE_PROF: the dense half's host split for this request
                 Ds41Dense::Prof & dp = Ds41Dense::prof();
                 std::fprintf(stderr, "dense prof: begin %.0f, upload %.0f, engram wait %.0f, build %.0f, compute %.0f (%ld spans; alloc %.0f "

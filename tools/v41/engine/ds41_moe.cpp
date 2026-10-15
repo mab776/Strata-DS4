@@ -568,6 +568,11 @@ struct Ds41MoeImpl {
     /// first.  A seed consumes it: those experts fill the first STRATA_WARM_SHARE (default 500) per mille of the
     /// slots, the global rank the rest.  Empty = off.
     std::vector<std::pair<int32_t, int32_t>> warm;
+    /// mab776 STRATA_KEEP_CACHE: the slots shrink_cache emptied (slot order) - regrow_cache refills them; keep_batch:
+    /// a batch runs with the cache open (run_chunk copies resident experts into its stage halves)
+    struct KeptSlot { int32_t slot, layer, expert; };
+    std::vector<KeptSlot> kept_tail;
+    bool keep_batch = false;
 #if defined(DS4_MOE_CUDA)
     std::unique_ptr<ChunkStage> cstage;   ///< chunk_prefetch: the two pinned slabs
 #endif
@@ -1644,6 +1649,18 @@ bool Ds41MoeTier::build_arena_ranked(const std::vector<std::pair<int32_t, int32_
 
 void Ds41MoeTier::set_slot_gib(double gib) { im_->cfg.slot_gib = gib; }
 
+bool Ds41MoeTier::keep_cache_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_KEEP_CACHE"); return e && std::atoi(e) > 0; }();
+    return on;
+}
+
+namespace {
+int64_t keep_seg_bytes() {
+    const char* e = std::getenv("STRATA_KEEP_CACHE_SEG_MIB");
+    return (int64_t) (e ? std::max(2, std::atoi(e)) : 256) << 20;
+}
+}  // namespace
+
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
@@ -1675,6 +1692,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         }
         if (!sizes.empty()) {
             im_->gpu->cache.reset(new strata::core::ExpertCache());
+            if (keep_cache_on()) im_->gpu->cache->set_segment_bytes(keep_seg_bytes());   // mab776 STRATA_KEEP_CACHE
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
         }
     }
@@ -1683,6 +1701,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         im_->cfg.slots > 0) {
         std::vector<int64_t> sizes((size_t) im_->cfg.slots, im_->blob);
         im_->gpu->cache.reset(new strata::core::ExpertCache());
+        if (keep_cache_on()) im_->gpu->cache->set_segment_bytes(keep_seg_bytes());   // mab776 STRATA_KEEP_CACHE
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
@@ -3969,13 +3988,19 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     std::vector<int32_t> order[4];
     std::vector<int32_t> slot_e((size_t) NX, -1);
     const bool pc_on = gp.pc_buf != nullptr;
+    // mab776 STRATA_KEEP_CACHE (keep_batch): a resident expert is not launched in place (its slot is not at the MMQ
+    // stride -> the grouped kernel) but copied device to device into the stage halves with the streamed ones, at the
+    // front of order[1] (so its copies + launches start before the PCIe / disk ones)
+    std::vector<int32_t> kept_res;
     for (int64_t e = 0; e < NX; ++e) {
         if (!cnt[(size_t) e]) continue;
         const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
         slot_e[(size_t) e] = sl;
         if (pc_on && sl < 0 && gp.pc_fill[(size_t) (layer * NX + e)]) { order[3].push_back((int32_t) e); continue; }
+        if (im.keep_batch && sl >= 0) { kept_res.push_back((int32_t) e); continue; }
         order[sl >= 0 ? 0 : gp.arena.ptr(layer, e) ? 1 : 2].push_back((int32_t) e);
     }
+    if (!kept_res.empty()) order[1].insert(order[1].begin(), kept_res.begin(), kept_res.end());
     std::vector<int32_t> first((size_t) NX + 1, 0);
     {
         int32_t at = 0;
@@ -4367,7 +4392,11 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         std::vector<unsigned long long> ps;
         for (size_t i = b0; i < b1; ++i) {
             const uint8_t* src;
-            if (i < nA) {
+            cudaMemcpyKind kind = cudaMemcpyHostToDevice;
+            if (i < nA && im.keep_batch && slot_e[(size_t) stream_e[i]] >= 0) {   // mab776 keep_batch: a VRAM slot
+                src = gp.cache->device_slot(slot_e[(size_t) stream_e[i]]);
+                kind = cudaMemcpyDeviceToDevice;
+            } else if (i < nA) {
                 src = gp.arena.ptr(layer, stream_e[i]);   // (arena_e: not prestaged)
             } else if (pf_slab >= 0) {
                 const size_t k = i - nA;
@@ -4398,7 +4427,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 src = slot_ptr(k);
             }
             uint8_t* d = (uint8_t*) gp.c_stage[h] + (i - b0) * (size_t) SL;
-            ck(cudaMemcpyAsync(d, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s_cp), "stream dma");
+            ck(cudaMemcpyAsync(d, src, (size_t) BL, kind, gp.s_cp), "stream dma");
             es.push_back(stream_e[i]);
             ps.push_back((unsigned long long) d);
             if (pc_on && i >= nA) {   // a file-tier blob with a prompt-cache slot: keep a VRAM copy (after the launch)
@@ -4682,9 +4711,78 @@ void Ds41MoeTier::release_cache() {
         for (const auto& p : ord) im_->warm.emplace_back((int32_t) (p.second / NX), (int32_t) (p.second % NX));
     }
     im_->gpu->cache.reset();
+    im_->kept_tail.clear();   // mab776 STRATA_KEEP_CACHE: nothing to refill into a closed cache
     im_->admitted = 0;
     im_->pf_n = 0;             // staged prefetches are keyed by expert, not slot - but they belong to the old decode
     im_->vlast.clear();        // the LRU order restarts from the next seed (lru_seed_order)
+#endif
+}
+
+void Ds41MoeTier::set_keep_batch(bool on) { im_->keep_batch = on; }
+
+bool Ds41MoeTier::shrink_cache(double free_gib, std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache) { err = "keep-cache: no VRAM cache"; return false; }
+    strata::core::ExpertCache& c = *im_->gpu->cache;
+    if (!c.segmented()) { err = "keep-cache: the cache is not segmented"; return false; }
+    if (!im_->kept_tail.empty()) { err = "keep-cache: the cache is already shrunk"; return false; }
+    const int64_t mapped = c.mapped_bytes();
+    const int64_t keep = std::max<int64_t>(0, mapped - (int64_t) (free_gib * 1073741824.0));
+    const int64_t K = c.slots_within(keep);   // slots [0, K) stay
+    cudaDeviceSynchronize();                  // no decode kernel or copy may still use a slot
+    const int64_t NX = im_->g.n_experts;
+    for (int64_t l = 0; l < im_->g.n_layers; ++l)
+        for (int64_t e = 0; e < NX; ++e) {
+            const int32_t sl = c.slot_of(l, e);
+            if (sl >= 0 && sl >= K) im_->kept_tail.push_back({sl, (int32_t) l, (int32_t) e});
+        }
+    std::sort(im_->kept_tail.begin(), im_->kept_tail.end(),
+              [](const Ds41MoeImpl::KeptSlot& x, const Ds41MoeImpl::KeptSlot& y) { return x.slot < y.slot; });
+    c.evict_from(K);
+    im_->admitted = c.resident();
+    im_->pf_n = 0;   // staged prefetches belong to the decode before the batch
+    if (!c.shrink(c.bytes_of(K), err)) return false;
+    return true;
+#else
+    (void) free_gib;
+    err = "keep-cache needs the CUDA tier";
+    return false;
+#endif
+}
+
+bool Ds41MoeTier::regrow_cache(std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache) { err = "keep-cache: no VRAM cache"; return false; }
+    strata::core::ExpertCache& c = *im_->gpu->cache;
+    std::string gerr;
+    const bool full = c.grow(c.full_bytes(), gerr);   // as far as the driver has VRAM (false = stopped short)
+    const int64_t live = c.slots();
+    int64_t refilled = 0, lost = 0;
+    std::vector<uint8_t> buf;
+    for (const auto& t : im_->kept_tail) {
+        if (t.slot >= live) { ++lost; continue; }   // its segment could not be mapped again: a miss from now on
+        const int32_t s2 = c.admit(t.layer, t.expert);
+        if (s2 != t.slot) { err = "keep-cache: refill slot mismatch"; im_->kept_tail.clear(); return false; }
+        const int64_t bytes = im_->bl[(size_t) im_->g.cls(t.layer, t.expert)];
+        if (const uint8_t* p = im_->gpu->arena.ptr(t.layer, t.expert)) {
+            if (!c.fill_slot_queued(s2, p, err, bytes)) { im_->kept_tail.clear(); return false; }
+        } else {   // not in the arena (a file-tier expert): read it, then copy (blocking)
+            buf.resize((size_t) im_->blob);
+            im_->blobs->read(t.layer, t.expert, buf.data());
+            if (!c.fill_slot_blocking(s2, buf.data(), err, bytes)) { im_->kept_tail.clear(); return false; }
+        }
+        ++refilled;
+    }
+    im_->kept_tail.clear();
+    if (!c.sync_queued(err)) return false;
+    im_->admitted = c.resident();
+    if (!full || lost)
+        std::fprintf(stderr, "keep-cache: regrow stopped short (%s) - %lld slots refilled, %lld left empty\n",
+                     gerr.c_str(), (long long) refilled, (long long) lost);
+    return true;
+#else
+    err = "keep-cache needs the CUDA tier";
+    return false;
 #endif
 }
 
