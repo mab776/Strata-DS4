@@ -749,7 +749,31 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
         const int nth = (int) std::min<int64_t>(n, (int64_t) chunk_pf_threads());
         const size_t sc = std::max<size_t>(im.blobs->read_staged_scratch(), 4096);
         std::vector<std::thread> rd;
-        for (int k = 0; k < nth; ++k)
+        // mab776 STRATA_CPF_PARTS=P (> 1): each blob read as P parts by different threads with read_part - the wave
+        // reader's pattern, and the path that also reads the second-drive mirror (STRATA_BLOB_MIRROR); read_staged
+        // (whole blobs, the main file only) otherwise
+        static const int cpf_parts = std::getenv("STRATA_CPF_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_CPF_PARTS")))) : 1;
+        if (cpf_parts > 1) {
+            const int64_t P = cpf_parts;
+            std::unique_ptr<std::atomic<int>[]> pdone(new std::atomic<int>[(size_t) n]);
+            for (int64_t i = 0; i < n; ++i) pdone[(size_t) i].store(0, std::memory_order_relaxed);
+            const int nthp = (int) std::min<int64_t>(n * P, (int64_t) chunk_pf_threads());
+            for (int k = 0; k < nthp; ++k)
+                rd.emplace_back([&] {
+                    for (int64_t x; (x = next.fetch_add(1)) < n * P;) {
+                        if (c.cancel[s].load(std::memory_order_relaxed)) break;
+                        const int64_t i = x / P;
+                        im.blobs->read_part(L, c.e[s][(size_t) i], (int) (x % P), (int) P, c.slab[s] + c.off[s][(size_t) i]);
+                        if (pdone[(size_t) i].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
+                            got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
+                            c.done[s].fetch_add(1, std::memory_order_release);
+                            c.rdy[s][(size_t) i].store(1, std::memory_order_release);
+                            c.rdy[s][(size_t) i].notify_all();
+                        }
+                    }
+                });
+        }
+        for (int k = 0; cpf_parts <= 1 && k < nth; ++k)
             rd.emplace_back([&, k] {
                 void* q = nullptr;
                 uint8_t* scratch = posix_memalign(&q, 4096, sc) == 0 ? (uint8_t*) q : nullptr;
