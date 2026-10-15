@@ -7,7 +7,7 @@
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
 //                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
-//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F]
+//                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F] [--peer-device N]
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
 // after layer 20's persistent-KV writes; only the last 2560 tokens run layers 21-39.  Same last-token logits / decode.
 //
@@ -89,6 +89,8 @@ struct Args {
     bool act_quant = true, chunk_prefetch = true, kv_fp4 = false;
     int  enc_skip = -1;           // -1 = default (on for one-shot layer-major runs), 1 = --enc-skip, 0 = --no-enc-skip; only run the tokens before the replay window through layers 21-39
     int  enc_replay = 2560;       // --enc-replay N: the replay window (window_size * (n_layer - cand_layer) = 128*20)
+    int  peer_device = -1;        // mab776 --peer-device N: GPU 1's static expert tier on CUDA device N (as STRATA_GPU1=N;
+                                  // Strata's server leaves out --layer-split for a config whose args name a peer device)
     float skip_miss = 0.0f, skip_file = 0.0f;
     double chunk_prefetch_gib = 0.0;
 };
@@ -126,6 +128,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
+        else if (k == "--peer-device") a.peer_device = std::atoi(next().c_str());   // mab776: GPU 1's static expert tier
         // prompt experts on MMQ (int8 tensor cores; PTQ1_0 through its lossless Q2_0 transcode) - DEFAULT since
         // 2026-10-12: 8K prompt 219-220 -> 244-248 tok/s, 4096 code ppl 2.3799 -> 2.3790, KL 7.6e-3, deterministic
         // (8K --dump-last md5 ee31507a0e88; the MMVQ path's was 4d229102872a).  --no-chunk-mmq = the MMVQ kernels.
@@ -643,6 +646,7 @@ int main(int argc, char ** argv) {
     mc.vram_lru = a.vram_lru;
     mc.arena_adapt = a.arena_adapt;
     mc.chunk_mmq = a.chunk_mmq;
+    mc.gpu1_device = a.peer_device;
     mc.chunk_prefetch = a.chunk_prefetch;
     mc.chunk_prefetch_gib = a.chunk_prefetch_gib;
     mc.skip_miss = a.skip_miss;
@@ -691,6 +695,9 @@ int main(int argc, char ** argv) {
         std::fprintf(stderr, "tier: %lld experts in VRAM, %lld in the RAM arena (%.1f GiB), %lld file tier; seeded in %.1f s\n",
                      (long long) tier.resident(), (long long) tier.arena_experts(), tier.arena_gib(), (long long) tier.file_tier(),
                      (now_ms() - t0) / 1000.0);
+        if (tier.gpu1_experts() > 0)   // mab776 STRATA_GPU1
+            std::fprintf(stderr, "tier: %lld experts on GPU 1's static tier (%.1f GiB)\n", (long long) tier.gpu1_experts(),
+                         tier.gpu1_gib());
     }
     // the selection-only bias per layer: the prune penalty / mask, + route_bias on the experts resident in VRAM now
     std::vector<char> proxy_res;   // --bias-prompt: the would-be VRAM set (first N ranked) until the real seed
@@ -719,7 +726,8 @@ int main(int argc, char ** argv) {
             for (int64_t e = 0; e < TG.n_experts; ++e)
                 rb[(size_t) e] = (!pruned.empty() && pruned[(size_t) (l * TG.n_experts + e)]) ? (a.prune_penalty > 0 ? -a.prune_penalty : -1e30f)
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
-                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                               : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) && !tier.in_arena(l, e) &&
+                                  !tier.in_gpu1(l, e)) ? -a.route_bias_file : 0.0f;   // (mab776: GPU 1 is not the file tier)
             dense.set_route_bias((int) l, rb.data());
         }
     };
@@ -1642,9 +1650,10 @@ int main(int argc, char ** argv) {
             }
             const Ds41MoeStats pst = tier.stats();
             std::fprintf(stderr, "serve: prompt %d tokens (%d reused, %s) in %.2f s = %.1f tok/s (experts %lld hit / %lld cpu / "
-                                 "%lld pcie / %lld file)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
+                                 "%lld pcie / %lld file%s)\n", total, reused, by_step ? (exact_pass ? "exact passes" : "passes") : "batch", prompt_ms / 1000.0,
                          1000.0 * (total - reused) / std::max(prompt_ms, 1e-9), (long long) pst.hits, (long long) pst.cpu,
-                         (long long) pst.pcie, (long long) pst.file_tier);
+                         (long long) pst.pcie, (long long) pst.file_tier,
+                         pst.gpu1 ? (" / " + std::to_string(pst.gpu1) + " gpu1").c_str() : "");   // mab776 STRATA_GPU1
             if (defer_vram && !cache_open) {   // decode next: the VRAM cache opens into what the prompt freed
                 if (!open_cache()) {
                     std::printf("ERR VRAM seed failed: %s\n", err.c_str());
@@ -1794,9 +1803,11 @@ int main(int argc, char ** argv) {
                 snap_len = -1;
                 finish = "length";
             }
-            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file\n",
+            std::fprintf(stderr, "serve: %d tokens in %.2f s = %.2f tok/s (%s); experts: %lld hit, %lld cpu, %lld pcie, %lld file%s\n",
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
-                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
+                         (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
+                         st.gpu1 ? (", " + std::to_string(st.gpu1) + " gpu1 (wait " + std::to_string((int) st.g1_wait_ms) +
+                                    " ms)").c_str() : "");   // mab776 STRATA_GPU1
 #if defined(DS41_HAVE_DSPARK)
             if (rq_pass > 0)
                 std::fprintf(stderr, "serve: DSpark %ld passes, %.2f tokens/pass (all requests %.2f)\n", rq_pass,
@@ -1806,7 +1817,7 @@ int main(int argc, char ** argv) {
                              lk_drafts, lk_acc, 100.0 * (double) lk_acc / std::max(1L, lk_drafts));
 #endif
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
-                        (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
+                        (long long) (st.hits + st.gpu1), (long long) st.lookups(), (long long) st.file_tier, total - reused);   // (GPU 1: hits)
             std::fflush(stdout);
         }
         // mab776 STRATA_PARK: the live conversation is parked too when the engine ends (the server sends QUIT on

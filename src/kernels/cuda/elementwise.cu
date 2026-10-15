@@ -271,6 +271,23 @@ void scatter_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t
     }
     scatter_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
 }
+namespace {
+__global__ void gather_rows_kernel(const float4* __restrict__ src, float4* dst, const int32_t* __restrict__ rows,
+                                   int64_t w4) {
+    const int64_t r = blockIdx.x;
+    const float4* s = src + (int64_t) rows[r] * w4;
+    float4* d = dst + r * w4;
+    for (int64_t i = threadIdx.x; i < w4; i += blockDim.x) d[i] = s[i];
+}
+}  // namespace
+void gather_rows_f32(const float* src, float* dst, const int32_t* rows, int64_t n, int64_t width, void* stream) {
+    if (n <= 0) return;
+    if ((width & 3) != 0 || ((uintptr_t) dst & 15) != 0 || ((uintptr_t) src & 15) != 0) {
+        std::fprintf(stderr, "gather_rows_f32: width must be a multiple of 4 and both pointers 16-byte aligned\n");
+        std::exit(1);
+    }
+    gather_rows_kernel<<<(unsigned) n, 128, 0, (cudaStream_t) stream>>>((const float4*) src, (float4*) dst, rows, width / 4);
+}
 void copy_rows_from_mapped(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
                            const int32_t* count, void* stream) {
     if (rows <= 0) return;
