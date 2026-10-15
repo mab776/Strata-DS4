@@ -753,9 +753,11 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
         // reader's pattern, and the path that also reads the second-drive mirror (STRATA_BLOB_MIRROR); read_staged
         // (whole blobs, the main file only) otherwise
         static const int cpf_parts = std::getenv("STRATA_CPF_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_CPF_PARTS")))) : 1;
+        // the per-blob part counters live until the readers are joined below (declared in the if-block they were
+        // freed under the running threads: the 2026-10-15 03:00 crash)
+        std::unique_ptr<std::atomic<int>[]> pdone(cpf_parts > 1 ? new std::atomic<int>[(size_t) n] : nullptr);
         if (cpf_parts > 1) {
             const int64_t P = cpf_parts;
-            std::unique_ptr<std::atomic<int>[]> pdone(new std::atomic<int>[(size_t) n]);
             for (int64_t i = 0; i < n; ++i) pdone[(size_t) i].store(0, std::memory_order_relaxed);
             const int nthp = (int) std::min<int64_t>(n * P, (int64_t) chunk_pf_threads());
             for (int k = 0; k < nthp; ++k)
