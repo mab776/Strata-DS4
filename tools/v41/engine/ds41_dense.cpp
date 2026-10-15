@@ -1745,6 +1745,68 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
+// mab776 STRATA_PARK: layer order; per layer raw_snap, [st_kv_snap, st_sc_snap], [comp rows, idxk rows]. A ratio-r kv
+// source holds n / r closed rows for n positions (an open ratio-2 group lives in st_kv / st_sc; its spare row is
+// write-only scratch - attention reads closed rows only).
+size_t Ds41Dense::park_bytes(int n) const {
+    const Impl & im = *p_;
+    size_t b = 0;
+    for (const auto & L : im.ly) {
+        b += ggml_nbytes(L.raw_snap);
+        if (L.st_kv_snap) b += ggml_nbytes(L.st_kv_snap) + ggml_nbytes(L.st_sc_snap);
+        if (L.comp) {
+            const size_t rows = (size_t) (n / L.ratio);
+            b += rows * L.comp->nb[1] + rows * L.idxk->nb[1];
+        }
+    }
+    return b;
+}
+
+bool Ds41Dense::park_save(int n, std::vector<uint8_t> & out) {
+    Impl & im = *p_;
+    if (n < 1 || im.snap_pos != n) { im.err = "park: no snapshot at that position"; return false; }
+    ggml_backend_synchronize(im.backend);
+    out.resize(park_bytes(n));
+    size_t at = 0;
+    auto get = [&](const ggml_tensor * t, size_t bytes) { if (bytes) ggml_backend_tensor_get(t, out.data() + at, 0, bytes); at += bytes; };
+    for (auto & L : im.ly) {
+        get(L.raw_snap, ggml_nbytes(L.raw_snap));
+        if (L.st_kv_snap) { get(L.st_kv_snap, ggml_nbytes(L.st_kv_snap)); get(L.st_sc_snap, ggml_nbytes(L.st_sc_snap)); }
+        if (L.comp) {
+            const size_t rows = (size_t) (n / L.ratio);
+            get(L.comp, rows * L.comp->nb[1]);
+            get(L.idxk, rows * L.idxk->nb[1]);
+        }
+    }
+    return at == out.size();
+}
+
+bool Ds41Dense::park_load(int n, const uint8_t * in, size_t bytes) {
+    Impl & im = *p_;
+    if (n < 1 || n > im.cfg.ctx_max || bytes != park_bytes(n)) { im.err = "park: blob size mismatch"; return false; }
+    ggml_backend_synchronize(im.backend);
+    size_t at = 0;
+    auto set = [&](ggml_tensor * t, size_t b) { if (b) ggml_backend_tensor_set(t, in + at, 0, b); at += b; };
+    for (auto & L : im.ly) {
+        set(L.raw_snap, ggml_nbytes(L.raw_snap));
+        if (L.st_kv_snap) { set(L.st_kv_snap, ggml_nbytes(L.st_kv_snap)); set(L.st_sc_snap, ggml_nbytes(L.st_sc_snap)); }
+        if (L.comp) {
+            const size_t rows = (size_t) (n / L.ratio);
+            set(L.comp, rows * L.comp->nb[1]);
+            set(L.idxk, rows * L.idxk->nb[1]);
+        }
+    }
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = n;
+    return at == bytes;
+}
+
+void Ds41Dense::park_history(const int * ids, int n) {
+    Impl & im = *p_;
+    if (!im.engram.enabled()) return;
+    for (int p = 0; p < n; ++p) im.engram.set_token(p, ids[p]);
+}
+
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;
     const auto & L = im.ly[(size_t) il];

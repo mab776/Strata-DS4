@@ -161,6 +161,14 @@ public:
     bool snapshot(int pos);
     bool restore();
     int snapshot_pos() const;
+    /// mab776 STRATA_PARK (conversation parking): the state of a conversation at its snapshot point `n` as one blob -
+    /// the snapshot tensors (window rings, ratio-2 compressor state) + the closed compressed-KV and indexer-key rows of
+    /// positions [0, n) of every kv source (position-indexed: the next conversation overwrites them).  park_load writes
+    /// a blob back (snapshot tensors + rows; restore() then makes it live) and park_history the Engram's token history.
+    size_t park_bytes(int n) const;
+    bool park_save(int n, std::vector<uint8_t> & out);
+    bool park_load(int n, const uint8_t * in, size_t bytes);
+    void park_history(const int * ids, int n);
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

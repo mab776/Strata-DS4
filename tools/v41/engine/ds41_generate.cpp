@@ -52,6 +52,11 @@
 #include <unordered_map>
 #include <vector>
 
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <unistd.h>
+
 using namespace strata;
 using namespace strata::v41;
 
@@ -302,6 +307,204 @@ bool rows_nonfinite(const float * lg, int nv, int rows) {
         if ((u[i] & 0x7f800000u) == 0x7f800000u) return true;   // exponent all ones: an infinity or a NaN
     return false;
 }
+
+
+// mab776 STRATA_PARK=1 (opt-in): conversation parking.  A request that does not continue the live conversation first
+// parks it (the dense state at its snapshot point, Ds41Dense::park_save) and then takes a parked conversation it extends
+// (loaded as the snapshot: the usual reuse paths continue from it).  Every parked conversation is written to
+// STRATA_PARK_DIR (the disk tier, at most STRATA_PARK_DISK_GIB = 10) and kept in RAM while STRATA_PARK_RAM_GIB (4)
+// allows - least recently used goes first (RAM -> disk only -> deleted); untouched for STRATA_PARK_DAYS (14) = deleted.
+// Files carry a stamp (the engine binary + the model's head + ctx / kv format): another engine or model wipes them.
+// Conversations under STRATA_PARK_MIN (1024) tokens are not parked.  Restore checks the token prefix, so a lost or
+// evicted conversation just reads again.  <dir>/status.json: counts + bytes (the server's /health shows them).
+struct ParkStore {
+    struct Entry {
+        std::vector<int> ids;        // the prompt tokens up to the snapshot point
+        std::vector<float> logits;   // its last-row logits (the regenerate path)
+        std::vector<uint8_t> blob;   // the dense state (empty = on disk only)
+        size_t bytes = 0;            // the blob's size
+        std::string file;            // the disk copy ("" = none)
+        double used = 0;             // last use (unix s)
+    };
+    bool on = false;
+    std::vector<Entry> e;
+    std::string dir;
+    size_t ram_cap = 0, disk_cap = 0;
+    double max_age = 14 * 86400.0;
+    int min_tokens = 1024;
+    uint64_t stamp = 0;
+    long n_park = 0, n_hit = 0, n_evict = 0;
+
+    static double now_s() { return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+    static uint64_t fnv(const void * p, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
+        const uint8_t * b = (const uint8_t *) p;
+        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 0x100000001b3ull;
+        return h;
+    }
+    static uint64_t fnv_file(const std::string & path, size_t limit, uint64_t h) {
+        std::ifstream f(path, std::ios::binary);
+        std::vector<char> buf(1 << 22);
+        size_t done = 0;
+        while (f && done < limit) {
+            f.read(buf.data(), (std::streamsize) std::min(buf.size(), limit - done));
+            const size_t got = (size_t) f.gcount();
+            if (!got) break;
+            h = fnv(buf.data(), got, h);
+            done += got;
+        }
+        return h;
+    }
+    size_t ram_used() const { size_t b = 0; for (const auto & x : e) b += x.blob.size(); return b; }
+    size_t disk_used() const { size_t b = 0; for (const auto & x : e) if (!x.file.empty()) b += x.bytes + 64 + 4 * (x.ids.size() + x.logits.size()); return b; }
+
+    bool write_file(Entry & x) {
+        char nb[48];
+        std::snprintf(nb, sizeof(nb), "/%016llx.park", (unsigned long long) fnv(x.ids.data(), x.ids.size() * 4));
+        const std::string path = dir + nb, tmp = path + ".tmp";
+        std::ofstream f(tmp, std::ios::binary);
+        uint64_t hd[8] = { 0x314b52505431344full /* "O41TPRK1" */, stamp, (uint64_t) x.ids.size(), (uint64_t) x.logits.size(),
+                           (uint64_t) x.bytes, 0, 0, 0 };
+        f.write((const char *) hd, sizeof(hd));
+        f.write((const char *) x.ids.data(), (std::streamsize) (x.ids.size() * 4));
+        f.write((const char *) x.logits.data(), (std::streamsize) (x.logits.size() * 4));
+        f.write((const char *) x.blob.data(), (std::streamsize) x.blob.size());
+        f.close();
+        if (!f || std::rename(tmp.c_str(), path.c_str()) != 0) { std::remove(tmp.c_str()); return false; }
+        x.file = path;
+        return true;
+    }
+    bool read_blob(Entry & x) {   // the disk copy's state back into RAM
+        std::ifstream f(x.file, std::ios::binary);
+        if (!f) return false;
+        f.seekg((std::streamoff) (64 + 4 * (x.ids.size() + x.logits.size())));
+        x.blob.resize(x.bytes);
+        f.read((char *) x.blob.data(), (std::streamsize) x.bytes);
+        if (!f) { x.blob.clear(); return false; }
+        ::utimes(x.file.c_str(), nullptr);   // the age limit counts from the last use
+        return true;
+    }
+    void drop(size_t i) {
+        if (!e[i].file.empty()) std::remove(e[i].file.c_str());
+        e.erase(e.begin() + (long) i);
+        ++n_evict;
+    }
+    void status() const {
+        if (dir.empty()) return;
+        size_t nr = 0, nd = 0, toks = 0;
+        for (const auto & x : e) { nr += !x.blob.empty(); nd += !x.file.empty(); toks += x.ids.size(); }
+        std::ofstream f(dir + "/status.json.tmp");
+        f << "{\"conversations\": " << e.size() << ", \"tokens\": " << toks << ", \"ram_entries\": " << nr << ", \"ram_bytes\": " << ram_used()
+          << ", \"ram_cap\": " << ram_cap << ", \"disk_entries\": " << nd << ", \"disk_bytes\": " << disk_used() << ", \"disk_cap\": " << disk_cap
+          << ", \"parked\": " << n_park << ", \"restored\": " << n_hit << ", \"evicted\": " << n_evict << "}\n";
+        f.close();
+        std::rename((dir + "/status.json.tmp").c_str(), (dir + "/status.json").c_str());
+    }
+    void enforce() {
+        const double t = now_s();
+        for (size_t i = e.size(); i-- > 0;)
+            if (t - e[i].used > max_age) drop(i);
+        while (ram_used() > ram_cap) {   // the least recently used RAM copy goes (its disk copy stays)
+            long lru = -1;
+            for (size_t i = 0; i < e.size(); ++i)
+                if (!e[i].blob.empty() && (lru < 0 || e[i].used < e[(size_t) lru].used)) lru = (long) i;
+            if (lru < 0) break;
+            if (e[(size_t) lru].file.empty()) drop((size_t) lru);
+            else { e[(size_t) lru].blob.clear(); e[(size_t) lru].blob.shrink_to_fit(); }
+        }
+        while (disk_used() > disk_cap) {   // the least recently used conversation goes
+            long lru = -1;
+            for (size_t i = 0; i < e.size(); ++i)
+                if (!e[i].file.empty() && (lru < 0 || e[i].used < e[(size_t) lru].used)) lru = (long) i;
+            if (lru < 0) break;
+            if (!e[(size_t) lru].blob.empty()) { std::remove(e[(size_t) lru].file.c_str()); e[(size_t) lru].file.clear(); }
+            else drop((size_t) lru);
+        }
+    }
+    void init(const std::string & exe, const std::string & model, int64_t ctx, bool kv_fp4) {
+        const char * v = std::getenv("STRATA_PARK");
+        on = v && std::atoi(v) != 0;
+        if (!on) return;
+        auto genv = [](const char * k, double d) { const char * x = std::getenv(k); return x ? std::atof(x) : d; };
+        ram_cap = (size_t) (genv("STRATA_PARK_RAM_GIB", 4.0) * 1073741824.0);
+        disk_cap = (size_t) (genv("STRATA_PARK_DISK_GIB", 10.0) * 1073741824.0);
+        max_age = genv("STRATA_PARK_DAYS", 14.0) * 86400.0;
+        min_tokens = (int) genv("STRATA_PARK_MIN", 1024);
+        if (const char * d = std::getenv("STRATA_PARK_DIR")) dir = d;
+        const double t0 = now_s();
+        struct stat ms{};
+        ::stat(model.c_str(), &ms);
+        uint64_t h = fnv_file(exe, (size_t) -1, 0xcbf29ce484222325ull);
+        h = fnv_file(model, (size_t) 64 << 20, h);
+        const int64_t meta[4] = { (int64_t) ms.st_size, ctx, kv_fp4 ? 1 : 0, 1 /* format */ };
+        stamp = fnv(meta, sizeof(meta), h);
+        long kept = 0, wiped = 0;
+        if (!dir.empty()) {
+            ::mkdir(dir.c_str(), 0755);
+            if (DIR * dp = ::opendir(dir.c_str())) {
+                while (dirent * de = ::readdir(dp)) {
+                    const std::string nm = de->d_name;
+                    if (nm.size() < 6 || nm.compare(nm.size() - 5, 5, ".park") != 0) continue;
+                    const std::string path = dir + "/" + nm;
+                    std::ifstream f(path, std::ios::binary);
+                    uint64_t hd[8] = {};
+                    f.read((char *) hd, sizeof(hd));
+                    struct stat fs{};
+                    ::stat(path.c_str(), &fs);
+                    if (!f || hd[0] != 0x314b52505431344full || hd[1] != stamp || t0 - (double) fs.st_mtime > max_age) {
+                        f.close(); std::remove(path.c_str()); ++wiped; continue;
+                    }
+                    Entry x;
+                    x.ids.resize((size_t) hd[2]);
+                    x.logits.resize((size_t) hd[3]);
+                    x.bytes = (size_t) hd[4];
+                    f.read((char *) x.ids.data(), (std::streamsize) (x.ids.size() * 4));
+                    f.read((char *) x.logits.data(), (std::streamsize) (x.logits.size() * 4));
+                    if (!f) { f.close(); std::remove(path.c_str()); ++wiped; continue; }
+                    x.file = path;
+                    x.used = (double) fs.st_mtime;
+                    e.push_back(std::move(x));
+                    ++kept;
+                }
+                ::closedir(dp);
+            }
+            enforce();
+        }
+        std::fprintf(stderr, "park: on - RAM %.1f GiB, disk %.1f GiB in %s, %d tokens min, %.0f days; %ld conversations kept, %ld "
+                             "wiped (stamp %016llx, %.1f s)\n", ram_cap / 1073741824.0, disk_cap / 1073741824.0,
+                     dir.empty() ? "(none)" : dir.c_str(), min_tokens, max_age / 86400.0, kept, wiped,
+                     (unsigned long long) stamp, now_s() - t0);
+        status();
+    }
+    // the parked conversation `ids` extends the most (its whole prefix matches; `minus1` = up to its last token, the
+    // one-token rollback's case); -1 = none
+    long find(const std::vector<int> & ids, bool minus1) const {
+        long best = -1;
+        for (size_t i = 0; i < e.size(); ++i) {
+            const auto & x = e[i].ids;
+            const size_t need = x.size() - (minus1 ? 1 : 0);
+            if (x.empty() || need > ids.size() || (best >= 0 && x.size() <= e[(size_t) best].ids.size())) continue;
+            if (std::memcmp(x.data(), ids.data(), need * 4) == 0) best = (long) i;
+        }
+        return best;
+    }
+    void put(std::vector<int> && ids, const std::vector<float> & logits, std::vector<uint8_t> && blob) {
+        for (size_t i = e.size(); i-- > 0;) {   // what it extends (or repeats) is superseded - also up to its last token:
+            const auto & x = e[i].ids;         // the template renders a turn's generation prefix differently in history
+            if (!x.empty() && x.size() <= ids.size() && std::memcmp(x.data(), ids.data(), (x.size() - 1) * 4) == 0) drop(i);
+        }
+        Entry x;
+        x.ids = std::move(ids);
+        x.logits = logits;
+        x.bytes = blob.size();
+        x.blob = std::move(blob);
+        x.used = now_s();
+        if (!dir.empty() && !write_file(x)) std::fprintf(stderr, "park: cannot write to %s\n", dir.c_str());
+        e.push_back(std::move(x));
+        ++n_park;
+        enforce();
+        status();
+    }
+};
 
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
@@ -1118,6 +1321,8 @@ int main(int argc, char ** argv) {
         std::printf("READY %d stop\n", ctxv);
         std::fflush(stdout);
         std::fprintf(stderr, "serve: ready (ctx %d, prefill chunk %d)\n", ctxv, NP);
+        ParkStore park;   // mab776 STRATA_PARK (opt-in): conversation parking
+        park.init("/proc/self/exe", a.model, ctxv, a.kv_fp4);
         std::string line;
         while (next_line(line)) {
             if (line == "QUIT") break;
@@ -1147,6 +1352,58 @@ int main(int argc, char ** argv) {
             }
             size_t lcp = 0;
             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+            // mab776 STRATA_PARK: a request that does not continue the live conversation parks it (at its snapshot point),
+            // then takes the parked conversation it extends - loaded as the snapshot, so the branches below continue from it
+            if (park.on) {
+                static const bool rb1 = std::getenv("STRATA_SERVE_ROLLBACK1") && std::getenv("STRATA_SERVE_ROLLBACK1")[0] == '1';
+                const bool continues = (!hist.empty() && lcp == hist.size() && lcp < ids.size()) ||
+                                       (snap_len > 0 && lcp >= (size_t) snap_len) ||
+                                       (rb1 && snap_len > 1 && lcp == (size_t) snap_len - 1);
+                if (!continues) {
+                    const double tk0 = now_ms();
+                    double t_save = 0;
+                    if (snap_len >= park.min_tokens && (size_t) snap_len <= hist.size() && dense.snapshot_pos() == snap_len) {
+                        std::vector<uint8_t> blob;
+                        if (dense.park_save(snap_len, blob))
+                            park.put(std::vector<int>(hist.begin(), hist.begin() + snap_len), snap_logits, std::move(blob));
+                        t_save = now_ms() - tk0;
+                    }
+                    long bi = park.find(ids, false);
+                    if (bi < 0 && rb1) bi = park.find(ids, true);
+                    if (bi >= 0) {
+                        const double tl0 = now_ms();
+                        auto & x = park.e[(size_t) bi];
+                        const bool in_ram = !x.blob.empty();
+                        if ((in_ram || park.read_blob(x)) && dense.park_load((int) x.ids.size(), x.blob.data(), x.blob.size()) &&
+                            dense.restore()) {
+                            dense.park_history(x.ids.data(), (int) x.ids.size());
+                            hist = x.ids;
+                            snap_len = (int) x.ids.size();
+                            snap_logits = x.logits;
+                            x.used = ParkStore::now_s();
+                            ++park.n_hit;
+#if defined(DS41_HAVE_DSPARK)
+                            dsp_next = -1;   // its window belongs to the parked-away conversation
+#endif
+                            lcp = 0;
+                            while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
+                            std::fprintf(stderr, "park: restored a %zu-token conversation from %s in %.1f ms (the live one parked in %.1f ms)\n",
+                                         hist.size(), in_ram ? "RAM" : "disk", now_ms() - tl0, t_save);
+                            park.enforce();
+                            park.status();
+                        } else {
+                            std::fprintf(stderr, "park: restore failed (%s) - it reads again\n", dense.last_error().c_str());
+                            park.drop((size_t) bi);
+                            park.status();
+                            hist.clear();
+                            snap_len = -1;
+                            lcp = 0;
+                        }
+                    } else if (t_save > 0) {
+                        std::fprintf(stderr, "park: parked the live %d-token conversation in %.1f ms (no parked match)\n", snap_len, t_save);
+                    }
+                }
+            }
             int reused = 0;
             if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
@@ -1550,6 +1807,15 @@ int main(int argc, char ** argv) {
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) st.hits, (long long) st.lookups(), (long long) st.file_tier, total - reused);
             std::fflush(stdout);
+        }
+        // mab776 STRATA_PARK: the live conversation is parked too when the engine ends (the server sends QUIT on
+        // docker stop), so a restart continues it instead of reading it again
+        if (park.on && snap_len >= park.min_tokens && (size_t) snap_len <= hist.size() && dense.snapshot_pos() == snap_len) {
+            const double tq0 = now_ms();
+            std::vector<uint8_t> blob;
+            if (dense.park_save(snap_len, blob))
+                park.put(std::vector<int>(hist.begin(), hist.begin() + snap_len), snap_logits, std::move(blob));
+            std::fprintf(stderr, "park: the live %d-token conversation parked at exit in %.1f ms\n", snap_len, now_ms() - tq0);
         }
         tier.close();
         // the stdin reader thread (detached) sits in getline holding cin's lock: a normal exit's stream teardown waits
