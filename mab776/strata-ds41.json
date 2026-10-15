@@ -58,7 +58,11 @@
   "STRATA_BLOB_MIRROR": "/home/mab776/Documents/portainer/strata-ds41/mab776/mirror/V41-GSQ.experts.mirror",
   "STRATA_BLOB_MIRROR_SHARE": "0.5",
   "STRATA_DSPARK_DEPTH": "5",
-  "STRATA_SERVE_ROLLBACK1": "1"
+  "STRATA_SERVE_ROLLBACK1": "1",
+  "STRATA_CHUNK_PF_MIN": "2048",
+  "STRATA_CPF_PERBLOB": "1",
+  "STRATA_CPF_PARTS": "8",
+  "DS41_PF_THREADS": "32"
  },
  "_comment_mab776": "2026-10-15 overnight (ram-128gb/v41/OVERNIGHT-REPORT.md): --prompt-batch 32768 + the env block = opt-in engine paths, each measured; drop a key (or set it to 0) to go back to the old path. STRATA_BLOB_MIRROR needs mab776/mirror/V41-GSQ.experts.mirror (rebuild: see the report)."
 }
