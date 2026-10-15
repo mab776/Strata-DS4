@@ -1077,6 +1077,16 @@ int main(int argc, char ** argv) {
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+            } else if (std::getenv("STRATA_SERVE_ROLLBACK1") && std::getenv("STRATA_SERVE_ROLLBACK1")[0] == '1' &&
+                       snap_len > 1 && lcp == (size_t) snap_len - 1 && (size_t) snap_len - 1 < ids.size() && dense.restore()) {
+                // mab776 STRATA_SERVE_ROLLBACK1=1: the new prompt matches the snapshot up to its LAST token - the chat
+                // template renders the previous turn's assistant prefix differently from the generation prompt (V4.1:
+                // "<think>" opened it, the history has "</think>"), so every agent turn re-read the whole conversation.
+                // Restore the snapshot and re-feed from that token: the window ring holds RAW = SWA + 16 positions and
+                // the ratio-2 state ring the previous position, so one position back reads only valid rows (the
+                // rewritten position's own rows come from the pass, as any continuation's).
+                hist.resize((size_t) snap_len - 1);
+                reused = snap_len - 1;
             } else {
                 hist.clear();
                 snap_len = -1;
