@@ -44,6 +44,8 @@ struct Ds41DSpark::Impl {
     ggml_tensor * i_main = nullptr, * i_mpos = nullptr, * i_mslot = nullptr, * i_emb = nullptr, * i_bpos = nullptr;
     ggml_tensor * i_mask = nullptr, * i_bonus = nullptr, * i_pre = nullptr;
     std::vector<int> filled;           // ring slot -> position held (-1 empty)
+    std::vector<float> last_row;       // mab776 STRATA_DSPARK_SNAP: the last appended main_hidden row (redraft)
+    int last_pos = -1;
     // graphs (one per (k, draft?) shape), one allocator
     ggml_gallocr_t ga = nullptr;
     struct G { ggml_context * c = nullptr; ggml_cgraph * gf = nullptr; std::vector<ggml_tensor *> ids, conf, rids; };
@@ -268,6 +270,48 @@ bool Ds41DSpark::init(const Ds41DSparkConfig & cfg, std::string & err) {
 
 void Ds41DSpark::reset() {
     p_->filled.assign(WIN, -1);
+    p_->last_pos = -1;
+}
+
+// [filled: WIN ints][last_pos: int][last_row: 3 * n_embd floats][3 rings: DH x WIN floats each]
+bool Ds41DSpark::save_state(std::vector<uint8_t> & out) {
+    Impl & im = *p_;
+    if (im.ring.size() != 3 || im.filled.size() != (size_t) WIN || im.last_pos < 0) return false;
+    const size_t fb = (size_t) WIN * sizeof(int), lb = (size_t) (3 * im.D) * sizeof(float),
+                 rb = (size_t) im.DH * (size_t) WIN * sizeof(float);
+    if (im.last_row.size() * sizeof(float) != lb) return false;
+    ggml_backend_synchronize(im.be);   // no step graph still writes a ring
+    out.resize(fb + sizeof(int) + lb + 3 * rb);
+    uint8_t * at = out.data();
+    std::memcpy(at, im.filled.data(), fb); at += fb;
+    std::memcpy(at, &im.last_pos, sizeof(int)); at += sizeof(int);
+    std::memcpy(at, im.last_row.data(), lb); at += lb;
+    for (int b = 0; b < 3; ++b) ggml_backend_tensor_get(im.ring[(size_t) b], at + (size_t) b * rb, 0, rb);
+    return true;
+}
+
+bool Ds41DSpark::load_state(const uint8_t * data, size_t n) {
+    Impl & im = *p_;
+    const size_t fb = (size_t) WIN * sizeof(int), lb = (size_t) (3 * im.D) * sizeof(float),
+                 rb = (size_t) im.DH * (size_t) WIN * sizeof(float);
+    if (!data || im.ring.size() != 3 || n != fb + sizeof(int) + lb + 3 * rb) return false;
+    ggml_backend_synchronize(im.be);
+    const uint8_t * at = data;
+    im.filled.resize((size_t) WIN);
+    std::memcpy(im.filled.data(), at, fb); at += fb;
+    std::memcpy(&im.last_pos, at, sizeof(int)); at += sizeof(int);
+    im.last_row.resize((size_t) (3 * im.D));
+    std::memcpy(im.last_row.data(), at, lb); at += lb;
+    for (int b = 0; b < 3; ++b) ggml_backend_tensor_set(im.ring[(size_t) b], at + (size_t) b * rb, 0, rb);
+    return true;
+}
+
+bool Ds41DSpark::redraft(int bonus, int * ids, float * conf) {
+    Impl & im = *p_;
+    if (im.last_pos < 0 || im.last_row.size() != (size_t) (3 * im.D)) { im.err = "DSpark redraft: no last row"; return false; }
+    const std::vector<float> row = im.last_row;   // step() overwrites last_row with the same row
+    const int pos = im.last_pos;
+    return step(row.data(), &pos, 1, bonus, ids, conf);
 }
 
 static ggml_tensor * fake_quant_fp8(ggml_context * c, ggml_tensor * x) {
@@ -416,6 +460,8 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);
     for (int i = 0; i < k; ++i) { ms[(size_t) i] = pos[i] % (int) WIN; im.filled[(size_t) ms[(size_t) i]] = pos[i]; }
     ggml_backend_tensor_set(im.i_main, mh, 0, (size_t) k * (size_t) (3 * im.D) * 4);
+    im.last_row.assign(mh + (size_t) (k - 1) * (size_t) (3 * im.D), mh + (size_t) k * (size_t) (3 * im.D));
+    im.last_pos = pos[k - 1];
     ggml_backend_tensor_set(im.i_mpos, mp.data(), 0, (size_t) k * 4);
     ggml_backend_tensor_set(im.i_mslot, ms.data(), 0, (size_t) k * 4);
     const bool draft = bonus >= 0;

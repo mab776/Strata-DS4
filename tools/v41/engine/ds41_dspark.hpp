@@ -18,6 +18,7 @@
 #include "ggml-backend.h"
 
 #include <memory>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -48,6 +49,14 @@ public:
     bool step(const float * main_hidden, const int * pos, int k, int bonus, int * ids, float * conf);
     /// Forget the window (a new conversation / a rewind past it).
     void reset();
+    /// mab776 STRATA_DSPARK_SNAP: the window (each block's ring + the position each slot holds) as bytes, and back -
+    /// kept with the trunk's snapshot, so a regenerate or a parked conversation drafts from its first token instead of
+    /// starting from a reset window.
+    bool save_state(std::vector<uint8_t> & out);
+    bool load_state(const uint8_t * data, size_t n);
+    /// The drafts after the last appended position again (its main_hidden row re-appended, `bonus` = the token after
+    /// it): a regenerate's first block, with no prompt token to feed.
+    bool redraft(int bonus, int * ids, float * conf);
     double last_ms() const;             ///< wall time of the last step's graph
     size_t weight_bytes() const;        ///< device bytes of the stack's weights
     const std::string & last_error() const;

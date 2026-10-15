@@ -1309,12 +1309,22 @@ int main(int argc, char ** argv) {
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
         int n_req = 0;
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
+        static constexpr uint64_t kDspMagic = 0x4b50534431345344ull;   // mab776: a parked blob's DSpark trailer ("DS41DSPK")
 #if defined(DS41_HAVE_DSPARK)
         // STRATA_SERVE_DSPARK: DSpark's window (main_hidden of the last <= 128 positions) is seeded by running a
         // request's last min(128, new) prompt tokens through pass_v instead of the passes / batch (no extra work), and
         // it carries over when the next request continues this one (dsp_next = the position its ring expects next);
         // any other reuse resets it (lower acceptance for a while, never a different output).
         int dsp_next = -1;
+        // mab776 STRATA_DSPARK_SNAP=1: the window as it was at the snapshot point (dsp_snap, for snap_len) - a regenerate,
+        // a continuation from the snapshot or a parked conversation restores it instead of resetting the drafter
+        static const bool dsp_snap_on = std::getenv("STRATA_DSPARK_SNAP") && std::getenv("STRATA_DSPARK_SNAP")[0] == '1';
+        std::vector<uint8_t> dsp_snap;
+        int dsp_snap_len = -1;
+        auto dsp_restore = [&](int at) {   // after a dense.restore() of snap_len: the drafter's window to match (at = reused)
+            if (dsp_snap_on && dsp && dsp_snap_len == snap_len && dsp->load_state(dsp_snap.data(), dsp_snap.size()))
+                dsp_next = at;
+        };
         const int sp_depth_serve = std::getenv("STRATA_DSPARK_DEPTH") ? std::max(1, std::min(5, std::atoi(std::getenv("STRATA_DSPARK_DEPTH")))) : 4;
         long sv_pass = 0, sv_acc = 0;
 #endif
@@ -1373,8 +1383,16 @@ int main(int argc, char ** argv) {
                     double t_save = 0;
                     if (snap_len >= park.min_tokens && (size_t) snap_len <= hist.size() && dense.snapshot_pos() == snap_len) {
                         std::vector<uint8_t> blob;
-                        if (dense.park_save(snap_len, blob))
+                        if (dense.park_save(snap_len, blob)) {
+#if defined(DS41_HAVE_DSPARK)
+                            if (dsp_snap_on && dsp_snap_len == snap_len && !dsp_snap.empty()) {   // + the drafter's window
+                                const uint64_t tr[2] = { (uint64_t) dsp_snap.size(), kDspMagic };
+                                blob.insert(blob.end(), dsp_snap.begin(), dsp_snap.end());
+                                blob.insert(blob.end(), (const uint8_t *) tr, (const uint8_t *) tr + sizeof tr);
+                            }
+#endif
                             park.put(std::vector<int>(hist.begin(), hist.begin() + snap_len), snap_logits, std::move(blob));
+                        }
                         t_save = now_ms() - tk0;
                     }
                     long bi = park.find(ids, false);
@@ -1383,8 +1401,17 @@ int main(int argc, char ** argv) {
                         const double tl0 = now_ms();
                         auto & x = park.e[(size_t) bi];
                         const bool in_ram = !x.blob.empty();
-                        if ((in_ram || park.read_blob(x)) && dense.park_load((int) x.ids.size(), x.blob.data(), x.blob.size()) &&
-                            dense.restore()) {
+                        size_t dense_n = x.blob.size(), dsp_n = 0;   // a DSpark trailer (STRATA_DSPARK_SNAP) is split off
+                        auto split = [&]() {
+                            uint64_t tr[2] = { 0, 0 };
+                            if (x.blob.size() < sizeof tr) return;
+                            std::memcpy(tr, x.blob.data() + x.blob.size() - sizeof tr, sizeof tr);
+                            if (tr[1] != kDspMagic || tr[0] + sizeof tr > x.blob.size()) return;
+                            dsp_n = (size_t) tr[0];
+                            dense_n = x.blob.size() - sizeof tr - dsp_n;
+                        };
+                        if ((in_ram || park.read_blob(x)) && (split(), true) &&
+                            dense.park_load((int) x.ids.size(), x.blob.data(), dense_n) && dense.restore()) {
                             dense.park_history(x.ids.data(), (int) x.ids.size());
                             hist = x.ids;
                             snap_len = (int) x.ids.size();
@@ -1393,6 +1420,11 @@ int main(int argc, char ** argv) {
                             ++park.n_hit;
 #if defined(DS41_HAVE_DSPARK)
                             dsp_next = -1;   // its window belongs to the parked-away conversation
+                            dsp_snap_len = -1;
+                            if (dsp_snap_on && dsp_n > 0) {   // the restored one's window: taken by the reuse below
+                                dsp_snap.assign(x.blob.begin() + (long) dense_n, x.blob.begin() + (long) (dense_n + dsp_n));
+                                dsp_snap_len = snap_len;
+                            }
 #endif
                             lcp = 0;
                             while (lcp < hist.size() && lcp < ids.size() && hist[lcp] == ids[lcp]) ++lcp;
@@ -1414,14 +1446,24 @@ int main(int argc, char ** argv) {
                 }
             }
             int reused = 0;
+#if defined(DS41_HAVE_DSPARK)
+            bool dsp_regen = false;   // mab776 STRATA_DSPARK_SNAP: a regenerate with the drafter's window restored
+#endif
             if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
                 last_logits = snap_logits;
+#if defined(DS41_HAVE_DSPARK)
+                dsp_restore(reused);
+                dsp_regen = dsp_next == reused;
+#endif
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
+#if defined(DS41_HAVE_DSPARK)
+                dsp_restore(reused);
+#endif
             } else if (std::getenv("STRATA_SERVE_ROLLBACK1") && std::getenv("STRATA_SERVE_ROLLBACK1")[0] == '1' &&
                        snap_len > 1 && lcp == (size_t) snap_len - 1 && (size_t) snap_len - 1 < ids.size() && dense.restore()) {
                 // mab776 STRATA_SERVE_ROLLBACK1=1: the new prompt matches the snapshot up to its LAST token - the chat
@@ -1432,6 +1474,9 @@ int main(int argc, char ** argv) {
                 // rewritten position's own rows come from the pass, as any continuation's).
                 hist.resize((size_t) snap_len - 1);
                 reused = snap_len - 1;
+#if defined(DS41_HAVE_DSPARK)
+                dsp_restore(reused);   // its ring slot for that position is rewritten by the tail, as the trunk's rows
+#endif
             } else {
                 hist.clear();
                 snap_len = -1;
@@ -1604,6 +1649,9 @@ int main(int argc, char ** argv) {
                 if (ok) { bias_now = true; apply_bias(); }
                 ph_tail = now_ms() - tt0;
                 pp(delta);
+            } else if (ok && dsp_regen && delta == 0 && !nonfinite) {   // mab776 STRATA_DSPARK_SNAP: a regenerate's first
+                sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // token, and its drafts from the
+                if (!dsp->redraft(sp_t, sp_ids, sp_conf)) sp_t = -1;                   // restored window (else: plain decode)
             }
 #endif
             std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
@@ -1635,7 +1683,13 @@ int main(int argc, char ** argv) {
                 continue;
             }
             hist = ids;
-            if (total > reused && dense.snapshot(total)) { snap_len = total; snap_logits = last_logits; }
+            if (total > reused && dense.snapshot(total)) {
+                snap_len = total;
+                snap_logits = last_logits;
+#if defined(DS41_HAVE_DSPARK)
+                dsp_snap_len = dsp_snap_on && dsp && dsp->save_state(dsp_snap) ? total : -1;
+#endif
+            }
             if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {   // exactness checks: request N's last-row logits
                 char nb[32];
                 std::snprintf(nb, sizeof(nb), "/req%03d.f32", n_req);
@@ -1825,8 +1879,16 @@ int main(int argc, char ** argv) {
         if (park.on && snap_len >= park.min_tokens && (size_t) snap_len <= hist.size() && dense.snapshot_pos() == snap_len) {
             const double tq0 = now_ms();
             std::vector<uint8_t> blob;
-            if (dense.park_save(snap_len, blob))
+            if (dense.park_save(snap_len, blob)) {
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp_snap_on && dsp_snap_len == snap_len && !dsp_snap.empty()) {
+                    const uint64_t tr[2] = { (uint64_t) dsp_snap.size(), kDspMagic };
+                    blob.insert(blob.end(), dsp_snap.begin(), dsp_snap.end());
+                    blob.insert(blob.end(), (const uint8_t *) tr, (const uint8_t *) tr + sizeof tr);
+                }
+#endif
                 park.put(std::vector<int>(hist.begin(), hist.begin() + snap_len), snap_logits, std::move(blob));
+            }
             std::fprintf(stderr, "park: the live %d-token conversation parked at exit in %.1f ms\n", snap_len, now_ms() - tq0);
         }
         tier.close();
