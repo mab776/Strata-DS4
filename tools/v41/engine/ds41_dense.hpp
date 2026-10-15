@@ -99,6 +99,14 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// mab776 STRATA_FN_DEV=1: the batch's fn columns on the device ([n_embd, B] token-major, null on the CPU backend);
+    /// attn_router_span then skips fn's host readback (batch_fn() is NOT filled) - the tier copies it on the card.
+    const float * batch_fn_dev() const;
+    static bool fn_dev_on();
+    /// mab776 STRATA_SPAN_ASYNC=1: attn_router_span / _kv queue their uploads + readbacks on the backend's stream and
+    /// return without waiting; call sync() once after a layer's spans, before batch_ids() / batch_wts() are read.
+    static bool span_async_on();
+    void sync();
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.

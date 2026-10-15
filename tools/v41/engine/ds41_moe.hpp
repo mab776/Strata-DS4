@@ -473,6 +473,9 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// mab776: run_chunk_dev with the activations already on the card (`x_dev`, n * n_embd floats, same device) -
+    /// copied device to device instead of uploaded from the host (`x` unused).  STRATA_FN_DEV=1 (ds41_generate).
+    bool run_chunk_dev_x(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_dev, void* out_dev);
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.

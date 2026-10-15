@@ -602,7 +602,19 @@ int main(int argc, char ** argv) {
         for (int l = 0; l < n_layer; ++l) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
-            for (int t = 0; t < m; ++t) {
+            // mab776 STRATA_PASS_MULTI=1: the pass's tokens go to the tier Ds41MoeTier::kMaxMulti at a time (the
+            // verify path's batched per-class run: a miss shared by several tokens is fetched once) instead of one
+            // tier call per token; a refused call falls back to the per-token loop below for its tokens
+            static const bool pass_multi = std::getenv("STRATA_PASS_MULTI") && std::getenv("STRATA_PASS_MULTI")[0] == '1';
+            int t0m = 0;
+            if (pass_multi && rdev1 && m > 1) {
+                for (; t0m < m; t0m += Ds41MoeTier::kMaxMulti) {
+                    const int nt = std::min(Ds41MoeTier::kMaxMulti, m - t0m);
+                    if (!tier.run_multi_to_dev(l, nt, mids.data() + (size_t) t0m * top_k, mw.data() + (size_t) t0m * top_k,
+                                               fn + (size_t) t0m * n_embd, rdev1 + (size_t) t0m * n_embd)) break;
+                }
+            }
+            for (int t = t0m; t < m; ++t) {
                 const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
                                                         fn + (size_t) t * n_embd, rdev1 + (size_t) t * n_embd)
                                       : tier.run(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
@@ -852,14 +864,20 @@ int main(int argc, char ** argv) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
                     }
+                    if (Ds41Dense::span_async_on()) dense.sync();   // mab776 STRATA_SPAN_ASYNC: ids / wts / fn are in now
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
                     // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
                     float * rdev = routed_host ? nullptr : dense.routed_dev();
+                    // mab776 STRATA_FN_DEV=1: the experts' input stays on the card (attn_router_span skipped its readback)
+                    const float * fdev = rdev && Ds41Dense::fn_dev_on() ? dense.batch_fn_dev() : nullptr;
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
-                        const bool ok = rdev ? tier.run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                        const bool ok = fdev ? tier.run_chunk_dev_x(l, pn, dense.batch_ids() + (size_t) s * top_k,
+                                                                    dense.batch_wts() + (size_t) s * top_k,
+                                                                    fdev + (size_t) s * n_embd, rdev + (size_t) s * n_embd)
+                                      : rdev ? tier.run_chunk_dev(l, pn, dense.batch_ids() + (size_t) s * top_k,
                                                                   dense.batch_wts() + (size_t) s * top_k,
                                                                   dense.batch_fn() + (size_t) s * n_embd,
                                                                   rdev + (size_t) s * n_embd)

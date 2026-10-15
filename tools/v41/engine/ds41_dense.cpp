@@ -198,6 +198,10 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
+    // mab776 STRATA_SPAN_ASYNC=1: the per-span index uploads come from this pinned buffer (one fixed region per sub-batch
+    // index of a batch) on the backend's stream, so attn_router_span need not wait for the GPU between sub-batches
+    ggml_backend_buffer_t span_pin = nullptr;
+    size_t span_region = 0;
 
     // ---- graphs
     ggml_context * gctx = nullptr;        // node structs of the cached (n = 1) graphs
@@ -213,6 +217,7 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
 
     ~Impl() {
+        if (span_pin) ggml_backend_buffer_free(span_pin);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
         if (sbuf) ggml_backend_buffer_free(sbuf);
@@ -1313,6 +1318,7 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
 // PASS-LOCAL row maps (the pass's own rows / states sit at the end of the [ring | pass rows] they index, so they are
 // recomputed from the sub-batch's own position - upload_inputs laid them out for the whole batch, correct only at
 // col0 = 0).  Shared by attn_router_span and attn_router_span_kv.
+static bool upload_span_async(Ds41Dense::Impl & im, int col0, int n, size_t si);
 static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
     const size_t si = (size_t) (col0 / im.S);
@@ -1320,6 +1326,7 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     im.pass_cap[0] = im.span_cap[si][0];
     im.pass_cap[1] = im.span_cap[si][1];
     im.pass_cap[2] = im.span_cap[si][2];
+    if (Ds41Dense::span_async_on() && !im.cpu) return upload_span_async(im, col0, n, si);
     const int64_t pbase = (int64_t) im.batch_pos0 + col0;
     {
         std::vector<int32_t> widx((size_t) (im.SWA * n));
@@ -1357,6 +1364,53 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     return true;
 }
 
+// mab776 STRATA_SPAN_ASYNC: upload_span's four index arrays, written into sub-batch si's region of a pinned buffer and
+// copied on the backend's stream (ordered after the previous sub-batch's graph; no host wait).  Same values.
+static bool upload_span_async(Ds41Dense::Impl & im, int col0, int n, size_t si) {
+    const size_t region = (size_t) (im.SWA * im.S + 2 * im.S + im.RAW + 2) * 4;
+    const size_t nreg = im.span_cap.size();
+    if (!im.span_pin || im.span_region != region || ggml_backend_buffer_get_size(im.span_pin) < region * nreg) {
+        if (im.span_pin) { ggml_backend_synchronize(im.backend); ggml_backend_buffer_free(im.span_pin); im.span_pin = nullptr; }
+        ggml_backend_buffer_type_t hb = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(im.backend));
+        const size_t want = region * std::max<size_t>(nreg, (size_t) ((im.NCmax + im.S - 1) / im.S));
+        im.span_pin = hb ? ggml_backend_buft_alloc_buffer(hb, want) : nullptr;
+        if (!im.span_pin) { im.err = "span staging: no pinned host buffer"; return false; }
+        im.span_region = region;
+    }
+    int32_t * base = (int32_t *) ((uint8_t *) ggml_backend_buffer_get_base(im.span_pin) + si * region);
+    int32_t * widx = base, * sidx = widx + im.SWA * im.S, * ws = sidx + 2 * im.S, * ss = ws + im.RAW;
+    const int64_t pbase = (int64_t) im.batch_pos0 + col0;
+    for (int t = 0; t < n; ++t) {
+        const int64_t p = pbase + t;
+        for (int64_t j = 0; j < im.SWA; ++j) {
+            const int64_t q = p - im.SWA + 1 + j;
+            widx[t * im.SWA + j] = q < 0 ? 0 : (int32_t) (q >= pbase ? im.RAW + (q - pbase) : q % im.RAW);
+        }
+    }
+    ggml_backend_tensor_set_async(im.backend, im.i_widx, widx, (size_t) col0 * im.SWA * 4, (size_t) (im.SWA * n) * 4);
+    auto row = [&](int64_t q) { return (int32_t) (q >= pbase ? 2 + (q - pbase) : q % 2); };
+    for (int t = 0; t < n; ++t) {
+        const int64_t p = pbase + t, g0 = (p / 2) * 2;
+        sidx[2 * t] = row(g0);
+        sidx[2 * t + 1] = row(p >= g0 + 1 ? g0 + 1 : g0);
+    }
+    ggml_backend_tensor_set_async(im.backend, im.i_sidx, sidx, (size_t) col0 * 2 * 4, (size_t) (2 * n) * 4);
+    const int64_t kw = std::min<int64_t>(n, im.RAW);
+    for (int64_t j = 0; j < kw; ++j) ws[j] = (int32_t) ((pbase + n - kw + j) % im.RAW);
+    ggml_backend_tensor_set_async(im.backend, im.i_wslot, ws, 0, (size_t) kw * 4);
+    const int64_t ks = std::min<int64_t>(n, 2);
+    for (int64_t j = 0; j < ks; ++j) ss[j] = (int32_t) ((pbase + n - ks + j) % 2);
+    ggml_backend_tensor_set_async(im.backend, im.i_sslot, ss, 0, (size_t) ks * 4);
+    return true;
+}
+
+bool Ds41Dense::span_async_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_SPAN_ASYNC"); return e && e[0] == '1'; }();
+    return on;
+}
+
+void Ds41Dense::sync() { ggml_backend_synchronize(p_->backend); }
+
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
     if (!upload_span(im, col0, n)) return false;
@@ -1382,10 +1436,12 @@ bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     ggml_free(gc);
     if (!ok) return false;
     // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
-    ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
+    // mab776 STRATA_FN_DEV=1: the tier reads fn on the card (batch_fn_dev) - no 4 x n_embd bytes a column to the host
+    if (!(fn_dev_on() && !im.cpu))
+        ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
-    ggml_backend_synchronize(im.backend);
+    if (!(span_async_on() && !im.cpu)) ggml_backend_synchronize(im.backend);   // async: the caller's sync() before the tier
     return true;
 }
 
@@ -1415,6 +1471,11 @@ int Ds41Dense::batch_size() const { return (int) p_->batch; }
 const int32_t * Ds41Dense::batch_ids() const { return p_->host_ids.data(); }
 const float * Ds41Dense::batch_wts() const { return p_->host_wts.data(); }
 const float * Ds41Dense::batch_fn() const { return p_->host_fn.data(); }
+const float * Ds41Dense::batch_fn_dev() const { return p_->cpu || !p_->o_fn ? nullptr : (const float *) p_->o_fn->data; }
+bool Ds41Dense::fn_dev_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_FN_DEV"); return e && e[0] == '1'; }();
+    return on;
+}
 
 bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_host, ggml_tensor ** fn_dev) {
     Impl & im = *p_;
