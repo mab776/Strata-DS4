@@ -10,7 +10,7 @@ while read -r L B IDS REST; do
   e=(); for x in $REST; do e+=(-e "$x"); done
   echo "[$(date +%T)] ppl $L ($B $IDS) $REST" | tee -a $O/sweep.log
   timeout 900 docker run --rm --name ds41-ppl --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=0 -e STRATA_NO_LARGEPAGES=1 "${e[@]}" \
-    --memory 104g --memory-swap 104g --oom-score-adj 500 --ulimit memlock=-1:-1 --ipc host \
+    --memory 104g --memory-swap 104g --oom-score-adj 500 --ulimit memlock=-1:-1 --ulimit core=0 --ipc host \
     -v "$G:$G:ro" -v "/media/mab776/nvme 2To/models/deepseek-v41/engram-a:/media/mab776/nvme 2To/models/deepseek-v41/engram-a:ro" \
     -v /home/mab776/v41-engram/engram-b:/home/mab776/v41-engram/engram-b:ro -v $W:$W:ro -v $P:$P strata-ds4:cu13 \
     $W/$B/ds41_generate -m "$G/V41-GSQ.gguf" --backend cuda --experts gpu \

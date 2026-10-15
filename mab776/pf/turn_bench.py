@@ -22,6 +22,7 @@ def main():
     ap.add_argument("--ratio", type=float, default=3.1)
     ap.add_argument("--offset", type=int, default=7000000)
     ap.add_argument("--label", default="")
+    ap.add_argument("--temp", type=float, default=float(__import__("os").environ.get("TURN_TEMP", "0.7")))
     a = ap.parse_args()
     text = corpus()
     at = a.offset
@@ -36,7 +37,7 @@ def main():
         if nt:
             msgs.append({"role": "user", "content": chunk(nt)})
         t0 = time.time()
-        r = call(a.url, "/v1/chat/completions", {"messages": msgs, "max_tokens": a.gen, "temperature": 0.7,
+        r = call(a.url, "/v1/chat/completions", {"messages": msgs, "max_tokens": a.gen, "temperature": a.temp,
                                                   "top_p": 0.95, "stream": False})
         wall = time.time() - t0
         msgs.append({"role": "assistant", "content": r["choices"][0]["message"].get("content") or "ok"})

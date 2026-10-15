@@ -16,7 +16,7 @@ docker rm -f ds41-pf >/dev/null 2>&1
 dump=(); [ "${DUMP:-0}" = 1 ] && { mkdir -p $O/dump/$L; rm -f $O/dump/$L/*; dump=(-e STRATA_SERVE_DUMP=/dump -e STRATA_SERVE_DUMP_TAIL=512 -v $O/dump/$L:/dump); }
 docker run -d --name ds41-pf --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=$GPUS -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e HOME=/home/mab776 -e STRATA_TEXT_LOG=/tmp/strata-ds41-text.log "${dump[@]}" "$@" \
-  --memory $MEM --memory-swap $MEM --oom-score-adj 500 --ulimit memlock=-1:-1 --ipc host --security-opt label=disable \
+  --memory $MEM --memory-swap $MEM --oom-score-adj 500 --ulimit memlock=-1:-1 --ulimit core=0 --ipc host --security-opt label=disable \
   -p $PORT:8150 -w $W \
   -v "/media/mab776/nvme 2To/models/strata-data/src-01431:/home/mab776/AI/Strata:ro" \
   -v "/media/mab776/nvme 2To/models/deepseek-v41/gsq:/media/mab776/nvme 2To/models/deepseek-v41/gsq:ro" \
@@ -35,7 +35,8 @@ for d in $DEPTHS; do
   timeout ${BENCH_TO:-1500} python3 $B/strata_bench.py ${d%%:*} --offset ${d##*:} --ratio 3.1 --url $U --nonce $nonce --label $L --gen ${GEN:-128} 2>&1 | tail -1 | tee -a $O/$L.jsonl
   echo "   RAM $(free -g | awk 'NR==2{print $3" used / "$7" avail GiB"}') | VRAM $(nvidia-smi --query-gpu=memory.used --format=csv,noheader | paste -sd/) | ctr $(docker stats --no-stream --format '{{.MemUsage}}' ds41-pf)" | tee -a $O/$L.log
 done
-[ "${TURNS:-0}" = 1 ] && timeout 1200 python3 $W/mab776/pf/turn_bench.py $U --nonce t$L-$t0 --label $L 2>&1 | tee -a $O/$L.jsonl
+tn=t$L-$t0; [ "${DUMP:-0}" = 1 ] && tn=klturn
+[ "${TURNS:-0}" = 1 ] && timeout 1200 python3 $W/mab776/pf/turn_bench.py $U --nonce $tn --label $L 2>&1 | tee -a $O/$L.jsonl
 docker exec ds41-pf sh -c 'grep -E "prompt phases|^serve: prompt|chunk prof|chunk prefetch|prompt cache|chunk prestage|VRAM|tier:|enc-skip|error|ERR" /tmp/strata-ds41.log' >> $O/$L.log
 docker exec ds41-pf cat /tmp/strata-ds41.log > $O/$L.engine.log 2>/dev/null
 [ "${KEEP:-0}" = 1 ] || docker rm -f ds41-pf >/dev/null

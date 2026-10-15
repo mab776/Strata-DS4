@@ -14,7 +14,7 @@ NS=/nsys/target-linux-x64/nsys
 docker rm -f ds41-pf >/dev/null 2>&1
 docker run -d --name ds41-pf --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=$GPUS -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e HOME=/home/mab776 "$@" \
-  --memory $MEM --memory-swap $MEM --oom-score-adj 500 --ulimit memlock=-1:-1 --ipc host --security-opt label=disable \
+  --memory $MEM --memory-swap $MEM --oom-score-adj 500 --ulimit memlock=-1:-1 --ulimit core=0 --ipc host --security-opt label=disable \
   -p $PORT:8150 -w $W \
   -v "/media/mab776/nvme 2To/models/strata-data/src-01431:/home/mab776/AI/Strata:ro" \
   -v "/media/mab776/nvme 2To/models/deepseek-v41/gsq:/media/mab776/nvme 2To/models/deepseek-v41/gsq:ro" \
