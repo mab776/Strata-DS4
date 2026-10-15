@@ -212,6 +212,10 @@ def ds41_parse_tool_call(body: str, schema=None):
 
 
 F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
+# mab776: Strata >= 0.1.43 takes an opener as a call only when FUNC_START follows it (#1058, else prose): DSML's
+# follower is ' name="X">' (lstripped).  Only read with tool_call_recovery off by function_end/_bare_opener.
+if hasattr(F, "FUNC_START"):
+    F.FUNC_START = 'name="'
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
@@ -238,9 +242,9 @@ def _op_feed_ds41(self, delta: str):
     return _op_feed(self, _strip_wrappers(self, delta, False))
 
 
-def _op_finish_ds41(self):
+def _op_finish_ds41(self, *a, **k):   # mab776: newer Strata servers pass the stop reason
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
-    return out + _op_finish(self)
+    return out + _op_finish(self, *a, **k)
 
 
 F.OutputParser.__init__ = _op_init_ds41
@@ -288,7 +292,7 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
-def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel):
+def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **_kw):   # mab776: newer Strata servers pass force=
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
