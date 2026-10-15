@@ -438,13 +438,25 @@ struct B {
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     Allo & a = cached ? allo_dec : allo_pass;
+    // mab776 STRATA_DENSE_PROF: the allocator's share (a buffer that changes size = a cudaFree, which waits for the
+    // device) vs the graph launch
+    const bool pr = Ds41Dense::prof_on() && !cached;
+    const size_t sz0 = pr && a.a ? ggml_gallocr_get_buffer_size(a.a, 0) : 0;
+    const auto tp0 = std::chrono::steady_clock::now();
     bool ok_alloc = a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true));
+    if (pr) {
+        Ds41Dense::Prof & dp = Ds41Dense::prof();
+        dp.alloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
+        if (a.a && ggml_gallocr_get_buffer_size(a.a, 0) != sz0) ++dp.reallocs;
+    }
     if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
         std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
         ok_alloc = a.alloc(gf, false);
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
+    const auto tl0 = std::chrono::steady_clock::now();
     if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+    if (pr) Ds41Dense::prof().launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
     return true;
 }
 
@@ -1318,8 +1330,12 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
 
 // ================================================================== the layer-major prompt batch
 
+static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }   // mab776 STRATA_DENSE_PROF
+
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
+    const double tq = prof_on() ? dprof_now() : 0;
+    struct Lap { double t; ~Lap() { if (t > 0) Ds41Dense::prof().begin += dprof_now() - t; } } lap_{ tq };
     if (B < 1 || B > im.cfg.prompt_batch || B > im.NC || pos0 < 0 || pos0 + B > im.cfg.ctx_max) { im.err = "bad batch"; return false; }
     if (!im.upload_inputs(tids, B, pos0)) return false;
     im.pos0 = pos0; im.batch_pos0 = pos0; im.batch = B; im.n = B; im.col0 = 0;
@@ -1439,6 +1455,11 @@ bool Ds41Dense::span_async_on() {
 }
 
 void Ds41Dense::sync() { ggml_backend_synchronize(p_->backend); }
+bool Ds41Dense::prof_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_DENSE_PROF"); return e && e[0] == '1'; }();
+    return on;
+}
+Ds41Dense::Prof & Ds41Dense::prof() { static Prof p; return p; }
 
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
@@ -1455,13 +1476,21 @@ bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
 
 bool Ds41Dense::attn_router_span(int il, int col0, int n) {
     Impl & im = *p_;
+    const bool pr = prof_on();
+    double tq = pr ? dprof_now() : 0;
+    auto lap = [&](double & acc) { if (pr) { const double u = dprof_now(); acc += u - tq; tq = u; } };
     if (!upload_span(im, col0, n)) return false;
+    lap(prof().upload);
     if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // wait the pass's Engram reads here
+    lap(prof().engram);
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gc = ggml_init(p);
     ggml_cgraph * gf = build_attn(im, gc, il, n, col0);
+    lap(prof().build);
     const bool ok = im.compute(gf, false);
+    lap(prof().compute);
+    if (pr) ++prof().spans;
     ggml_free(gc);
     if (!ok) return false;
     // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
@@ -1486,6 +1515,8 @@ float * Ds41Dense::routed_dev() { return p_->cpu || !p_->routed ? nullptr : (flo
 bool Ds41Dense::finish_span(int il, int col0, int n) {
     Impl & im = *p_;
     (void) il;
+    const double tq = prof_on() ? dprof_now() : 0;
+    struct Lap { double t; ~Lap() { if (t > 0) Ds41Dense::prof().finish += dprof_now() - t; } } lap_{ tq };
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };

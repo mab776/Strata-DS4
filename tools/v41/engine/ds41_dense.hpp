@@ -107,6 +107,12 @@ public:
     /// return without waiting; call sync() once after a layer's spans, before batch_ids() / batch_wts() are read.
     static bool span_async_on();
     void sync();
+    /// mab776 STRATA_DENSE_PROF=1 (timing only, the same work runs): host-time split of the layer-major batch path in
+    /// ms - begin_batch, the span uploads, the Engram wait, graph build, compute (alloc + launch), finish spans; the
+    /// caller adds its sync() waits.  prof() is cleared by the reader.
+    struct Prof { double begin = 0, upload = 0, engram = 0, build = 0, compute = 0, finish = 0, sync = 0, alloc = 0, launch = 0; long spans = 0, reallocs = 0; };
+    static bool prof_on();
+    static Prof & prof();
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.

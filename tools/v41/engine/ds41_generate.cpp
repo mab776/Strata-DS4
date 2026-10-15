@@ -864,7 +864,11 @@ int main(int argc, char ** argv) {
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
                     }
-                    if (Ds41Dense::span_async_on()) dense.sync();   // mab776 STRATA_SPAN_ASYNC: ids / wts / fn are in now
+                    if (Ds41Dense::span_async_on()) {   // mab776 STRATA_SPAN_ASYNC: ids / wts / fn are in now
+                        const double ts = Ds41Dense::prof_on() ? now_ms() : 0;
+                        dense.sync();
+                        if (ts > 0) Ds41Dense::prof().sync += now_ms() - ts;
+                    }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
@@ -1230,6 +1234,13 @@ int main(int argc, char ** argv) {
                          "(cache open %.2f s, seed %.2f s)\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
                          (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
                          bcap > 0 ? bcap_got : sp_tail, bcap > 0 ? " from the batch" : " as passes", ph_open / 1000.0, ph_tail / 1000.0);
+            if (Ds41Dense::prof_on()) {   // mab776 STRATA_DENSE_PROF: the dense half's host split for this request
+                Ds41Dense::Prof & dp = Ds41Dense::prof();
+                std::fprintf(stderr, "dense prof: begin %.0f, upload %.0f, engram wait %.0f, build %.0f, compute %.0f (%ld spans; alloc %.0f "
+                             "with %ld buffer resizes, launch %.0f), sync %.0f, finish %.0f ms\n", dp.begin, dp.upload, dp.engram, dp.build,
+                             dp.compute, dp.spans, dp.alloc, dp.reallocs, dp.launch, dp.sync, dp.finish);
+                dp = Ds41Dense::Prof();
+            }
             if (tail_keep > 0 && ok) {   // the quality scorer's rows: req%03d.tail.f32, [tail_keep x n_vocab], last prompt row last
                 if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {
                     char nb[40];
