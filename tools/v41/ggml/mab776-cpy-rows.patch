@@ -1,0 +1,56 @@
+mab776 (overnight 2026-10-15): GGML_CUDA_CPY_ROWS=1 (opt-in) - a row-wise kernel for non-contiguous F32 -> F16/F32 copies with
+contiguous rows (the F16 key block of STRATA_KALL16 is written through such views); cpy_scalar's per-element index math
+made those copies 23 % of a 32k prefill's GPU time. Same cast, same values.
+
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -176,6 +176,41 @@
+     cpy_blck(cx + x_offset, cdst + dst_offset);
+ }
+ 
++
++// mab776 (Strata-DSV4.1 overnight): GGML_CUDA_CPY_ROWS=1 - a non-contiguous F32 -> F16 / F32 copy whose rows are
++// contiguous on both sides (same shape, element stride 1) runs one block per row instead of cpy_scalar's per-element
++// int64 index math (8 divisions an element; 1.25 ms for 134 M elements).  Same cast, same values.
++template <typename dst_t>
++static __global__ void cpy_rows_f32(const char * cx, char * cdst, const int64_t ne00, const int64_t ne01, const int64_t ne02,
++                                    const int64_t nb01, const int64_t nb02, const int64_t nb03,
++                                    const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++    const int64_t r = blockIdx.x;
++    const int64_t i01 = r % ne01, i02 = (r / ne01) % ne02, i03 = r / (ne01 * ne02);
++    const float * x = (const float *) (cx + i01*nb01 + i02*nb02 + i03*nb03);
++    dst_t * y = (dst_t *) (cdst + i01*nb11 + i02*nb12 + i03*nb13);
++    for (int64_t i = threadIdx.x; i < ne00; i += blockDim.x) {
++        y[i] = ggml_cuda_cast<dst_t>(x[i]);
++    }
++}
++
++static bool ggml_cuda_cpy_rows_try(const ggml_tensor * src0, ggml_tensor * src1, cudaStream_t stream) {
++    static const bool on = [] { const char * e = getenv("GGML_CUDA_CPY_ROWS"); return e && atoi(e) != 0; }();
++    if (!on || src0->type != GGML_TYPE_F32 || (src1->type != GGML_TYPE_F16 && src1->type != GGML_TYPE_F32)) return false;
++    if (src0->nb[0] != 4 || src1->nb[0] != (size_t) ggml_type_size(src1->type)) return false;
++    for (int d = 0; d < 4; ++d) if (src0->ne[d] != src1->ne[d]) return false;
++    const int64_t nrows = src0->ne[1] * src0->ne[2] * src0->ne[3];
++    if (nrows <= 0 || nrows > INT_MAX || src0->ne[0] <= 0) return false;
++    const int nt = src0->ne[0] >= 256 ? 256 : 128;
++    if (src1->type == GGML_TYPE_F16)
++        cpy_rows_f32<half><<<(unsigned) nrows, nt, 0, stream>>>((const char *) src0->data, (char *) src1->data, src0->ne[0], src0->ne[1], src0->ne[2],
++            src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[1], src1->nb[2], src1->nb[3]);
++    else
++        cpy_rows_f32<float><<<(unsigned) nrows, nt, 0, stream>>>((const char *) src0->data, (char *) src1->data, src0->ne[0], src0->ne[1], src0->ne[2],
++            src0->nb[1], src0->nb[2], src0->nb[3], src1->nb[1], src1->nb[2], src1->nb[3]);
++    CUDA_CHECK(cudaGetLastError());
++    return true;
++}
++
+ template<typename src_t, typename dst_t>
+ static __global__ void cpy_scalar_contiguous(const char * cx, char * cdst, const int64_t ne) {
+     const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+@@ -473,6 +508,7 @@
+         {
+             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+         }
++    } else if (!contiguous_srcs && ggml_cuda_cpy_rows_try(src0, src1, main_stream)) {   // mab776 GGML_CUDA_CPY_ROWS
+     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
