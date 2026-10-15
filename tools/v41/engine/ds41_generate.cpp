@@ -276,6 +276,33 @@ struct Lookup {
     }
 };
 
+// mab776 STRATA_NAN_GUARD=1 (opt-in; the V4 fork's M13 = upstream Strata 0.1.43 #879): a row of logits holding a NaN or
+// an infinity ends the request `DONE ... nonfinite` (Strata 0.1.43.1's server understands it) and emits none of that
+// pass's tokens; the conversation state that may carry the poison (history, snapshot, DSpark window) is dropped, so the
+// next request reads from token 0.  An exponent-bit scan (~10 us a row).  STRATA_NAN_INJECT=<k>[,<k>..] (test only)
+// flags the k-th checked row set.
+bool nan_guard_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_NAN_GUARD"); return e && std::atoi(e) != 0; }();
+    return on;
+}
+bool rows_nonfinite(const float * lg, int nv, int rows) {
+    if (!nan_guard_on()) return false;
+    static std::vector<long long> inject = [] {
+        std::vector<long long> v;
+        if (const char * e = std::getenv("STRATA_NAN_INJECT"))
+            for (const char * q = e; *q;) { char * end = nullptr; v.push_back(std::strtoll(q, &end, 10)); q = *end ? end + 1 : end; }
+        return v;
+    }();
+    static long long checked = 0;
+    ++checked;
+    if (std::find(inject.begin(), inject.end(), checked) != inject.end()) return true;
+    const uint32_t * u = (const uint32_t *) lg;
+    const size_t m = (size_t) nv * (size_t) rows;
+    for (size_t i = 0; i < m; ++i)
+        if ((u[i] & 0x7f800000u) == 0x7f800000u) return true;   // exponent all ones: an infinity or a NaN
+    return false;
+}
+
 double log_softmax_at(const float * lg, int nv, int tok) {
     const float mx = *std::max_element(lg, lg + nv);
     double z = 0;
@@ -1248,6 +1275,8 @@ int main(int argc, char ** argv) {
             bcap_n = 0;
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             double ph_regrow = 0;
+            bool nonfinite = false;   // mab776 STRATA_NAN_GUARD
+            if (ok && total > reused && rows_nonfinite(last_logits.data(), nv, 1)) nonfinite = true;
             if (kept) {   // mab776 STRATA_KEEP_CACHE: the batch buffers went back (feed's release_chunk); refill the tail
                 const double tr0 = now_ms();
                 tier.set_keep_batch(false);
@@ -1267,7 +1296,7 @@ int main(int argc, char ** argv) {
             int sp_ids[5] = {0}, sp_tmp[5];
             float sp_conf[5];
 #if defined(DS41_HAVE_DSPARK)
-            if (ok && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
+            if (ok && sp_tail > 0 && !nonfinite) {   // the tail through pass_v (chunks of <= 16), the cache open; routing as the passes
                 const double to0 = now_ms();
                 if (defer_vram && !cache_open) {
                     if (!open_cache()) { ferr = "VRAM seed failed: " + err; ok = false; }
@@ -1371,7 +1400,7 @@ int main(int argc, char ** argv) {
             tier.reset_stats();
             const double td0 = now_ms();
             int gen = 0, pos = total;
-            const char * finish = "length";
+            const char * finish = nonfinite ? "nonfinite" : "length";   // mab776 STRATA_NAN_GUARD
             std::vector<float> lg = last_logits;
 #if defined(DS41_HAVE_DSPARK)
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
@@ -1389,7 +1418,7 @@ int main(int argc, char ** argv) {
             static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
             const int LK = temp > 0 ? lk_env : lk_env_g;
             long lk_passes = 0, lk_drafts = 0, lk_acc = 0;
-            if (sp_t >= 0) {
+            if (sp_t >= 0 && !nonfinite) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
                 std::vector<int> vt;
@@ -1444,6 +1473,7 @@ int main(int argc, char ** argv) {
                     for (int i = 0; i < nd; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
+                    if (rows_nonfinite(vlog.data() + (size_t) r0 * nv, nv, nd + 1)) { nonfinite = true; finish = "nonfinite"; break; }
                     int acc = 0, tn = -1;
                     for (; acc < nd; ++acc) {
                         sample_dist(vlog.data() + (size_t) (r0 + acc) * nv, nv, temp, tk, top_p, min_p, dist);
@@ -1475,7 +1505,7 @@ int main(int argc, char ** argv) {
                 sv_pass += rq_pass; sv_acc += rq_acc;
             }
 #endif
-            while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
+            while (sp_t < 0 && !nonfinite && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
                 const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
                 std::printf("T %d\n", tok);
@@ -1486,8 +1516,19 @@ int main(int argc, char ** argv) {
                 if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
+                if (rows_nonfinite(lg.data(), nv, 1)) { nonfinite = true; finish = "nonfinite"; break; }
             }
             const double dec_ms = now_ms() - td0;
+            if (nonfinite) {   // mab776 STRATA_NAN_GUARD: everything that may carry the poison goes; the next request reads from 0
+                std::fprintf(stderr, "serve: non-finite logits (#879) after %d tokens: the request ends (DONE nonfinite); the "
+                                     "history, the snapshot and the DSpark window are dropped\n", gen);
+                hist.clear();
+                snap_len = -1;
+#if defined(DS41_HAVE_DSPARK)
+                if (dsp) dsp->reset();
+                dsp_next = -1;
+#endif
+            }
             const Ds41MoeStats st = tier.stats();
             if (std::strcmp(finish, "error") == 0) {
                 std::fprintf(stderr, "serve: decode failed: %s\n", ferr.c_str());
