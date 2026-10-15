@@ -407,6 +407,7 @@ struct Gpu {
     /// run_chunk's MMQ on PTQ1_0: the run's ternary matrices transcoded to Q2_0 here (ds41_transcode, lossless)
     void* m_tc = nullptr;
     size_t m_tc_cap = 0;
+    bool m_tc_full = false;   ///< mab776 STRATA_TC_KEEP: m_tc holds the whole cap (kept across launches)
 #if defined(DS4_MOE_MMQ)
     /// Created once and never destroyed: a binary that also links ggml-cuda (mimo_generate's dense backend) resolves
     /// ~ggml_backend_cuda_context to ggml-cuda's real one, which segfaults on the context strata_mmq built.
@@ -418,6 +419,7 @@ struct Gpu {
         m_gu = m_h = m_xg = m_xu = m_xd = m_bnd = m_iota = m_tc = nullptr;
         m_rows = 0;
         m_tc_cap = 0;
+        m_tc_full = false;
     }
 
     void close() {
@@ -4084,24 +4086,44 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         size_t tc_max = SIZE_MAX;
         if (strided && MP.SL2 > 0) {
             const size_t want = (size_t) std::max<int64_t>(1, gp.c_half / SL) * MP.SL2;
-            if (gp.m_tc_cap < want) {
+            // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
+            // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
+            // per MMQ launch
+            const char* tce = std::getenv("STRATA_MMQ_TC_GIB");
+            const size_t tc_cap = (size_t) ((tce ? std::atof(tce) : 1.0) * 1073741824.0);
+            // mab776 STRATA_TC_KEEP=1: the region is allocated once instead of per launch.  `want` (a device half of
+            // experts at their Q2_0 size, ~1.4 GiB) is above the cap for V4.1's classes, so `m_tc_cap < want` held on
+            // EVERY launch: cudaFree + cudaMemGetInfo + cudaMalloc each time (s5 2026-10-15, a 475-token prompt: 762
+            // cudaMalloc + 782 cudaFree = 2.3 s of host time against 0.8 s of GPU kernels, and each cudaFree waits for
+            // the device).  tc_keep takes tc_cap once (a sub-run then holds min(want, tc_cap) / SL2 experts, what the
+            // per-launch allocation gave) until free_mmq; reuse is ordered by gp.s like any kept region.  The MoE
+            // products are tile-only (mmq-deterministic.patch), so the sub-run split cannot change an output.
+            static const bool tc_keep = [] { const char* e = std::getenv("STRATA_TC_KEEP"); return e && e[0] == '1'; }();
+            if (!(tc_keep && gp.m_tc && gp.m_tc_full) && gp.m_tc_cap < want) {
                 if (gp.m_tc) cudaFree(gp.m_tc);
                 gp.m_tc = nullptr;
                 gp.m_tc_cap = 0;
+                gp.m_tc_full = false;
                 size_t fr = 0, tot = 0;
                 cudaMemGetInfo(&fr, &tot);
                 const size_t keep = (size_t) 2 << 30;   // room for the dense pass buffer (grows with the prompt)
-                // at most STRATA_MMQ_TC_GIB (1): taking all the free VRAM squeezed the next-layer prestage region
-                // (3.00 -> 1.37 GiB) and cost the dense half ~1.2 s on an 8K prompt; 1 GiB = ~80 transcoded experts
-                // per MMQ launch
-                const char* tce = std::getenv("STRATA_MMQ_TC_GIB");
-                const size_t tc_cap = (size_t) ((tce ? std::atof(tce) : 1.0) * 1073741824.0);
-                size_t got = fr > keep ? std::min(std::min(want, tc_cap), fr - keep) : 0;
-                got = got / MP.SL2 * MP.SL2;
-                if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
-                else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
+                if (tc_keep && fr > keep + tc_cap) {
+                    if (cudaMalloc(&gp.m_tc, tc_cap) == cudaSuccess) {
+                        gp.m_tc_cap = tc_cap;
+                        gp.m_tc_full = true;
+                    } else {
+                        (void) cudaGetLastError();
+                        gp.m_tc = nullptr;
+                    }
+                }
+                if (!gp.m_tc_full) {
+                    size_t got = fr > keep ? std::min(std::min(want, tc_cap), fr - keep) : 0;
+                    got = got / MP.SL2 * MP.SL2;
+                    if (got >= MP.SL2 && cudaMalloc(&gp.m_tc, got) == cudaSuccess) gp.m_tc_cap = got;
+                    else { (void) cudaGetLastError(); gp.m_tc = nullptr; }
+                }
             }
-            tc_max = gp.m_tc_cap / MP.SL2;
+            tc_max = gp.m_tc_full ? std::min(want, tc_cap) / MP.SL2 : gp.m_tc_cap / MP.SL2;
             if (tc_max == 0) strided = false;
         }
         if (strided) {   // sub-runs of at most m_rows entries (one expert has <= n <= m_rows) and tc_max experts
