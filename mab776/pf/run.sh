@@ -32,10 +32,10 @@ echo "$L ready after $(( $(date +%s) - t0 )) s" | tee -a $O/$L.log
 first=1
 for d in $DEPTHS; do
   nonce=$L-$t0; [ "${DUMP:-0}" = 1 ] && [ $first = 1 ] && nonce=klgate; first=0
-  python3 $B/strata_bench.py ${d%%:*} --offset ${d##*:} --ratio 3.1 --url $U --nonce $nonce --label $L --gen ${GEN:-128} 2>&1 | tail -1 | tee -a $O/$L.jsonl
+  timeout ${BENCH_TO:-1500} python3 $B/strata_bench.py ${d%%:*} --offset ${d##*:} --ratio 3.1 --url $U --nonce $nonce --label $L --gen ${GEN:-128} 2>&1 | tail -1 | tee -a $O/$L.jsonl
   echo "   RAM $(free -g | awk 'NR==2{print $3" used / "$7" avail GiB"}') | VRAM $(nvidia-smi --query-gpu=memory.used --format=csv,noheader | paste -sd/) | ctr $(docker stats --no-stream --format '{{.MemUsage}}' ds41-pf)" | tee -a $O/$L.log
 done
-[ "${TURNS:-0}" = 1 ] && python3 $W/mab776/pf/turn_bench.py $U --nonce t$L-$t0 --label $L 2>&1 | tee -a $O/$L.jsonl
+[ "${TURNS:-0}" = 1 ] && timeout 1200 python3 $W/mab776/pf/turn_bench.py $U --nonce t$L-$t0 --label $L 2>&1 | tee -a $O/$L.jsonl
 docker exec ds41-pf sh -c 'grep -E "prompt phases|^serve: prompt|chunk prof|chunk prefetch|prompt cache|chunk prestage|VRAM|tier:|enc-skip|error|ERR" /tmp/strata-ds41.log' >> $O/$L.log
 docker exec ds41-pf cat /tmp/strata-ds41.log > $O/$L.engine.log 2>/dev/null
 [ "${KEEP:-0}" = 1 ] || docker rm -f ds41-pf >/dev/null

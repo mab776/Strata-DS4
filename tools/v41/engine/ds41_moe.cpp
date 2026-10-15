@@ -652,7 +652,16 @@ struct ChunkStage {
     double ms[2] = {0, 0};           ///< the reader job's own wall time
     int64_t bytes[2] = {0, 0};       ///< what it read
     std::atomic<int64_t> total[2];   ///< blobs the job was asked for
+    /// mab776 STRATA_CPF_PERBLOB=1: per-blob "read" flags, so run_chunk consumes a slab while it still fills (no whole-
+    /// layer join before the layer's first DMA)
+    std::unique_ptr<std::atomic<uint8_t>[]> rdy[2];
+    size_t rdy_n[2] = {0, 0};
 };
+
+bool cpf_perblob() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_CPF_PERBLOB"); return e && e[0] == '1'; }();
+    return on;
+}
 
 int chunk_pf_threads() {
     static const int n = [] {
@@ -711,6 +720,11 @@ int64_t chunk_stage_build(Ds41MoeImpl& im, int s, int64_t layer) {
     cs.done[s].store(0);
     cs.cancel[s].store(0);
     cs.total[s].store((int64_t) cs.e[s].size());
+    if (cs.rdy_n[s] < cs.e[s].size() || !cs.rdy[s]) {
+        cs.rdy[s].reset(new std::atomic<uint8_t>[std::max<size_t>(cs.e[s].size(), (size_t) im.g.n_experts)]);
+        cs.rdy_n[s] = std::max<size_t>(cs.e[s].size(), (size_t) im.g.n_experts);
+    }
+    for (size_t i = 0; i < cs.e[s].size(); ++i) cs.rdy[s][i].store(0, std::memory_order_relaxed);
     cs.layer[s] = layer;
     return at;
 }
@@ -746,6 +760,8 @@ void chunk_stage_run(Ds41MoeImpl& im, int s) {
                     else im.blobs->read(L, c.e[s][(size_t) i], dst);
                     got.fetch_add((int64_t) c.len[s][(size_t) i], std::memory_order_relaxed);
                     c.done[s].fetch_add(1, std::memory_order_release);
+                    c.rdy[s][(size_t) i].store(1, std::memory_order_release);   // mab776 STRATA_CPF_PERBLOB
+                    c.rdy[s][(size_t) i].notify_all();
                 }
                 std::free(scratch);
             });
@@ -852,7 +868,9 @@ int chunk_pf_prepare(Ds41MoeImpl& im, int64_t layer, int n) {
         }
         chunk_stage_run(im, s);
     }
-    chunk_stage_join(im, s);   // the whole layer must be in the slab before its DMAs start (antirez's publish rule)
+    // the whole layer must be in the slab before its DMAs start (antirez's publish rule) - or, STRATA_CPF_PERBLOB=1,
+    // each DMA waits for its own blob's flag (gpu_run_chunk) and the slab is consumed while it still fills
+    if (!cpf_perblob()) chunk_stage_join(im, s);
     cs.cur = s;                // the slab gpu_run_chunk consumes (and the covers check looks at)
     const int64_t nx = chunk_next_routed(im, layer);
     if (nx >= 0 && nx != layer) {
@@ -4302,6 +4320,14 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 const int32_t q = im.cstage->idx[pf_slab][(size_t) order[2][k]];
                 src = im.cstage->slab[pf_slab] + im.cstage->off[pf_slab][(size_t) q];
                 ++g_pf.used;
+                if (cpf_perblob()) {   // mab776: the slab may still be filling - this blob's own flag
+                    std::atomic<uint8_t>& f = im.cstage->rdy[pf_slab][(size_t) q];
+                    if (!f.load(std::memory_order_acquire)) {
+                        const double tw = now_ms();
+                        while (!f.load(std::memory_order_acquire)) f.wait(0, std::memory_order_acquire);
+                        t_file += now_ms() - tw;
+                    }
+                }
             } else {
                 const size_t k = i - nA;
                 if (k >= wave_end) {   // a new wave reuses the slots: every DMA out of them must be done first

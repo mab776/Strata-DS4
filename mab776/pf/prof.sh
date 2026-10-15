@@ -28,7 +28,7 @@ until curl -sf -m 5 $U/v1/models >/dev/null && python3 $B/strata_bench.py 300 --
   docker ps -q -f name=ds41-pf | grep -q . || { echo "$L: died"; exit 1; }
 done
 echo "$L ready after $(( $(date +%s) - t0 )) s"
-python3 $B/strata_bench.py $NTOK --offset 5000000 --ratio 3.1 --url $U --nonce p$L-$t0 --label $L --gen 16 > $O/$L.bench 2>&1 &
+timeout 1500 python3 $B/strata_bench.py $NTOK --offset 5000000 --ratio 3.1 --url $U --nonce p$L-$t0 --label $L --gen 16 > $O/$L.bench 2>&1 &
 RP=$!
 sleep $ST
 docker exec ds41-pf $NS start --sample=none --cpuctxsw=none --output=/out/$L --force-overwrite=true && echo "capture started $(date +%T)"
