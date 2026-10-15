@@ -3842,7 +3842,11 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         ck(cudaMalloc(&gp.c_x, (size_t) n * (size_t) H * 4), "c_x");
         ck(cudaMalloc(&gp.c_xq, (size_t) n * strata::kernels::native_q8_1_bytes((int) H, 1)), "c_xq");   // its ncols <= 8
         ck(cudaMalloc(&gp.c_parts, (size_t) ne * (size_t) H * 4), "c_parts");
-        ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
+        // mab776 STRATA_LAZY_XQ=1: the grouped kernel's scratch (3 x entries x n_ff floats: 4.8 GB at 32K rows) only
+        // when a launch takes that kernel (MMQ runs never touch it)
+        static const bool lazy_scr = [] { const char* e = std::getenv("STRATA_LAZY_XQ"); return e && e[0] == '1'; }();
+        gp.c_scratch = nullptr;
+        if (!lazy_scr) ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
         ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) ne), "c_dst");
         ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) ne), "c_tok");
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
@@ -4110,6 +4114,8 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         lstart.push_back(first[(size_t) es.back()] + cnt[(size_t) es.back()]);
         const int32_t ng = (int32_t) es.size();
         if (!gp.c_xq_ok) (void) quantize_xq();   // mab776 STRATA_LAZY_XQ: the grouped kernel reads c_xq
+        if (!gp.c_scratch)                        // ... and its scratch, sized for this call's entries
+            ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes((int64_t) gp.c_tok * K, im.g.n_ff)), "c_scratch lazy");
         ck(cudaMemcpyAsync(gp.c_ptr, ptrs.data(), sizeof(unsigned long long) * es.size(), cudaMemcpyHostToDevice, gp.s), "c_ptr");
         ck(cudaMemcpyAsync(gp.c_start, lstart.data(), sizeof(int32_t) * lstart.size(), cudaMemcpyHostToDevice, gp.s), "c_start");
         ck(cudaMemcpyAsync(gp.c_ng, &ng, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "c_ng");
