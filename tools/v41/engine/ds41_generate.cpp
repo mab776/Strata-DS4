@@ -668,7 +668,8 @@ int main(int argc, char ** argv) {
         mc.exclude = pruned;
     }
     if (!tier.init(TG, &src, mc, err)) { std::fprintf(stderr, "ds41_generate: tier init: %s\n", err.c_str()); return 1; }
-    dense.set_oom_hook([&]() { return tier.release_prestage(); });   // a prompt pass that does not fit: prestage gives way
+    // a prompt pass that does not fit: prestage gives way, then (mab776) the prompt cache - one region per call
+    dense.set_oom_hook([&]() { return tier.release_prestage() || tier.release_prompt_cache(); });
     // defer the VRAM cache: the prompt's chunk + graph buffers (~4 GiB) use that VRAM first, then the cache opens into
     // it (measured) - the old fixed --vram-margin had to cover prefill and starved decode of slots.  --serve does this
     // per request: a multi-token prompt closes the cache (release_cache), the decode after it re-seeds (~0.6 s)

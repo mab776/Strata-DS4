@@ -4791,6 +4791,7 @@ bool Ds41MoeTier::release_prestage() {
     if (!im_->gpu || !im_->gpu->p_buf) return false;
     Gpu& gp = *im_->gpu;
     cudaDeviceSynchronize();   // no DMA into it and no expert kernel reading from it is still in flight
+    std::fprintf(stderr, "chunk prestage: %.2f GiB region released for the dense half\n", gp.p_cap / 1073741824.0);
     cudaFree(gp.p_buf);
     if (gp.p_copied) cudaEventDestroy(gp.p_copied);
     if (gp.p_used) cudaEventDestroy(gp.p_used);
@@ -4800,6 +4801,25 @@ bool Ds41MoeTier::release_prestage() {
     gp.p_layer = -1;
     gp.p_used_rec = false;
     gp.p_off = true;           // no prestage for the rest of this prompt (release_chunk re-arms it)
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool Ds41MoeTier::release_prompt_cache() {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->pc_buf) return false;
+    Gpu& gp = *im_->gpu;
+    cudaDeviceSynchronize();   // no fill copy into it and no expert kernel reading from it is still in flight
+    std::fprintf(stderr, "prompt cache: %.2f GiB released for the dense half (%lld slots, %lld filled, %lld expert "
+                         "launches served from VRAM so far)\n", gp.pc_cap / 1073741824.0, (long long) gp.pc_slots,
+                 (long long) gp.pc_fills, (long long) gp.pc_hit_e);
+    cudaFree(gp.pc_buf);
+    gp.pc_buf = nullptr;       // pc_tried stays set: no new cache for the rest of this prompt (release_chunk re-arms it)
+    gp.pc_cap = 0;
+    gp.pc_ptr.clear();
+    gp.pc_fill.clear();
     return true;
 #else
     return false;

@@ -485,6 +485,10 @@ public:
     /// Gives the layer-prestage region back (VRAM for the dense half when its pass buffer would not fit); prestage
     /// stays off until release_chunk.  False when there was none.
     bool release_prestage();
+    /// mab776: gives the prompt cache's VRAM back (the same use, after release_prestage: a deep prompt's pass buffer
+    /// outgrows STRATA_PROMPT_CACHE_KEEP_GIB); the prompt's later batches read those experts from the file tier
+    /// again, and no new cache opens until release_chunk.  False when there was none.
+    bool release_prompt_cache();
     /// Closes the VRAM expert cache and gives its device memory back (--serve: a multi-token prompt needs that VRAM
     /// for its pass / chunk buffers, as the one-shot deferred seed).  Every expert is then an arena / file-tier
     /// expert until the next seed_from_ranked, which reopens the cache (sized by set_slot_gib) and refills it; the

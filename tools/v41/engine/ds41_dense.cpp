@@ -50,6 +50,7 @@ struct Allo {
     uint64_t epoch = 0;
     std::map<const ggml_cgraph *, uint64_t> graph_epoch;
     std::set<const void *> compute_bufs;
+    bool failed = false;   // mab776: the last alloc failed (see alloc)
     ~Allo() { if (a) ggml_gallocr_free(a); }
     bool alloc(ggml_cgraph * g, bool reuse) {
         auto it = graph_epoch.find(g);
@@ -67,7 +68,12 @@ struct Allo {
             for (int i = 0; i < g->n_leafs; ++i) unbind(g->leafs[i]);
         }
         const size_t before = ggml_gallocr_get_buffer_size(a, 0);
-        if (!ggml_gallocr_alloc_graph(a, g)) return false;
+        // mab776: a failed reserve has freed the buffer but kept the failed graph's plan, so the next
+        // ggml_gallocr_alloc_graph sees no need to reserve and binds the tensors to the NULL buffer (the segfault of
+        // the oom_hook retry): reserve explicitly first.  The old buffer is gone, so every graph bound to it is stale.
+        if (failed && !ggml_gallocr_reserve(a, g)) return false;
+        failed = false;
+        if (!ggml_gallocr_alloc_graph(a, g)) { failed = true; ++epoch; return false; }
         if (ggml_gallocr_get_buffer_size(a, 0) != before && before != 0) ++epoch;
         auto note = [&](const ggml_tensor * t) {
             if (!t || !t->buffer) return;
@@ -449,8 +455,8 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
         dp.alloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
         if (a.a && ggml_gallocr_get_buffer_size(a.a, 0) != sz0) ++dp.reallocs;
     }
-    if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
-        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
+    while (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more (each call frees one region)
+        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - the tier gave VRAM back, retrying\n");
         ok_alloc = a.alloc(gf, false);
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }

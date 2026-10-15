@@ -125,7 +125,7 @@ public:
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
     /// Called when a graph's buffer cannot be allocated; return true if it freed device memory (the allocation is
-    /// then retried once).  E.g. the expert tier's prestage region.
+    /// then retried, and the hook called again while it fails).  E.g. the expert tier's prestage region.
     void set_oom_hook(std::function<bool()> hook);
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
