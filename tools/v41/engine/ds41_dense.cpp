@@ -181,6 +181,10 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_lastblk = nullptr;    // F32 [NC]   (nvis - 1) / block size: the pinned candidate block (ratio 1)
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
+    // mab776 STRATA_KALL16=1: the attention's per-query keys assembled in place as F16 [DH, kall_m, S] (window rows, then
+    // the top-k compressed rows; the pad rows stay zero) - instead of concat + pad + cast of the F32 gathers
+    ggml_tensor * kall16 = nullptr;
+    int64_t kall_m = 0;
     ggml_tensor * blk_ramp = nullptr;     // F32 [cmax1 / CBS + 1]  i (constant)
 
     // ---- the pass
@@ -459,6 +463,11 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 #endif
 }
 
+static bool kall16_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_KALL16"); return e && e[0] == '1'; }();
+    return on;
+}
+
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
     using L_t = Ds41Dense::Impl::Layer;
     L_t & L = im.ly[(size_t) il];
@@ -623,20 +632,36 @@ static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il,
     }
 
     // ---- attention: per query its window rows + its top-k compressed rows, one flash-attn with the query as batch
-    ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                                 // [DH, M, n]
     ggml_tensor * Mall = Mc ? ggml_concat(gc, Mw, Mc, 0) : Mw;                                 // [M, n]
-    int64_t M = Kall->ne[1];
-    if (!im.cpu && M % 256) {   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
-        const int64_t pad = 256 - M % 256;
-        Kall = ggml_pad(gc, Kall, 0, (int) pad, 0, 0);
-        Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, pad, n), NEG_INF), 0);
-        M += pad;
+    const int64_t M0 = SWA + (Kc ? Kc->ne[1] : 0);
+    const int64_t Mp = im.cpu ? M0 : (M0 + 255) / 256 * 256;
+    ggml_tensor * k4 = nullptr, * kdep = nullptr;
+    if (im.kall16 && n <= im.kall16->ne[2] && Mp <= im.kall_m) {
+        // mab776 STRATA_KALL16: the F32 gathers convert straight into their rows of the persistent F16 block (same
+        // values as concat + pad + cast: the pad rows hold zeros, or a previous pass's finite keys - masked to -inf
+        // either way).  The flash-attn reads a view of it: it depends on the window copy through the view and on
+        // the compressed copy through kdep (src[5], a dependency marker - and both copies sit earlier in the graph).
+        ggml_tensor * kb = im.kall16;
+        ggml_tensor * tw = ggml_cpy(gc, Kw, ggml_view_3d(gc, kb, DH, SWA, n, kb->nb[1], kb->nb[2], 0));
+        ggml_build_forward_expand(gf, tw);
+        if (Kc) {
+            kdep = ggml_cpy(gc, Kc, ggml_view_3d(gc, kb, DH, Kc->ne[1], n, kb->nb[1], kb->nb[2], (size_t) SWA * kb->nb[1]));
+            ggml_build_forward_expand(gf, kdep);
+        }
+        k4 = ggml_view_4d(gc, tw, DH, Mp, 1, n, kb->nb[1], (size_t) Mp * kb->nb[1], kb->nb[2], 0);
+    } else {
+        ggml_tensor * Kall = Kc ? ggml_concat(gc, Kw, Kc, 1) : Kw;                             // [DH, M, n]
+        if (Mp != M0) Kall = ggml_pad(gc, Kall, 0, (int) (Mp - M0), 0, 0);   // ggml-cuda's flash-attn for d 512 wants the key count a multiple of 256
+        k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, Mp, 1, n), GGML_TYPE_F16);
     }
-    ggml_tensor * k4 = ggml_cast(gc, ggml_reshape_4d(gc, Kall, DH, M, 1, n), GGML_TYPE_F16);
+    if (Mp != M0)
+        Mall = ggml_concat(gc, Mall, ggml_fill(gc, ggml_new_tensor_2d(gc, GGML_TYPE_F32, Mp - M0, n), NEG_INF), 0);
+    const int64_t M = Mp;
     ggml_tensor * q4 = ggml_permute(gc, ggml_reshape_4d(gc, q, DH, NH, 1, n), 0, 2, 1, 3);    // [DH, 1, NH, n]
     ggml_tensor * m4 = ggml_cast(gc, ggml_reshape_4d(gc, Mall, M, 1, 1, n), GGML_TYPE_F16);
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
+    if (kdep) o->src[5] = kdep;   // mab776 STRATA_KALL16: the compressed rows' copy happens before the read
     o = ggml_reshape_3d(gc, o, DH, NH, n);
     o = b.rope(o, pos, r, true);                                                               // de-RoPE the output
     // grouped output LoRA (model.py: einsum over groups) then wo_b
@@ -1087,6 +1112,10 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
     auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
     im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
     im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
+    if (kall16_on() && !im.cpu) {   // zeroed with ibuf below: rows past a pass's keys must stay finite (they are masked)
+        im.kall_m = (im.SWA + im.ITOP + 255) / 256 * 256;
+        im.kall16 = ggml_new_tensor_3d(im.ictx, GGML_TYPE_F16, im.DH, im.kall_m, im.S);
+    }
     im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
     if (!im.ibuf) { err = "cannot allocate the inputs"; return false; }
     ggml_backend_buffer_clear(im.ibuf, 0);
