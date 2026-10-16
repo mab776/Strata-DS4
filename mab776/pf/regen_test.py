@@ -2,7 +2,7 @@
 """mab776: the regenerate path - the same greedy prompt three times (the 2nd and 3rd take the snapshot + saved logits,
 no prefill).  The output must not change; with STRATA_DSPARK_SNAP=1 the repeats draft with DSpark from the first token.
   regen_test.py URL LABEL"""
-import json, sys
+import json, os, sys
 sys.path.insert(0, "/home/mab776/Documents/portainer/strata-coder/bench")
 from ple_bench import corpus  # noqa: E402
 from strata_bench import call, last_request  # noqa: E402
@@ -23,3 +23,5 @@ for i in range(3):
                       "gen": m.get("output_tokens"), "drafts": [m.get("drafts_offered"), m.get("drafts_accepted")],
                       "same_as_first": out == first, "same_as_prev": out == prev}), flush=True)
     prev = out
+    if os.environ.get("REGEN_OUT"):
+        open(os.environ["REGEN_OUT"] + f".{i}.txt", "w").write(out)
