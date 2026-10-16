@@ -396,6 +396,17 @@ struct Gpu {
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
          *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
+    /// mab776 STRATA_WAVE_LAYER=1 (lw_start): a small batch's file-tier blobs of EVERY class pass of layer lw_layer,
+    /// read in one queue into the bounce halves before the first pass (-1 = none; the passes then read their own)
+    std::unique_ptr<ReadPool> lw_pool;
+    int64_t lw_layer = -1;
+    std::vector<int32_t> lw_slot;                       ///< per expert of lw_layer: its index below, -1 = not queued
+    std::vector<std::pair<int32_t, int32_t>> lw_blob;   ///< (expert, class), in read order = the passes' order
+    std::vector<uint8_t*> lw_ptr;                       ///< each queued blob's place in c_bounce
+    std::unique_ptr<std::atomic<int>[]> lw_ready, lw_pdone;
+    size_t lw_cap = 0;
+    uint8_t* lw_spare = nullptr;                        ///< a pass's blob the queue does not have (never expected)
+    int64_t lw_layers = 0, lw_blobs_n = 0, lw_miss = 0;
     float* c_hparts = nullptr;
     cudaStream_t s_cp = nullptr;
     cudaEvent_t c_copied[2] = {}, c_used[2] = {};
@@ -444,8 +455,10 @@ struct Gpu {
         if (h_parts) cudaFreeHost(h_parts);
         for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
+        lw_pool.reset();   // its readers write c_bounce: gone first
         for (uint8_t* p : c_bounce)
             if (p) cudaFreeHost(p);
+        if (lw_spare) cudaFreeHost(lw_spare);
         if (c_hparts) cudaFreeHost(c_hparts);
         for (int i = 0; i < 2; ++i) {
             if (c_copied[i]) cudaEventDestroy(c_copied[i]);
@@ -5325,7 +5338,9 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                 }
             });
     };
-    if (nF && pf_slab < 0) {
+    // mab776 STRATA_WAVE_LAYER: lw_start queued this layer's file blobs (every class pass's) before the first pass
+    const bool lw = gp.lw_layer == layer && pf_slab < 0;
+    if (nF && pf_slab < 0 && !lw) {
         // the bounce slots are shared by every class pass: the previous pass returned (non-last passes do not
         // sync) with its DMAs out of them possibly still queued on s_cp - the readers must not overwrite them yet
         ck(cudaStreamSynchronize(gp.s_cp), "bounce free");
@@ -5362,6 +5377,24 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
                         while (!f.load(std::memory_order_acquire)) f.wait(0, std::memory_order_acquire);
                         t_file += now_ms() - tw;
                     }
+                }
+            } else if (lw) {   // mab776 STRATA_WAVE_LAYER: the layer queue's slot (its own place in c_bounce)
+                const int32_t e = order[2][i - nA];
+                const int32_t q = gp.lw_slot[(size_t) e];
+                if (q >= 0) {
+                    std::atomic<int>& f = gp.lw_ready[(size_t) q];
+                    if (!f.load(std::memory_order_acquire)) {
+                        const double tw = now_ms();
+                        while (!f.load(std::memory_order_acquire)) f.wait(0, std::memory_order_acquire);
+                        t_file += now_ms() - tw;
+                    }
+                    src = gp.lw_ptr[(size_t) q];
+                } else {   // not queued (lw_start's classification missed it): read it here, into the spare
+                    ++gp.lw_miss;
+                    ck(cudaStreamSynchronize(gp.s_cp), "lw spare free");   // its previous DMA is done
+                    if (!gp.lw_spare) ck(cudaMallocHost((void**) &gp.lw_spare, (size_t) im.blob), "lw spare");
+                    im.blobs->read(layer, e, gp.lw_spare);
+                    src = gp.lw_spare;
                 }
             } else {
                 const size_t k = i - nA;
@@ -5412,7 +5445,7 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
     }
     for (auto& t : readers) t.join();
     const int64_t n_file = (int64_t) nF;
-    if (prof && nF && pf_slab < 0) {
+    if (prof && nF && pf_slab < 0 && !lw) {
         g_cprof.file_rd += now_ms() - t_rd0;
         g_cprof.rd_busy += t_rd_last.load() - t_rd0;
         g_cprof.file_gb += (double) nF * (double) BL / 1e9;
@@ -5522,6 +5555,115 @@ bool gpu_run_chunk(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
 #endif
 
 #if defined(DS4_MOE_CUDA)
+// mab776 STRATA_WAVE_LAYER=1 (opt-in): a batch without a chunk-prefetch slab for `layer` (small serve turns) reads
+// the routed file-tier blobs of EVERY class pass in ONE queue started here, before the first pass.  The passes used to
+// start their own reads as each began (gpu_run_chunk's start_wave: a bounce sync, 32 new threads, the wave's tail), so
+// the drives idled between the up to 9 class passes of a layer: a +300-token turn read at ~6.7 GB/s where the two
+// drives give 9.05 (raw O_DIRECT, 1.25 MiB parts).  The same blobs go into pinned bounce slots of their own and the
+// passes DMA and launch exactly as before (each waits for its blob's flag instead of its wave's), so the output is
+// unchanged.  The classification is the passes' own (gpu_run_chunk: no VRAM slot, no prompt-cache copy, not in the
+// arena, not GPU 1's); a pass blob the queue lacks is read on the spot (counted: lw_miss).  Off, or a layer whose
+// blobs do not fit the two bounce halves: the passes read as before.
+static bool wave_layer_on() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_WAVE_LAYER"); return e && e[0] == '1'; }();
+    return on;
+}
+
+static void lw_start(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids) {
+    Gpu& gp = *im.gpu;
+    gp.lw_layer = -1;
+    if (!wave_layer_on() || !gp.c_ready || !gp.c_bounce[0] || !gp.c_bounce[1] || gp.c_bhalf <= 0 || !im.blobs) return;
+    if (im.cstage && im.cstage->layer[im.cstage->cur] == layer) return;   // the slab has this layer's file tier
+    const int64_t NX = im.g.n_experts, NE = (int64_t) n * im.g.top_k;
+    const bool g1_on = im.g1 && im.g1->c_n1 > 0;
+    const bool pc_on = gp.pc_buf != nullptr;
+    std::vector<uint8_t> routed((size_t) NX, 0);
+    for (int64_t j = 0; j < NE; ++j) {
+        const int32_t e = ids[j];
+        if (e < 0 || e >= NX) return;
+        if (g1_on && im.g1->c_took[(size_t) e]) continue;   // GPU 1's share: not a GPU 0 pass's
+        routed[(size_t) e] = 1;
+    }
+    auto is_file = [&](int64_t e) {
+        const int32_t sl = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
+        if (sl >= 0) return false;
+        if (pc_on && gp.pc_fill[(size_t) (layer * NX + e)]) return false;
+        return gp.arena.ptr(layer, e) == nullptr;
+    };
+    std::vector<int> cl;   // chunk_classes' pass order: ascending class; inside a pass, ascending expert ids
+    for (int64_t e = 0; e < NX; ++e)
+        if (routed[(size_t) e]) {
+            const int c = im.g.cls(layer, e);
+            if (std::find(cl.begin(), cl.end(), c) == cl.end()) cl.push_back(c);
+        }
+    std::sort(cl.begin(), cl.end());
+    gp.lw_slot.assign((size_t) NX, -1);
+    gp.lw_blob.clear();
+    gp.lw_ptr.clear();
+    int half = 0;
+    size_t at = 0;
+    for (int c : cl)
+        for (int64_t e = 0; e < NX; ++e) {
+            if (!routed[(size_t) e] || im.g.cls(layer, e) != c || !is_file(e)) continue;
+            const size_t b = ((size_t) im.bl[(size_t) c] + 4095) & ~(size_t) 4095;
+            if (at + b > (size_t) gp.c_bhalf) {
+                if (half == 1) return;   // does not fit: the passes read as before
+                half = 1;
+                at = 0;
+            }
+            gp.lw_slot[(size_t) e] = (int32_t) gp.lw_blob.size();
+            gp.lw_blob.push_back({(int32_t) e, c});
+            gp.lw_ptr.push_back(gp.c_bounce[half] + at);
+            at += b;
+        }
+    const size_t nb = gp.lw_blob.size();
+    if (nb == 0) return;
+    if (nb > gp.lw_cap) {
+        gp.lw_cap = std::max(nb, (size_t) 256);
+        gp.lw_ready.reset(new std::atomic<int>[gp.lw_cap]);
+        gp.lw_pdone.reset(new std::atomic<int>[gp.lw_cap]);
+    }
+    for (size_t q = 0; q < nb; ++q) {
+        gp.lw_ready[q].store(0, std::memory_order_relaxed);
+        gp.lw_pdone[q].store(0, std::memory_order_relaxed);
+    }
+    // the previous layer's passes DMA'd out of the same halves: all of it done before the readers write them
+    // (its last pass synced its compute stream, so this is normally already true)
+    ck(cudaStreamSynchronize(gp.s_cp), "lw bounce free");
+    if (!gp.lw_pool) gp.lw_pool = std::make_unique<ReadPool>();
+    static const size_t P = (size_t) (std::getenv("STRATA_WAVE_PARTS") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_WAVE_PARTS")))) : 8);
+    gp.lw_layer = layer;
+    ++gp.lw_layers;
+    gp.lw_blobs_n += (int64_t) nb;
+    Gpu* g = &gp;
+    Ds41BlobSource* src = im.blobs;
+    gp.lw_pool->start(nb * P, [g, src, layer](size_t x) {
+        const size_t q = x / P;
+        if (P == 1) src->read(layer, g->lw_blob[q].first, g->lw_ptr[q]);
+        else src->read_part(layer, g->lw_blob[q].first, (int) (x % P), (int) P, g->lw_ptr[q]);
+        if (P == 1 || g->lw_pdone[q].fetch_add(1, std::memory_order_acq_rel) + 1 == (int) P) {   // the blob's last part
+            g->lw_ready[q].store(1, std::memory_order_release);
+            g->lw_ready[q].notify_all();
+        }
+    });
+}
+
+static void lw_end(Ds41MoeImpl& im) {
+    Gpu& gp = *im.gpu;
+    if (gp.lw_layer < 0) return;
+    gp.lw_pool->wait();   // every blob was consumed by a pass, so the readers are done
+    gp.lw_layer = -1;
+    static int64_t said = 0, said_miss = 0;
+    const int64_t nl = gp.lw_layers;
+    const bool pow10 = nl == 1 || nl == 10 || nl == 100 || nl == 1000 || nl % 10000 == 0;
+    if ((pow10 && nl != said) || gp.lw_miss > said_miss) {   // at layers 1 / 10 / 100 / 1000 / every 10000, and on a miss
+        said = nl;
+        said_miss = gp.lw_miss;
+        std::fprintf(stderr, "wave layer: %lld layers, %lld blobs queued, %lld read outside the queue\n",
+                     (long long) gp.lw_layers, (long long) gp.lw_blobs_n, (long long) gp.lw_miss);
+    }
+}
+
 // a chunk over every format class present (one pass each; the sum after the last)
 // the next routed layer after `layer` (wrapping: the next chunk's layer 0) gets the layer prestage
 void chunk_pstage_next(Ds41MoeImpl& im, int64_t layer) {
@@ -5555,6 +5697,8 @@ bool chunk_classes(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, co
         if (std::find(cl.begin(), cl.end(), c) == cl.end()) cl.push_back(c);
     }
     std::sort(cl.begin(), cl.end());
+    lw_start(im, layer, n, ids);   // mab776 STRATA_WAVE_LAYER (opt-in): the layer's file blobs in one queue
+    struct LwEnd { Ds41MoeImpl& im; ~LwEnd() { lw_end(im); } } lw_end_guard{im};
     for (size_t i = 0; i < cl.size(); ++i)
         if (!gpu_run_chunk(im, layer, n, ids, w, x, out, out_dev, cl[i], i == 0, i + 1 == cl.size(), x_dev)) return false;
     chunk_pstage_next(im, layer);
