@@ -36,7 +36,7 @@ def files(pattern_list, exclude=()):
     return "\n\n".join(parts)
 
 
-C = "/home/mab776/.claude/jobs/6a7c0663/tmp/corpora"
+C = "/home/mab776/Documents/portainer/ram-128gb/v41/pf/corpora"   # Gutenberg pg1041 / pg1342 / pg6099 / pg14155
 P = "/home/mab776/Documents/portainer"
 src = {
     "code": corpus()[5000000:],

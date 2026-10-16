@@ -11,7 +11,7 @@ from ple_bench import corpus  # noqa: E402
 import strata_tokenizer as ST  # noqa: E402
 import json  # noqa: E402
 
-C = "/home/mab776/.claude/jobs/6a7c0663/tmp/corpora"
+C = "/home/mab776/Documents/portainer/ram-128gb/v41/pf/corpora"   # Gutenberg pg1041 / pg1342 / pg6099 / pg14155
 P = "/home/mab776/Documents/portainer"
 TOK = "/media/mab776/nvme 2To/models/deepseek-v41/gsq/tokenizer"
 OUT = "/home/mab776/Documents/portainer/ram-128gb/v41/pf/ppl"
