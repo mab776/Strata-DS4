@@ -8,6 +8,10 @@ L=$1; BLD=$2; shift 2
 W=/home/mab776/Documents/portainer/strata-ds41; O=/home/mab776/Documents/portainer/ram-128gb/v41/pf/nsys; mkdir -p $O
 G="/media/mab776/nvme 2To/models/deepseek-v41/gsq"
 e=(); for x in "$@"; do e+=(-e "$x"); done
+# NSYS=0: the same one-shot run without the profiler (a plain decode A/B: the log's DSpark verify ms/pass, tok/s)
+NSYS_CMD=(/opt/nvidia/nsight-systems/2025.3.2/bin/nsys profile -o $O/$L --force-overwrite true -t cuda --sample=none --cpuctxsw=none
+          --cuda-graph-trace=node --delay ${DELAY:-110} --duration ${DUR:-8})
+[ "${NSYS:-1}" = 0 ] && NSYS_CMD=()
 docker rm -f ds41-nsys >/dev/null 2>&1
 timeout 900 docker run --rm --name ds41-nsys --runtime nvidia -e NVIDIA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID \
   -e STRATA_NO_LARGEPAGES=1 -e GGML_NO_BACKTRACE=1 \
@@ -20,8 +24,7 @@ timeout 900 docker run --rm --name ds41-nsys --runtime nvidia -e NVIDIA_VISIBLE_
   -v "$G:$G:ro" -v "/media/mab776/nvme 2To/models/deepseek-v41/engram-a:/media/mab776/nvme 2To/models/deepseek-v41/engram-a:ro" \
   -v /home/mab776/v41-engram/engram-b:/home/mab776/v41-engram/engram-b:ro -v $W:$W:ro -v $O:$O -v $O/../ppl:$O/../ppl:ro \
   -v /opt/nvidia/nsight-systems/2025.3.2:/opt/nvidia/nsight-systems/2025.3.2:ro strata-ds4:cu13 \
-  /opt/nvidia/nsight-systems/2025.3.2/bin/nsys profile -o $O/$L --force-overwrite true -t cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node \
-    --delay ${DELAY:-110} --duration ${DUR:-8} \
+  ${NSYS_CMD[@]} \
   $W/$BLD/ds41_generate -m "$G/V41-GSQ.gguf" --backend cuda --experts gpu \
     --engram "/media/mab776/nvme 2To/models/deepseek-v41/engram-a:/home/mab776/v41-engram/engram-b" --rank "$G/rank.bin" \
     --ctx 8192 --arena-adapt --kv-fp4 --route-bias 0.5 --route-bias-file 0.3 --arena-gib 76.5 --prompt-batch 32768 \
