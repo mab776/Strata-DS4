@@ -1152,6 +1152,13 @@ int main(int argc, char ** argv) {
                     if (rdev1) rdev1 = dense.routed_dev();
                 }
                 if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
+                // mab776 STRATA_ENGRAM_AHEAD=1 (opt-in): the next batch's Engram reads start now, behind this batch's in
+                // the reader pool, so they land while this batch computes (123k fresh: the dense half waited ~5 s on them)
+                static const bool eng_ahead = std::getenv("STRATA_ENGRAM_AHEAD") && std::getenv("STRATA_ENGRAM_AHEAD")[0] == '1';
+                if (eng_ahead && c0 + B < n) {
+                    const int B2 = std::min(PB, n - c0 - B);
+                    if (B2 >= 2 && !dense.engram_ahead(ids + c0 + B, B2, pos0 + c0 + B)) { ferr = dense.last_error(); return false; }
+                }
                 for (int l = 0; l < n_layer; ++l) {
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state

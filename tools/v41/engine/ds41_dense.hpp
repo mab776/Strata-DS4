@@ -82,6 +82,9 @@ public:
     /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
     /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
     bool begin_batch(const int * tids, int B, int pos0);
+    /// mab776 STRATA_ENGRAM_AHEAD: start the Engram reads of the NEXT layer-major batch (tids, n tokens at pos0) now, so they
+    /// run while this batch computes; that batch's begin_batch takes them.  At most one in flight; a no-op when Engram is off.
+    bool engram_ahead(const int * tids, int n, int pos0);
     /// Dense half of layer il for the batch's sub-batch starting at column col0 (n tokens, col0 % max_pass == 0):
     /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
     /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.

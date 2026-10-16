@@ -213,6 +213,12 @@ struct Ds41Dense::Impl {
     // attn_router: the whole pass's rows are read from disk while the embeddings, the init graph and the layers below
     // the first Engram layer (1) run.  Null once uploaded (or when Engram is off) - see engram_ready().
     std::shared_ptr<Ds41Engram::Batch> eng_batch;
+    // mab776 STRATA_ENGRAM_AHEAD=1: the NEXT layer-major batch's Engram reads, started while this batch computes
+    // (engram_ahead), and the (pos0, n) they are for; upload_inputs takes them instead of starting cold
+    std::vector<std::vector<float>> eng_rows_next;
+    std::shared_ptr<Ds41Engram::Batch> eng_batch_next;
+    int64_t eng_next_pos0 = -1;
+    int eng_next_n = 0;
     // mab776 STRATA_SPAN_ASYNC=1: the per-span index uploads come from this pinned buffer (one fixed region per sub-batch
     // index of a batch) on the backend's stream, so attn_router_span need not wait for the GPU between sub-batches
     ggml_backend_buffer_t span_pin = nullptr;
@@ -279,6 +285,7 @@ struct Ds41Dense::Impl {
     }
 
     ~Impl() {
+        if (eng_batch_next) { std::string e; engram.wait(eng_batch_next, e); }   // its reads write eng_rows_next
         drain();
         if (ev_sum) ggml_backend_event_free(ev_sum);
         pv_clear();
@@ -1375,7 +1382,18 @@ bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
             }
             for (size_t e = 0; e < im.eng_rows.size() && e < 2; ++e)
                 ggml_backend_tensor_set(im.i_eng[e], im.eng_rows[e].data(), 0, im.eng_rows[e].size() * 4);
+        } else if (im.eng_batch_next && im.eng_next_pos0 == pos0 && im.eng_next_n == n) {
+            // mab776 STRATA_ENGRAM_AHEAD: this batch's reads were started during the previous one - take them
+            std::swap(im.eng_rows, im.eng_rows_next);
+            im.eng_batch = std::move(im.eng_batch_next);
+            im.eng_batch_next.reset();
+            im.eng_next_pos0 = -1;
         } else {
+            if (im.eng_batch_next) {   // read ahead for another span: finish it (its buffer is ours) and drop it
+                if (!im.engram.wait(im.eng_batch_next, im.err)) return false;
+                im.eng_batch_next.reset();
+                im.eng_next_pos0 = -1;
+            }
             im.eng_batch = im.engram.start(pos0, n, im.eng_rows, im.err);
             if (!im.eng_batch) return false;
         }
@@ -1696,6 +1714,17 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     o = im.predict_out_n[{ il, (int) n }];
     if (!im.compute(it->second, true)) return false;
     ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
+    return true;
+}
+
+bool Ds41Dense::engram_ahead(const int * tids, int n, int pos0) {
+    Impl & im = *p_;
+    if (!im.engram.enabled() || n <= 64 || im.eng_batch_next) return true;   // (decode-sized reads stay synchronous)
+    for (int t = 0; t < n; ++t) im.engram.set_token(pos0 + t, tids[t]);
+    im.eng_batch_next = im.engram.start(pos0, n, im.eng_rows_next, im.err);
+    if (!im.eng_batch_next) return false;
+    im.eng_next_pos0 = pos0;
+    im.eng_next_n = n;
     return true;
 }
 
