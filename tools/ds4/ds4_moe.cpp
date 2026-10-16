@@ -1031,7 +1031,9 @@ bool ds4_moe_layer_layout(const Ds4MoeGeom& g, int64_t l, cpu::NativeFmt& f, std
 
 bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string& err) {
     try {
-        GgufFile f(gguf);
+        // every shard of a split model (unsloth UD-Q3_K_M / UD-Q4_K_XL: shard 1 = metadata only, the experts later)
+        const GgufModel m = GgufModel::open(gguf);
+        const GgufFile& f = m.meta();
         // the architecture's own key prefix: deepseek4.*, mimo2.*, ... (the key names are llama.cpp's, shared)
         std::string arch = "deepseek4";
         if (const MetaValue* a = f.get("general.architecture"); a && a->type == MetaType::STRING) arch = a->s;
@@ -1059,7 +1061,7 @@ bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string&
             for (int r = 0; r < 3; ++r) {
                 char name[64];
                 std::snprintf(name, sizeof name, "blk.%lld.ffn_%s_exps.weight", (long long) l, roles[r]);
-                const TensorInfo* ti = f.find(name);
+                const TensorInfo* ti = m.find(name);
                 if (!ti) continue;
                 ++have;
                 // ne0 is the input width: gate/up are [n_embd, n_ff, n_experts], down is [n_ff, n_embd, n_experts].
@@ -1337,6 +1339,9 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
         im_->bl[(size_t) l] = (int64_t) im_->fl[(size_t) l].bytes;
         im_->mixed_sizes = im_->mixed_sizes || im_->bl[(size_t) l] != im_->blob;
     }
+    // mab776 10-16: DS4_FORCE_MIXED=1 = a uniform file (UD-Q4_K_XL: every layer MXFP4) takes the mixed-size cache path,
+    // so --vram-grow's elastic cache (prompts on the margin, decode on the grow) works on it too
+    if (std::getenv("DS4_FORCE_MIXED") && std::atoi(std::getenv("DS4_FORCE_MIXED")) != 0) im_->mixed_sizes = true;
     if (!blobs->open(err)) return false;
     if ((int64_t) blobs->blob_bytes() != im_->blob) {
         err = "blob source is " + std::to_string(blobs->blob_bytes()) + " bytes, the geometry's is " +

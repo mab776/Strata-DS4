@@ -816,7 +816,8 @@ bool Server::init(std::string & why) {
             bmax = std::max(bmax, b);
         }
         if (bmax <= 0) { why = "slots auto: no routed experts in " + a.model; return false; }
-        if (bmin == bmax) {
+        const bool force_mixed = std::getenv("DS4_FORCE_MIXED") && std::atoi(std::getenv("DS4_FORCE_MIXED")) != 0;   // mab776 10-16
+        if (bmin == bmax && !force_mixed) {
             a.slots = (int64_t) (budget / (double) bmax);
         } else {
             slot_gib_auto = budget / 1073741824.0;
@@ -830,7 +831,7 @@ bool Server::init(std::string & why) {
         // mab776 M6 (= ds4_generate's M7a --vram-grow): the prompt chunks run on the budget above, the cache is grown
         // between prompts to leave --vram-grow GiB free (mixed blob sizes only: the elastic open)
         if (a.vram_grow >= 0) {
-            if (bmin == bmax || a.vram_grow >= a.vram_margin_gib) {
+            if ((bmin == bmax && !force_mixed) || a.vram_grow >= a.vram_margin_gib) {
                 why = "--vram-grow needs mixed expert sizes and G < --vram-margin";
                 return false;
             }
