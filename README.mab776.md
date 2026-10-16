@@ -760,3 +760,26 @@ map; V41_DECODE_OVERLAP_PLAN.md has the attribution.  Same rules as M13: env swi
   patch files (theirs: tools/v41/ggml/, ours: tools/ds4/patches/ - the argsort patch = theirs + a 3-line header), our engine
   changes stay env-switched, and a future merge resolves serve/ by taking theirs + re-applying our serve commits.
 
+
+## 128 GB quants (2026-10-16) - UD-Q4_K_XL and UD-Q3_K_M on stack 74, vs the live IQ2_M
+Trial: the 128 GB compose (mem_limit 110g) with a trial snapshot `run.q128` (6c0c1aea + commit da544a75); the live run/,
+ds4-server.json and compose were never changed, and stack 74 is back on IQ2_M (50g). Same bench as M13/M14 (ksweep2.py,
+greedy, 512 tokens, the m14-ab prompts). LCB-13 skipped (Marc 10-16). Engine fixes needed (da544a75):
+- `slots auto` read only shard 1 of a split GGUF ("no layer has routed expert tensors"): the geometry now opens every shard.
+- UD-Q4_K_XL is uniform (every expert MXFP4, 12.75 MiB) and `--vram-grow` refused uniform files: env `DS4_FORCE_MIXED=1`
+  sends it through the mixed-size (elastic) cache path. Without it (no grow, 2,305 slots) decode was the same or worse.
+
+| | IQ2_M (live, M13) | UD-Q4_K_XL | UD-Q3_K_M |
+|---|---|---|---|
+| KLD vs full | 0.484 | 0.013 | 0.157 |
+| fits? | yes, 42 GiB | yes: arena 98 GiB, 0 experts on NVMe; container 96-101 GiB, host min 10 GiB free | loads (arena 72.6 GiB, all resident, 74-77 GiB) but **broken**: non-finite logits on the first decoded token of every request (NaN guard, 30 hits) - empty answers, needle 0/1, tools 0/6 |
+| experts on GPUs | ~2,000 GPU1 + GPU0 cache | GPU0 2,309 -> 2,841 (grow) + GPU1 868 (10.8 GiB) of 11,008 | GPU0 2,822 -> 3,478 + GPU1 1,062 |
+| decode K=2 8k / 127k | 78.7 / 75.5 tok/s | **42 / 41 tok/s** (pass 49 / 52 ms); K=1 44.6 / 44.4 | (NaN) |
+| prefill 8k / 127k | 1,286 / 1,523 tok/s | 8.2k **751 tok/s (10.9 s)**, 126k **853 tok/s (148 s)** | 8.2k 1,021 tok/s (8.0 s), 126k 1,060 tok/s (119 s) |
+| needle 127k / tools | 3/3 @240k / ok | FOUND / 6/6 | missed / 0/6 |
+
+Q4_K_XL tuning: arena 95 left 206 experts on NVMe = ~700 MB/s of reads during decode, 26 tok/s; arena 98 (all in RAM)
+= 44 tok/s. `--pcie` 0.3 / 0.55 / 0.8 = flat (42-45). Expert hits ~77 % GPU0 + 8.6 % GPU1 + ~15 % CPU/PCIe (IQ2_M ~4 %):
+the expert is 1.7x bigger and two thirds of them live in RAM. K=1 is as fast as K=2 here.
+Q3_K_M NaN: its layout (gate/up IQ3_XXS + down MXFP4, one MXFP4 layer) is the first file with an MXFP4 *down* on the
+IQ3_XXS gate/up kernels - suspect the mixed-format expert path; not debugged (Marc: quick test only).
