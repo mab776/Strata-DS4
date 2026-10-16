@@ -379,7 +379,10 @@ struct Ds4MoeImpl {
     bool mixed_sizes = false;         ///< blob size differs between routed layers (MiMo): cache opened at seed
     std::unique_ptr<cpu::ExpertPool> pool;
     std::vector<uint8_t> nact;        ///< the Q8_K activation the CPU kernel consumes
-    std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, f.act_bytes apart
+    std::vector<uint8_t> nact_n;      ///< run_multi: kMaxTok of them, cpu::kNativeActBytes apart (mab776 10-16: was
+                                      ///< f.act_bytes = the LARGEST layer's - on a file whose layers quantize the
+                                      ///< activation differently (UD-Q3_K_M: Q8_K rows for IQ3_XXS, Q8_0 for its MXFP4
+                                      ///< layer) the rows overlapped and every 2+-token pass's CPU experts read garbage)
     std::vector<float> parts_n;       ///< run_multi: the pool's outputs, one row per (token, k) entry
     bool last_dev_sum = false;        ///< mab776 M11: the last run_multi mixed on the card (DS4_DEV_SUM)
     const float* mix_add = nullptr;   ///< mab776 M13: set_mix_add's rows for the next mix on the card (then cleared)
@@ -2544,7 +2547,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
     if (n1g > 0) g1_launch(im, layer, nt, gp.h_x, n1g, g1_e, g1_start, g1_tok);
     if (any_cpu)
         for (int t = 0; t < nt; ++t)
-            cpu::native_quant_act(f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * im.f.act_bytes);
+            cpu::native_quant_act(f, gp.h_x + (size_t) t * H, im.nact_n.data() + (size_t) t * cpu::kNativeActBytes);
     if (!pre) {   // M12b: prelaunch_hits quantized the same fn rows on the card already
         ck(cudaMemcpyAsync(gp.d_x, gp.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "x h2d");
         strata::kernels::native_quantize_q8_1((const float*) gp.d_x, gp.d_xq, (int) H, nt, gp.s);
@@ -2645,7 +2648,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; }
         for (int j = 0; j < NE; ++j)
             if (ent_u[j] == u) {
-                jb.nact[jb.nt] = im.nact_n.data() + (size_t) (j / (int) K) * im.f.act_bytes;
+                jb.nact[jb.nt] = im.nact_n.data() + (size_t) (j / (int) K) * cpu::kNativeActBytes;
                 jb.out[jb.nt] = im.parts_n.data() + (size_t) j * (size_t) H;
                 ++jb.nt;
             }
