@@ -1699,6 +1699,20 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     return true;
 }
 
+bool Ds41Dense::predict_cols(int il, int n, int * top_ids) {
+    Impl & im = *p_;
+    if (n < 1 || n > im.NC || il < 0 || il >= (int) im.ly.size()) { im.err = "predict_cols: bad range"; return false; }
+    std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
+    ggml_init_params p = { meta.size(), meta.data(), true };
+    ggml_context * gc = ggml_init(p);
+    ggml_tensor * o = nullptr;
+    ggml_cgraph * gf = build_predict(im, gc, il, &o, n);
+    const bool ok = im.compute(gf, false);
+    if (ok) ggml_backend_tensor_get(o, top_ids, 0, sizeof(int32_t) * 16 * (size_t) n);
+    ggml_free(gc);
+    return ok;
+}
+
 bool Ds41Dense::finish(int il, const float * routed_sum, bool async) {
     Impl & im = *p_;
     (void) il;

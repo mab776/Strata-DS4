@@ -1125,6 +1125,8 @@ int main(int argc, char ** argv) {
         if (!dense.logits(dense_row0 + (lo - row0), hi - lo, tail_logits.data() + (size_t) (lo - t0) * nv)) { ferr = dense.last_error(); return false; }
         return true;
     };
+    std::vector<int> cp_pred;      // mab776 STRATA_CHUNK_PRED: the batch's predicted ids for the current layer
+    int64_t cp_st[7] = {};         // ... routed, then (predicted, hit) for top-6 / 8 / 12, summed over the batch's layers
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
     std::vector<float> bcap_vh;    // [bcap_n][3 * n_embd], as pass_v's vh
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
@@ -1161,9 +1163,52 @@ int main(int argc, char ** argv) {
                             if (!dense.attn_router_span_kv(l, s, sn)) { ferr = dense.last_error(); return false; }
                         }
                     }
+                    // mab776 STRATA_CHUNK_PRED=dry (measurement): for a short batch (B < STRATA_CHUNK_PRED_MAX, default
+                    // 2048 = the whole-layer slab cut), layer l's routing predicted before its attention (predict_cols)
+                    // against the routing it then takes, counted over the file-tier experts (neither in VRAM, the arena
+                    // nor GPU 1's tier) for the top-6 / 8 / 12 predictions; printed per batch
+                    static const char * cpred = std::getenv("STRATA_CHUNK_PRED");
+                    static const int cpred_max = std::getenv("STRATA_CHUNK_PRED_MAX") ? std::atoi(std::getenv("STRATA_CHUNK_PRED_MAX")) : 2048;
+                    const bool cpred_on = cpred && B < cpred_max && tier.arena_experts() > 0;
+                    if (cpred_on) {
+                        cp_pred.resize((size_t) B * 16);
+                        if (!dense.predict_cols(l, B, cp_pred.data())) { ferr = dense.last_error(); return false; }
+                    }
                     for (int s = d0; s < B; s += SB) {   // sub-batches in order: the layer's KV state advances as today
                         const int sn = std::min(SB, B - s);
                         if (!dense.attn_router_span(l, s, sn)) { ferr = dense.last_error(); return false; }
+                    }
+                    if (cpred_on) {
+                        if (Ds41Dense::span_async_on()) dense.sync();
+                        auto file_tier = [&](int e) { return !tier.resident(l, e) && !tier.in_arena(l, e) && !tier.in_gpu1(l, e); };
+                        std::vector<char> act((size_t) TG.n_experts, 0);
+                        const int32_t * bi = dense.batch_ids();
+                        for (int64_t j = (int64_t) d0 * top_k; j < (int64_t) B * top_k; ++j)
+                            if (bi[j] >= 0 && bi[j] < TG.n_experts && file_tier(bi[j])) act[(size_t) bi[j]] = 1;
+                        for (int e = 0; e < TG.n_experts; ++e) cp_st[0] += act[(size_t) e];
+                        const int ks[3] = { 6, 8, 12 };
+                        for (int q = 0; q < 3; ++q) {
+                            std::vector<char> pr((size_t) TG.n_experts, 0);
+                            for (int t = d0; t < B; ++t)
+                                for (int i = 0; i < ks[q]; ++i) {
+                                    const int e = cp_pred[(size_t) t * 16 + i];
+                                    if (e >= 0 && e < TG.n_experts && file_tier(e)) pr[(size_t) e] = 1;
+                                }
+                            for (int e = 0; e < TG.n_experts; ++e) {
+                                cp_st[1 + 2 * q] += pr[(size_t) e];
+                                cp_st[2 + 2 * q] += pr[(size_t) e] && act[(size_t) e];
+                            }
+                        }
+                        if (l == n_layer - 1) {
+                            std::fprintf(stderr, "chunk pred: B=%d, file-tier experts routed %lld; predicted top-6 %lld (%lld hit: recall %.0f %%, "
+                                         "precision %.0f %%), top-8 %lld (%lld: %.0f / %.0f %%), top-12 %lld (%lld: %.0f / %.0f %%)\n", B,
+                                         cp_st[0], cp_st[1], cp_st[2], 100.0 * cp_st[2] / std::max<int64_t>(1, cp_st[0]),
+                                         100.0 * cp_st[2] / std::max<int64_t>(1, cp_st[1]), cp_st[3], cp_st[4],
+                                         100.0 * cp_st[4] / std::max<int64_t>(1, cp_st[0]), 100.0 * cp_st[4] / std::max<int64_t>(1, cp_st[3]),
+                                         cp_st[5], cp_st[6], 100.0 * cp_st[6] / std::max<int64_t>(1, cp_st[0]),
+                                         100.0 * cp_st[6] / std::max<int64_t>(1, cp_st[5]));
+                            for (auto & v : cp_st) v = 0;
+                        }
                     }
                     if (Ds41Dense::span_async_on()) {   // mab776 STRATA_SPAN_ASYNC: ids / wts / fn are in now
                         const double ts = Ds41Dense::prof_on() ? now_ms() : 0;

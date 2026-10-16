@@ -141,6 +141,9 @@ public:
     /// predict() for EVERY column of the current pass (call before attn_router(il)): top_ids[t * 16 + i] = token t's
     /// i-th predicted expert of layer il (16 per token).  For the multi-token verify pass's expert prefetch; a hint only.
     bool predict_multi(int il, int * top_ids);
+    /// mab776 STRATA_CHUNK_PRED: layer il's routing predicted for columns [0, n) of a layer-major batch (the state as
+    /// predict() reads it - before il's attention): n x 16 ids, best first.  A rebuilt graph (any n).
+    bool predict_cols(int il, int n, int * top_ids);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
     bool finish(int il, const float * routed_sum, bool async = false);
     /// mab776 STRATA_ASYNC_FINISH: the event the expert tier records after mixing a verify pass's routed sums on the card
