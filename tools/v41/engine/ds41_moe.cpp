@@ -3760,6 +3760,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     static long xp_n = 0, xp_nu = 0, xp_cpu = 0, xp_file = 0;
     double xt = xprof ? now_ms() : 0;
     auto xmark = [&](int i) { if (xprof) { const double t = now_ms(); xp[i] += t - xt; xt = t; } };
+    // mab776: the launch phase (xmark 1 -> 2) split - overlap staging, hits site, LRU copies, file wait, PCIe site
+    static double xl[5] = {};
+    double xlt = 0;
+    auto xsub = [&](int i) { if (xprof) { const double t = now_ms(); if (i >= 0) xl[i] += t - xlt; xlt = t; } };
 
     if (im.g1) g1_poll(im);   // mab776 STRATA_GPU1_DYN: fills that are home
     // ---- distinct experts, first-seen order (entries keep their routing index j = t*K + k) ----
@@ -4050,6 +4054,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         ck(cudaStreamCreateWithFlags(&gp.s_dc, cudaStreamNonBlocking), "dc stream");
         ck(cudaEventCreateWithFlags(&gp.ev_dc, cudaEventDisableTiming), "ev_dc");
     }
+    xsub(-1);
     bool pre_staged[kMaxEnt] = {};
     int si_pre = 0;
     bool ovl = false;
@@ -4097,9 +4102,11 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             launch_group(c, ptr, start, dst, tok);
         }
     };
+    xsub(0);
     if (xprof) cudaEventRecord(xev[0], gp.s);
     launch_site(HIT);
     if (xprof) cudaEventRecord(xev[1], gp.s);
+    xsub(1);
     // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
     // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
     if (lru && npf > 0) {
@@ -4121,13 +4128,20 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             lru_old[n_lru] = v; lru_dem[n_lru] = dem; lru_new[n_lru++] = e;
         }
     }
+    xsub(2);
+    static long xf_calls = 0, xf_blobs = 0, xf_reads = 0;
     if (nfg > 0) {   // the file-tier blobs must be home before their DMAs are queued
         if (nfr > 0) gp.rpool->wait();
         im.st.file_tier += nfg;
         im.st.file_ms += now_ms() - tfg;
+        if (xprof) { ++xf_calls; xf_blobs += nfg; xf_reads += nfr; }
     }
+    xsub(3);
+    if (xprof && xp_n % 640 == 639)
+        std::fprintf(stderr, "[prof_x] calls with file-tier experts: %ld (%ld blobs, %ld read now)\n", xf_calls, xf_blobs, xf_reads);
     launch_site(PCIE);
     if (xprof) cudaEventRecord(xev[2], gp.s);
+    xsub(4);
     // stashed FILEG blobs -> their arena_adapt victim slots, on the CPU while the card runs the DMAs (both only read
     // the stash slot; the slot is not reissued before this call has returned)
     for (int b = 0; b < nfg; ++b)
@@ -4328,6 +4342,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                          (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
             std::fprintf(stderr, "[prof_x] GPU ms/call: hits site %.3f, PCIe site %.3f (DMAs + kernels), sum %.3f (incl. "
                          "GPU 1's rows)\n", xg[0] / xp_n, xg[1] / xp_n, xg[2] / xp_n);
+            std::fprintf(stderr, "[prof_x] launch split ms/call: overlap staging %.3f, hits site %.3f, LRU copies %.3f, "
+                         "file wait %.3f, PCIe site %.3f\n", xl[0] / xp_n, xl[1] / xp_n, xl[2] / xp_n, xl[3] / xp_n, xl[4] / xp_n);
             // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
             const cpu::ExpertPool& pl = *im.pool;
             const double g = pl.ms_multi_gu - xpool0[0], q = pl.ms_multi_q - xpool0[1], d = pl.ms_multi_down - xpool0[2];

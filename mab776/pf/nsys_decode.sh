@@ -27,7 +27,7 @@ timeout 900 docker run --rm --name ds41-nsys --runtime nvidia -e NVIDIA_VISIBLE_
   ${NSYS_CMD[@]} \
   $W/$BLD/ds41_generate -m "$G/V41-GSQ.gguf" --backend cuda --experts gpu \
     --engram "/media/mab776/nvme 2To/models/deepseek-v41/engram-a:/home/mab776/v41-engram/engram-b" --rank "$G/rank.bin" \
-    --ctx 8192 --arena-adapt --kv-fp4 --route-bias 0.5 --route-bias-file 0.3 --arena-gib 76.5 --prompt-batch ${PB:-32768} \
+    --ctx 8192 --arena-adapt --kv-fp4 --route-bias 0.5 --route-bias-file 0.3 --arena-gib ${ARENA:-76.5} --prompt-batch ${PB:-32768} \
     --peer-device 1 --temp 0 -n ${GEN:-1536} --ids-file /home/mab776/Documents/portainer/ram-128gb/v41/pf/ppl/dom-code-B.i32 \
     > $O/$L.log 2>&1
 echo "$L rc=$? $(grep -E '^decode' $O/$L.log | tail -1 | cut -c1-160)"
