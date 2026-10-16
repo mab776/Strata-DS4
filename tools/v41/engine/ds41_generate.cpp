@@ -984,17 +984,25 @@ int main(int argc, char ** argv) {
             const float * fn = nullptr;
             if (!dense.attn_router(l, mids.data(), mw.data(), &fn)) { ferr = dense.last_error(); return false; }
             lap(0);
+            // mab776 STRATA_ASYNC_FINISH=1 (opt-in): a one-call pass (m <= kMaxMulti) hands its routed sums to finish on the
+            // card - the tier records the dense half's sum event instead of syncing, finish waits on it there and is queued
+            // without a host wait (the next predict / attention readback covers both)
+            static const bool async_fin = std::getenv("STRATA_ASYNC_FINISH") && std::getenv("STRATA_ASYNC_FINISH")[0] == '1';
+            bool fin_async = false;
             if (rdev1 && !no_tier_batch) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (8: a depth-4 pass is one call).
                 constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                void * const sev = async_fin && m <= kMM ? dense.sum_event() : nullptr;
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
+                    if (sev) tier.set_done_event(sev);
                     if (!tier.run_multi_to_dev(l, chunk, mids.data() + (size_t) off * top_k, mw.data() + (size_t) off * top_k,
                                                fn + (size_t) off * n_embd, rdev1 + (size_t) off * n_embd)) {
                         ferr = "tier.run_multi_to_dev failed"; return false;
                     }
                 }
+                fin_async = sev && tier.event_used();
             } else {
                 for (int t = 0; t < m; ++t) {
                     const bool ok = rdev1 ? tier.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
@@ -1006,7 +1014,7 @@ int main(int argc, char ** argv) {
                 }
             }
             lap(1);
-            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data())) { ferr = dense.last_error(); return false; }
+            if (!dense.finish(l, rdev1 ? nullptr : crouted_m.data(), fin_async)) { ferr = dense.last_error(); return false; }
             lap(0);
             for (int j = 0; j < 3; ++j) {
                 if (l != dm_layers[j]) continue;

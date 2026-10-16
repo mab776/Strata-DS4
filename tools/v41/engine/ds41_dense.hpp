@@ -142,7 +142,11 @@ public:
     /// i-th predicted expert of layer il (16 per token).  For the multi-token verify pass's expert prefetch; a hint only.
     bool predict_multi(int il, int * top_ids);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
-    bool finish(int il, const float * routed_sum);
+    bool finish(int il, const float * routed_sum, bool async = false);
+    /// mab776 STRATA_ASYNC_FINISH: the event the expert tier records after mixing a verify pass's routed sums on the card
+    /// (Ds41MoeTier::set_done_event; a cudaEvent_t, null off CUDA).  finish(il, nullptr, true) waits on it on the card
+    /// and is queued without a host wait - the next graph's sync covers it; host reads of the state drain first.
+    void * sum_event();
     /// Decode (n == 1) fusion: finish(il) and predict(next_il) in ONE cached graph - the router prediction for the next
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.

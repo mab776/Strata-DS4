@@ -664,6 +664,8 @@ struct Ds41MoeImpl {
     std::vector<int64_t> last_use;    ///< arena_adapt: (layer, expert) -> the run() call that last used it
     int64_t tick = 0;
     int64_t run_seq = 0;              ///< gpu_run calls (spec_read tags its slots with the call that will use them)
+    void* done_ev = nullptr;          ///< mab776 STRATA_ASYNC_FINISH: set_done_event's event for the next verify call
+    bool ev_used = false;             ///< ... the last run_multi_to_dev recorded it in place of its stream sync
     int64_t run_layer = -1;           ///< the layer of the last gpu_run call
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
@@ -4195,8 +4197,14 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * (size_t) H, hrow, (size_t) H * 4, cudaMemcpyHostToDevice,
                                gp.s), "cpu row h2d");
         }
+        // mab776 STRATA_ASYNC_FINISH (set_done_event): no host waits left in this call - GPU 1's rows are waited for on
+        // the card and the sum records the caller's event (diagnostics that read on the host keep the syncs)
+        cudaEvent_t dev_ev = (cudaEvent_t) im.done_ev;
+        im.done_ev = nullptr;
+        if (xprof || g1_check_on()) dev_ev = nullptr;
         if (n1g > 0) {   // mab776 STRATA_GPU1: its rows (pinned) into their routing-index rows; the next call's
-            g1_wait(im, st);   // launch rewrites h_parts only after this call's sum sync below
+            if (dev_ev) ck(cudaStreamWaitEvent(gp.s, im.g1->ev, 0), "gpu1 rows (card wait)");
+            else g1_wait(im, st);   // launch rewrites h_parts only after this call's sum sync below
             for (int j = 0; j < NE; ++j)
                 if (w[j] != 0.0f && cls[ent_u[j]] == G1)
                     ck(cudaMemcpyAsync((float*) gp.d_parts + (size_t) j * (size_t) H,
@@ -4213,7 +4221,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                                              (const float*) ((uint8_t*) gp.d_meta + o_w) + (size_t) t * (size_t) K,
                                              (int) K, H, (float*) out_dev + (size_t) t * (size_t) H, gp.s);
         if (xprof) cudaEventRecord(xev[3], gp.s);
-        ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (dev_ev) {   // the caller's finish waits on it on the card; its next readback covers this call's buffers
+            ck(cudaEventRecord(dev_ev, gp.s), "sum event");
+            im.ev_used = true;
+        } else {
+            ck(cudaStreamSynchronize(gp.s), "sum sync");
+        }
         if (xprof) {
             float a = 0, b = 0, c = 0;
             cudaEventElapsedTime(&a, xev[0], xev[1]);
@@ -5588,8 +5601,13 @@ void Ds41MoeTier::profiler(bool on) {
 #endif
 }
 
+void Ds41MoeTier::set_done_event(void* ev) { if (im_) im_->done_ev = ev; }
+bool Ds41MoeTier::event_used() const { return im_ && im_->ev_used; }
+
 bool Ds41MoeTier::run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev) {
     if (!im_->inited || !im_->pool) return false;
+    im_->ev_used = false;   // mab776 STRATA_ASYNC_FINISH: set by gpu_run_n_ex when it recorded done_ev
+    struct ClearEv { Ds41MoeImpl* im; ~ClearEv() { im->done_ev = nullptr; } } clear_ev { im_.get() };   // one call only
     if (!ids || !w || !x || !out_dev || nt < 1 || nt > kMaxTok) return false;
     if (!im_->g.routed(layer)) return false;
     if (std::getenv("DS41_DBG_X")) std::fprintf(stderr, "[dbg_x] ENTER run_multi_to_dev layer=%lld nt=%d\n", (long long) layer, nt);

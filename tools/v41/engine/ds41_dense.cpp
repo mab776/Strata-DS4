@@ -7,6 +7,7 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-backend-impl.h"   // ggml_backend_event::context (a cudaEvent_t on CUDA; mab776 STRATA_ASYNC_FINISH)
 #ifdef DS41_HAVE_CUDA
 #include "ggml-cuda.h"
 #endif   // ggml_cgraph::uid (graph reuse)
@@ -52,6 +53,10 @@ struct Allo {
     std::set<const void *> compute_bufs;
     bool failed = false;   // mab776: the last alloc failed (see alloc)
     ~Allo() { if (a) ggml_gallocr_free(a); }
+    bool skips(const ggml_cgraph * g, bool reuse) const {   // mab776: alloc() would return at once (no planning)
+        auto it = graph_epoch.find(g);
+        return reuse && g->uid != 0 && it != graph_epoch.end() && it->second == epoch;
+    }
     bool alloc(ggml_cgraph * g, bool reuse) {
         auto it = graph_epoch.find(g);
         if (reuse && g->uid != 0 && it != graph_epoch.end() && it->second == epoch) return true;
@@ -233,6 +238,13 @@ struct Ds41Dense::Impl {
     struct PvGraph { ggml_context * ctx = nullptr; ggml_cgraph * gf = nullptr; ggml_tensor * out = nullptr; uint64_t used = 0; };
     std::map<GKey, PvGraph> pv_graphs;
     uint64_t pv_tick = 0;
+    // mab776 STRATA_ASYNC_FINISH: the tier's sum event, and whether a finish graph is still queued without a host wait
+    ggml_backend_event_t ev_sum = nullptr;
+    bool ev_sum_tried = false;
+    bool async_pending = false;
+    void drain() {   // before host reads (tensor_get uses another stream) and real graph allocations
+        if (async_pending) { ggml_backend_synchronize(backend); async_pending = false; }
+    }
     void pv_drop(std::map<GKey, PvGraph>::iterator it) {
         allo_pass.graph_epoch.erase(it->second.gf);
         ggml_free(it->second.ctx);
@@ -267,6 +279,8 @@ struct Ds41Dense::Impl {
     }
 
     ~Impl() {
+        drain();
+        if (ev_sum) ggml_backend_event_free(ev_sum);
         pv_clear();
         if (span_pin) ggml_backend_buffer_free(span_pin);
         if (nbuf) ggml_backend_buffer_free(nbuf);
@@ -285,7 +299,7 @@ struct Ds41Dense::Impl {
         const auto it = w.t.find("blk." + std::to_string(il) + ".ffn_gate_inp_pred.weight");
         return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
     }
-    bool compute(ggml_cgraph * gf, bool cached, bool pv = false);
+    bool compute(ggml_cgraph * gf, bool cached, bool pv = false, bool async = false);
     bool upload_inputs(const int * tids, int n, int pos0);
 };
 
@@ -489,7 +503,7 @@ struct B {
 
 }  // namespace
 
-bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv) {
+bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;   // pv (STRATA_PV_GRAPHS): a kept n > 1 graph, allo_pass with reuse
     // mab776 STRATA_DENSE_PROF: the allocator's share (a buffer that changes size = a cudaFree, which waits for the
     // device) vs the graph launch
@@ -497,6 +511,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv) {
     const size_t sz0 = pr && a.a ? ggml_gallocr_get_buffer_size(a.a, 0) : 0;
     const auto tp0 = std::chrono::steady_clock::now();
     const bool reuse = (cached || pv) && env_on("DS41_GRAPH_REUSE", true);
+    if (async_pending && !a.skips(gf, reuse)) drain();   // mab776: a real allocation may free a buffer still in use
     bool ok_alloc = a.alloc(gf, reuse);
     if (pr) {
         Ds41Dense::Prof & dp = Ds41Dense::prof();
@@ -510,7 +525,13 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv) {
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
     const auto tl0 = std::chrono::steady_clock::now();
-    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+    if (async) {   // mab776 STRATA_ASYNC_FINISH: queued only; the next synchronous graph (or drain) waits for it
+        if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+        async_pending = true;
+    } else {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
+        async_pending = false;   // graph_compute synchronized the stream
+    }
     if (pr) Ds41Dense::prof().launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
     return true;
 }
@@ -1222,6 +1243,7 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
 void Ds41Dense::set_route_bias(int il, const float * bias) {
     Impl & im = *p_;
     if (il < 0 || il >= (int) im.ly.size() || !im.ly[(size_t) il].rbias) return;
+    im.drain();   // mab776 STRATA_ASYNC_FINISH: tensor_set writes on another stream
     ggml_backend_tensor_set(im.ly[(size_t) il].rbias, bias, 0, (size_t) im.NE * 4);
 }
 
@@ -1266,6 +1288,7 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 // maps, the Engram rows and the per-pass ring slots).  Shared by begin() and begin_batch().
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     Impl & im = *this;
+    im.drain();   // mab776 STRATA_ASYNC_FINISH: the uploads below use another stream
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
@@ -1516,7 +1539,7 @@ bool Ds41Dense::span_async_on() {
     return on;
 }
 
-void Ds41Dense::sync() { ggml_backend_synchronize(p_->backend); }
+void Ds41Dense::sync() { ggml_backend_synchronize(p_->backend); p_->async_pending = false; }
 bool Ds41Dense::prof_on() {
     static const bool on = [] { const char * e = std::getenv("STRATA_DENSE_PROF"); return e && e[0] == '1'; }();
     return on;
@@ -1676,11 +1699,14 @@ bool Ds41Dense::predict_multi(int il, int * top_ids) {
     return true;
 }
 
-bool Ds41Dense::finish(int il, const float * routed_sum) {
+bool Ds41Dense::finish(int il, const float * routed_sum, bool async) {
     Impl & im = *p_;
     (void) il;
     const int64_t n = im.n;
-    if (routed_sum) ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4);
+    // mab776 STRATA_ASYNC_FINISH: the tier mixed into routed on its own stream and recorded ev_sum - wait there, queue
+    async = async && !routed_sum && im.ev_sum;
+    if (async) ggml_backend_event_wait(im.backend, im.ev_sum);
+    if (routed_sum) { im.drain(); ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4); }
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
@@ -1698,9 +1724,19 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached, pv);
+    const bool ok = im.compute(gf, cached, pv, async);   // (the kernels are queued with their arguments: the graph may go)
     if (gc) ggml_free(gc);
     return ok;
+}
+
+void * Ds41Dense::sum_event() {
+    Impl & im = *p_;
+    if (!im.ev_sum_tried) {
+        im.ev_sum_tried = true;
+        if (im.backend && !im.cpu)
+            if (ggml_backend_dev_t dev = ggml_backend_get_device(im.backend)) im.ev_sum = ggml_backend_event_new(dev);
+    }
+    return im.ev_sum ? im.ev_sum->context : nullptr;   // ggml-cuda's event context: the cudaEvent_t
 }
 
 bool Ds41Dense::finish_predict(int il, const float * routed_sum, int next_il, int * top_ids, int n_top) {
@@ -1780,6 +1816,7 @@ bool Ds41Dense::logits(int row0, int nrows, float * out) {
 
 bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
     Impl & im = *p_;
+    im.drain();   // mab776 STRATA_ASYNC_FINISH: tensor_get reads on another stream
     x.resize((size_t) (im.D * im.HC * im.n));
     pre.resize((size_t) (im.HC * im.n));
     ggml_backend_tensor_get(im.x_state, x.data(), 0, x.size() * 4);
@@ -1789,6 +1826,7 @@ bool Ds41Dense::read_state(std::vector<float> & x, std::vector<float> & pre) {
 
 bool Ds41Dense::read_state_cols(int c0, int n, std::vector<float> & x) {
     Impl & im = *p_;
+    im.drain();   // mab776 STRATA_ASYNC_FINISH: tensor_get reads on another stream
     if (c0 < 0 || n < 1 || c0 + n > im.NC) { im.err = "read_state_cols: bad range"; return false; }
     const size_t col = (size_t) (im.D * im.HC) * sizeof(float);   // x_state [D, HC, NC]: a column is contiguous
     x.resize((size_t) (im.D * im.HC * n));

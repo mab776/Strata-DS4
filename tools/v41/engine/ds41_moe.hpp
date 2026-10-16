@@ -475,6 +475,12 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// mab776 STRATA_ASYNC_FINISH: the NEXT run_multi_to_dev records `ev` (a cudaEvent_t on GPU 0) after its routed sums
+    /// instead of syncing its stream, and waits for GPU 1's rows on the card instead of on the host; event_used() says
+    /// whether it did - the caller's next consumer of out_dev must then wait on ev (on the card), and nothing the tier
+    /// reuses is touched before the host has seen that consumer finish (the next dense readback).  One call, then cleared.
+    void set_done_event(void* ev);
+    bool event_used() const;
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
