@@ -22,7 +22,7 @@
   "--route-bias-file",
   "0.3",
   "--arena-gib",
-  "83",
+  "82.5",
   "--prompt-batch",
   "32768",
   "--peer-device",
@@ -76,7 +76,7 @@
   "GGML_LI_MMA": "1",
   "STRATA_PARK": "1",
   "STRATA_PARK_DIR": "/home/mab776/v41-engram/park",
-  "STRATA_PARK_RAM_GIB": "1",
+  "STRATA_PARK_RAM_GIB": "0.5",
   "STRATA_PARK_DISK_GIB": "10",
   "STRATA_PARK_DAYS": "14",
   "STRATA_DSPARK_SNAP": "1",
@@ -85,7 +85,9 @@
   "STRATA_ENGRAM_AHEAD": "1",
   "STRATA_D3_PARTS": "128",
   "STRATA_PV_GRAPHS": "1",
-  "STRATA_ASYNC_FINISH": "1"
+  "STRATA_ASYNC_FINISH": "1",
+  "STRATA_WAVE_LAYER": "1",
+  "STRATA_PRESTAGE_GIB": "0"
  },
  "_comment_mab776": "2026-10-15 overnight (ram-128gb/v41/OVERNIGHT-REPORT.md): --prompt-batch 32768 + the env block = opt-in engine paths, each measured; drop a key (or set it to 0) to go back to the old path. STRATA_BLOB_MIRROR needs mab776/mirror/V41-GSQ.experts.mirror (rebuild: see the report); STRATA_BLOB_MIRROR_SHARE 0.75 = 6 of each blob's 8 parts from the mirror drive (the share is applied in eighths: 0.6 == 0.5)."
 }
