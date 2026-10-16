@@ -517,6 +517,18 @@ struct Gpu1 {
     cudaEvent_t ev_sc = nullptr;                    ///< ON GPU 0 (s0): GPU 1's rows are in c_parts
     std::vector<int32_t> c_need;                    ///< host copy of c_need0 (the chunk in flight)
     bool c_sc_q = false;                            ///< the scatter of the chunk in flight is queued
+    /// mab776 STRATA_GPU1_DYN=1: GPU 1 as a second, dynamic cache - a victim cache for GPU 0's LRU.  core[] = the static
+    /// part (the plan's first STRATA_GPU1_CORE_GIB, no arena copy, never evicted); the rest keeps its arena copy and is
+    /// replaced by GPU 0's evictions (filled from the arena on s_fill, published when the fill's event completes).
+    bool dyn = false;
+    std::vector<char> core, pend;                   ///< static core; a pending fill reads that expert's arena copy
+    std::vector<int64_t> vlast1;                    ///< GPU 1's LRU: the tier call that last used the expert here
+    cudaStream_t s_fill = nullptr;
+    cudaEvent_t ev_launch = nullptr;                ///< on s: the launches queued so far (a fill waits for them)
+    struct Fill { int64_t layer; int32_t in, out; cudaEvent_t ev; };
+    std::vector<Fill> fills;
+    std::vector<cudaEvent_t> ev_free;
+    int64_t n_fill = 0, n_pub = 0;
 
     void close() {
         if (dev < 0) return;
@@ -532,6 +544,11 @@ struct Gpu1 {
                 if (p) cudaFreeHost(p);
             if (ev) cudaEventDestroy(ev);
             if (c_ev) cudaEventDestroy(c_ev);
+            if (s_fill) cudaStreamSynchronize(s_fill);
+            for (auto& f : fills) if (f.ev) cudaEventDestroy(f.ev);
+            for (cudaEvent_t e : ev_free) cudaEventDestroy(e);
+            if (ev_launch) cudaEventDestroy(ev_launch);
+            if (s_fill) cudaStreamDestroy(s_fill);
             if (s) cudaStreamDestroy(s);
         }
         if (ev_x0) cudaEventDestroy(ev_x0);
@@ -725,6 +742,9 @@ bool open_gpu1(Ds41MoeImpl& im, int dev, std::string& err) {
                 ok(cudaStreamCreateWithFlags(&g.s0, cudaStreamNonBlocking), "stream0");
     {
         On on(dev);
+        g.dyn = std::getenv("STRATA_GPU1_DYN") && std::getenv("STRATA_GPU1_DYN")[0] == '1';
+        if (g.dyn) good = good && ok(cudaStreamCreateWithFlags(&g.s_fill, cudaStreamNonBlocking), "fill stream") &&
+                          ok(cudaEventCreateWithFlags(&g.ev_launch, cudaEventDisableTiming), "event");
         good = good && ok(cudaStreamCreateWithFlags(&g.s, cudaStreamNonBlocking), "stream") &&
                ok(cudaEventCreateWithFlags(&g.ev, cudaEventDisableTiming), "event") &&
                ok(cudaEventCreateWithFlags(&g.c_ev, cudaEventDisableTiming), "event") &&
@@ -838,6 +858,100 @@ void plan_gpu1(Ds41MoeImpl& im, const std::vector<std::pair<int32_t, int32_t>>& 
     }
     std::fprintf(stderr, "gpu1: device %d takes %zu experts (%.2f GiB of %.2f GiB), ranks after GPU 0's head of %lld (%.2f GiB)\n",
                  g.dev, g.set.size(), g.bytes / 1073741824.0, g.budget / 1073741824.0, (long long) n0, used0 / 1073741824.0);
+    if (g.dyn) {   // the static core: the plan's first STRATA_GPU1_CORE_GIB (default 0 = fully dynamic)
+        g.core.assign((size_t) N, 0);
+        g.pend.assign((size_t) N, 0);
+        g.vlast1.assign((size_t) N, -1);
+        const double cb = env_f("STRATA_GPU1_CORE_GIB", 0.0) * 1073741824.0;
+        double at = 0;
+        int64_t nc = 0;
+        for (const auto& le : g.set) {
+            const double b = (double) im.bl[(size_t) im.g.cls(le.first, le.second)];
+            if (at + b > cb) break;
+            g.core[(size_t) (le.first * NX + le.second)] = 1;
+            at += b;
+            ++nc;
+        }
+        std::fprintf(stderr, "gpu1: dynamic (a victim cache for GPU 0's LRU): static core %lld experts (%.2f GiB, no arena copy), "
+                     "%lld dynamic (keep their arena copy)\n", (long long) nc, at / 1073741824.0, (long long) g.set.size() - nc);
+    }
+}
+
+/// mab776 STRATA_GPU1: the experts the arena leaves out (static mode: all of GPU 1's; dynamic: its static core only)
+inline bool g1_core(const Ds41MoeImpl& im, int64_t layer, int64_t expert) {
+    if (!im.g1 || !im.g1->dyn) return g1_has(im, layer, expert);
+    const size_t i = (size_t) (layer * im.g.n_experts + expert);
+    return i < im.g1->core.size() && im.g1->core[i] != 0;
+}
+/// ... and the ones a pending fill is copying to GPU 1 (their arena copy must not move, nor take a GPU 0 slot)
+inline bool g1_pend(const Ds41MoeImpl& im, int64_t layer, int64_t expert) {
+    if (!im.g1 || !im.g1->dyn) return false;
+    const size_t i = (size_t) (layer * im.g.n_experts + expert);
+    return i < im.g1->pend.size() && im.g1->pend[i] != 0;
+}
+
+/// mab776 STRATA_GPU1_DYN: completed fills are published (the slot that held `out` holds `in` now).  Every tier call
+/// starts with it; a fill takes ~1.5 ms over GPU 1's x4 link, so it is usually home by the next layer's call.
+void g1_poll(Ds41MoeImpl& im) {
+    Gpu1& g = *im.g1;
+    if (!g.dyn || g.fills.empty()) return;
+    On on(g.dev);
+    for (size_t i = 0; i < g.fills.size();) {
+        Gpu1::Fill& f = g.fills[i];
+        const cudaError_t q = cudaEventQuery(f.ev);
+        if (q == cudaErrorNotReady) { ++i; continue; }
+        ck(q, "gpu1 fill");
+        const size_t ai = (size_t) (f.layer * im.g.n_experts + f.in);
+        g.cache->replace(f.layer, f.out, f.in);
+        g.has[ai] = 1;
+        g.pend[ai] = 0;
+        g.vlast1[ai] = im.tick;
+        g.ev_free.push_back(f.ev);
+        ++g.n_pub;
+        g.fills[i] = g.fills.back();
+        g.fills.pop_back();
+    }
+}
+
+/// mab776 STRATA_GPU1_DYN: GPU 0's LRU evicted `v0` (its arena copy is current: the call's copies are home) - it takes
+/// the slot of GPU 1's least-recently-used dynamic expert of its class (same slot size) not used by this call.  That
+/// one is unpublished at once (its routes go back to GPU 0's tiers; it keeps its arena copy); the fill waits for
+/// every GPU 1 launch queued so far (one could read the slot) and is published by g1_poll.
+void g1_admit(Ds41MoeImpl& im, int64_t layer, int32_t v0) {
+    Gpu1& g = *im.g1;
+    Gpu& gp = *im.gpu;
+    const int64_t NX = im.g.n_experts;
+    const size_t a0 = (size_t) (layer * NX + v0);
+    if (!g.dyn || g.has[a0] || g.pend[a0]) return;
+    const uint8_t* src = gp.arena.ptr(layer, v0);
+    if (!src) return;
+    const int c = im.g.cls(layer, v0);
+    int32_t v1 = -1;
+    int64_t best = INT64_MAX;
+    for (int64_t e = 0; e < NX; ++e) {
+        const size_t ai = (size_t) (layer * NX + e);
+        if (!g.has[ai] || g.core[ai] || g.pend[ai] || im.g.cls(layer, e) != c) continue;
+        const int64_t u = g.vlast1[ai];
+        if (u >= im.tick) continue;   // used by this call
+        if (u < best) { best = u; v1 = (int32_t) e; }
+    }
+    if (v1 < 0) return;
+    const int32_t slot = g.cache->slot_of(layer, v1);
+    if (slot < 0) return;
+    g.has[(size_t) (layer * NX + v1)] = 0;
+    g.pend[a0] = 1;
+    On on(g.dev);
+    cudaEvent_t ev = nullptr;
+    if (!g.ev_free.empty()) { ev = g.ev_free.back(); g.ev_free.pop_back(); }
+    else ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "gpu1 fill event");
+    ck(cudaEventRecord(g.ev_launch, g.s), "gpu1 launches");
+    ck(cudaStreamWaitEvent(g.s_fill, g.ev_launch, 0), "gpu1 fill wait");
+    ck(cudaMemcpyAsync(g.cache->device_slot(slot), src, (size_t) im.bl[(size_t) c], cudaMemcpyHostToDevice, g.s_fill),
+       "gpu1 fill");
+    ck(cudaEventRecord(ev, g.s_fill), "gpu1 fill done");
+    g.fills.push_back({layer, v0, v1, ev});
+    ++g.n_fill;
+    ++im.st.g1_fills;
 }
 
 /// mab776 STRATA_GPU1: fills GPU 1's cache with its plan.  The experts have no arena copy, so they come from the blob
@@ -1926,7 +2040,7 @@ std::vector<std::pair<int32_t, int32_t>> arena_order(const Ds41MoeImpl& im, cons
     if (im.g1 && !im.g1->has.empty()) {
         no_g1.reserve(ranked_in.size());
         for (const auto& le : ranked_in)
-            if (!g1_has(im, le.first, le.second)) no_g1.push_back(le);
+            if (!g1_core(im, le.first, le.second)) no_g1.push_back(le);
     }
 #endif
     const std::vector<std::pair<int32_t, int32_t>>& ranked = no_g1.empty() ? ranked_in : no_g1;
@@ -2176,7 +2290,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         for (const auto& le : ranked) {
             if ((int64_t) sizes.size() >= im_->cfg.slots) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
-            if (g1_has(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1: GPU 1 computes it
+            if (g1_has(*im_, le.first, le.second) || g1_pend(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1
             char& sn = seen[(size_t) (le.first * im_->g.n_experts + le.second)];
             if (sn) continue;
             const int64_t b = im_->bl[(size_t) im_->g.cls(le.first, le.second)];
@@ -2229,7 +2343,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
         for (const auto& le : fill_order) {
             if (filled >= want) break;
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
-            if (g1_has(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1: GPU 1 computes it
+            if (g1_has(*im_, le.first, le.second) || g1_pend(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1
             if (cache.slot_of(le.first, le.second) >= 0) continue;
             const int32_t s = cache.admit(le.first, le.second);
             if (s < 0) break;
@@ -2283,7 +2397,7 @@ bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>
     }
     for (const auto& le : fill_order) {
         if (filled >= want) break;
-        if (g1_has(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1: GPU 1 computes it
+        if (g1_has(*im_, le.first, le.second) || g1_pend(*im_, le.first, le.second)) continue;   // mab776 STRATA_GPU1
         if (im_->mixed_sizes) {   // keep slot i == the i-th distinct routed entry (the sizes list above)
             if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
             if (im_->gpu->cache->slot_of(le.first, le.second) >= 0) continue;
@@ -2636,6 +2750,7 @@ int32_t arena_victim(Ds41MoeImpl& im, int64_t layer, uint64_t need, const int32_
         if (gp.arena.off[(size_t) vs + 1] - gp.arena.off[(size_t) vs] < need) continue;
         const int64_t u = im.last_use[(size_t) (layer * NX + v)];
         if (u >= im.tick) continue;   // routed now
+        if (g1_pend(im, layer, v)) continue;   // mab776 STRATA_GPU1_DYN: a pending fill reads this slot
         bool t = false;
         for (int r = 0; r < ntaken && !t; ++r) t = taken[r] == (int32_t) v;
         if (t) continue;
@@ -2673,6 +2788,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     bool g1_kf[kMaxParts] = {};
     unsigned long long pf_ptr[kMaxParts] = {};
     int nh = 0, nc = 0, np = 0, npf_hit = 0, n1 = 0;
+    if (im.g1) g1_poll(im);   // mab776 STRATA_GPU1_DYN: fills that are home
     for (int64_t k = 0; k < K; ++k) {
         const int32_t e = ids6[k];
         const int32_t s = (gp.cache && !im.cfg.no_cache) ? gp.cache->slot_of(layer, e) : -1;
@@ -2988,7 +3104,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
     int64_t lc = 0;
     auto admit_ok = [&](int32_t e) {
         const int64_t m = im.vmiss[(size_t) (layer * NXL + e)];
-        return m >= 0 && lc - m <= kLruWin;
+        return m >= 0 && lc - m <= kLruWin && !g1_pend(im, layer, e);
     };
     if (lru) {
         if (im.vlast.empty()) im.vlast.assign((size_t) (im.g.n_layers * NXL), -1);
@@ -2996,6 +3112,8 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
         if (im.lcalls.empty()) im.lcalls.assign((size_t) im.g.n_layers, 0);
         lc = ++im.lcalls[(size_t) layer];
         for (int64_t k = 0; k < K; ++k) im.vlast[(size_t) (layer * NXL + ids6[k])] = im.tick;
+        if (im.g1 && im.g1->dyn)   // mab776 STRATA_GPU1_DYN: GPU 1's LRU
+            for (int i = 0; i < n1; ++i) im.g1->vlast1[(size_t) (layer * NXL + ids6[g1_k[i]])] = im.tick;
         // prefetched experts the routing used: device-to-device into a victim slot (the hits kernel above read the
         // staging copy; this copy only reads it too, and the next prefetch waits for the layer sync)
         for (int i = 0; i < nh; ++i) {
@@ -3275,6 +3393,7 @@ bool gpu_run(Ds41MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w
             ++st.vram_demotes;
         }
         ++st.vram_swaps;
+        if (im.g1 && im.g1->dyn) g1_admit(im, layer, lru_old[i]);   // mab776 STRATA_GPU1_DYN: down to GPU 1
         if (check_lru) {   // DS4_CHECK_LRU=1: the slot and the demoted arena copy against the file, byte for byte
             std::vector<uint8_t> ref((size_t) im.blob);
             std::string e;
@@ -3631,12 +3750,16 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     static const int xprof_mode = std::getenv("DS41_PROF_X") ? std::atoi(std::getenv("DS41_PROF_X")) : 0;
     const bool xprof = xprof_mode == 1 || (xprof_mode >= 2 && nt <= 8);
     static double xp[8] = {};
+    static double xg[3] = {};   // mab776: GPU time (events) of the hits site, the PCIe site, the sum (ms, summed)
+    static cudaEvent_t xev[4] = {};
+    if (xprof && !xev[0]) for (auto& e : xev) cudaEventCreate(&e);
     static double xpool0[3] = {};
     static int64_t xpool_b0 = 0;
     static long xp_n = 0, xp_nu = 0, xp_cpu = 0, xp_file = 0;
     double xt = xprof ? now_ms() : 0;
     auto xmark = [&](int i) { if (xprof) { const double t = now_ms(); xp[i] += t - xt; xt = t; } };
 
+    if (im.g1) g1_poll(im);   // mab776 STRATA_GPU1_DYN: fills that are home
     // ---- distinct experts, first-seen order (entries keep their routing index j = t*K + k) ----
     int32_t ue[kMaxEnt], ent_u[kMaxEnt];
     int nu = 0;
@@ -3811,7 +3934,10 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     int32_t lru_new[kMaxEnt], lru_old[kMaxEnt], lru_dem[kMaxEnt];
     int n_lru = 0;
     auto arena_slot = [&](int32_t e) { return gp.arena.base ? gp.arena.slot_of[(size_t) (layer * NXL + e)] : -1; };
-    auto admit_ok = [&](int32_t e) { const int64_t m = im.vmiss[(size_t) (layer * NXL + e)]; return m >= 0 && lc - m <= kLruWin; };
+    auto admit_ok = [&](int32_t e) {
+        const int64_t m = im.vmiss[(size_t) (layer * NXL + e)];
+        return m >= 0 && lc - m <= kLruWin && !g1_pend(im, layer, e);
+    };
     auto lru_victim = [&](int32_t incoming) -> int32_t {
         int32_t v = -1;
         int64_t best = INT64_MAX;
@@ -3831,6 +3957,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         if (im.lcalls.empty()) im.lcalls.assign((size_t) im.g.n_layers, 0);
         lc = ++im.lcalls[(size_t) layer];
         for (int u = 0; u < nu; ++u) im.vlast[(size_t) (layer * NXL + ue[u])] = im.tick;
+        if (im.g1 && im.g1->dyn)   // mab776 STRATA_GPU1_DYN: GPU 1's LRU
+            for (int u = 0; u < nu; ++u) if (cls[u] == G1) im.g1->vlast1[(size_t) (layer * NXL + ue[u])] = im.tick;
     }
     // The launches' metadata goes into the pinned h_meta block at monotonic offsets (never reused within this call;
     // the call ends with a stream sync, so the next call can start over) and up in ONE async copy per launch - it was
@@ -3871,12 +3999,73 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // The PCIe site (arena misses + FILEG) DMAs into the kMaxParts d_stage slots IN WAVES: when the slots run out
     // mid-class, the group so far is launched and the slots are reused - every copy and kernel is on gp.s, so a
     // copy into a slot queues behind the kernel that reads it. ----
+    // One PCIe-site expert's bytes onto the card (on stream `cs`): a d_stage slot (si = the next one), or - LRU
+    // admission, arena-held PCIe misses only, as gpu_run - its victim's VRAM slot.  False: no d_stage slot left.
+    auto stage_one = [&](int u, cudaStream_t cs, int& si) -> bool {
+        const int32_t e = ue[u];
+        const int64_t BL = BLX(e);
+        const uint8_t* src = gp.arena.ptr(layer, e);
+        if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
+            int b = 0;
+            while (fg_u[b] != u) ++b;
+            src = fg_src[b];
+        }
+        int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
+        if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
+        const bool demote = v >= 0 && arena_slot(v) < 0;
+        if ((v < 0 || demote) && si == kMaxParts) return false;
+        if (v < 0 || demote) {   // through a d_stage slot (the kernel reads it there)
+            uint8_t* to = (uint8_t*) gp.d_stage + (size_t) si * (size_t) B;
+            ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+            dptr[u] = (unsigned long long) to;
+            ++si;
+        }
+        if (v >= 0) {
+            uint8_t* vs = gp.cache->device_slot(gp.cache->slot_of(layer, v));
+            im.vlast[(size_t) (layer * NXL + v)] = im.tick;   // not again in this pass
+            int32_t dem = -1;
+            if (demote) {   // stage holds e; victim -> e's arena slot (D2H after e's H2D read it), stage -> victim slot
+                dem = arena_slot(e);
+                ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) dem], vs, (size_t) BLX(v),
+                                   cudaMemcpyDeviceToHost, cs), "lru demote");
+                ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
+            } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
+                ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                dptr[u] = (unsigned long long) vs;
+            }
+            lru_old[n_lru] = v;
+            lru_dem[n_lru] = dem;
+            lru_new[n_lru++] = e;
+        }
+        return true;
+    };
+    // mab776 STRATA_D3_OVERLAP=1: the arena-held PCIe share is staged on the demand-copy stream BEFORE the hits kernels
+    // are queued (launch_site(HIT) below), so its DMAs land while those run; the PCIe site's groups wait for ev_dc.  The
+    // destinations (d_stage, LRU victims: not routed by this pass) are slots no hits kernel reads.  A call needing more
+    // d_stage slots than kMaxParts (waves) takes the serialized path.
+    static const bool d3_ovl = std::getenv("STRATA_D3_OVERLAP") && std::getenv("STRATA_D3_OVERLAP")[0] == '1';
+    if (d3_ovl && !gp.s_dc) {
+        ck(cudaStreamCreateWithFlags(&gp.s_dc, cudaStreamNonBlocking), "dc stream");
+        ck(cudaEventCreateWithFlags(&gp.ev_dc, cudaEventDisableTiming), "ev_dc");
+    }
+    bool pre_staged[kMaxEnt] = {};
+    int si_pre = 0;
+    bool ovl = false;
+    if (d3_ovl) {
+        int need = 0;   // d_stage slots the whole PCIe site could need (every PCIe + file-tier miss, an upper bound)
+        for (int u = 0; u < nu; ++u) need += cls[u] == PCIE || cls[u] == FILEG;
+        ovl = need > 0 && need <= kMaxParts;
+        for (int u = 0; ovl && u < nu; ++u)
+            if (cls[u] == PCIE && (pre_staged[u] = stage_one(u, gp.s_dc, si_pre)) == false) ovl = false;
+        if (ovl) ck(cudaEventRecord(gp.ev_dc, gp.s_dc), "record demand copies");
+    }
     auto launch_site = [&](int want) {
         bool used[kMaxEnt] = {};
         auto in_site = [&](int u) { return cls[u] == want || (want == PCIE && cls[u] == FILEG); };
         int left = 0;
         for (int u = 0; u < nu; ++u) if (in_site(u)) ++left;
-        int si = 0;   // the next d_stage slot
+        int si = want == PCIE && ovl ? si_pre : 0;   // the next d_stage slot
+        const cudaStream_t cs = want == PCIE && ovl ? gp.s_dc : gp.s;
         while (left > 0) {
             int c = -1;
             for (int u = 0; u < nu && c < 0; ++u)
@@ -3887,57 +4076,28 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             for (int u = 0; u < nu; ++u) {
                 if (used[u] || !in_site(u) || im.g.cls(layer, ue[u]) != c) continue;
                 used[u] = true; --left;
-                if (want == PCIE) {
-                    const int32_t e = ue[u];
-                    const int64_t BL = BLX(e);
-                    const uint8_t* src = gp.arena.ptr(layer, e);
-                    if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
-                        int b = 0;
-                        while (fg_u[b] != u) ++b;
-                        src = fg_src[b];
-                    }
-                    // LRU admission (arena-held PCIe misses only, as gpu_run)
-                    int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
-                    if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
-                    const bool demote = v >= 0 && arena_slot(v) < 0;
-                    if (v < 0 || demote) {   // through a d_stage slot (the kernel reads it there)
-                        if (si == kMaxParts) {   // the slots are all in this wave: launch it, then reuse them
-                            launch_group(c, ptr, start, dst, tok);
-                            ptr.clear(); start.clear(); dst.clear(); tok.clear();
-                            si = 0;
-                        }
-                        uint8_t* to = (uint8_t*) gp.d_stage + (size_t) si * (size_t) B;
-                        ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s), "pcie dma");
-                        dptr[u] = (unsigned long long) to;
-                        ++si;
-                    }
-                    if (v >= 0) {
-                        uint8_t* vs = gp.cache->device_slot(gp.cache->slot_of(layer, v));
-                        im.vlast[(size_t) (layer * NXL + v)] = im.tick;   // not again in this pass
-                        int32_t dem = -1;
-                        if (demote) {   // stage holds e; victim -> e's arena slot (D2H after e's H2D read it), stage -> victim slot
-                            dem = arena_slot(e);
-                            ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) dem], vs, (size_t) BLX(v),
-                                               cudaMemcpyDeviceToHost, gp.s), "lru demote");
-                            ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, gp.s), "lru stage copy");
-                        } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
-                            ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, gp.s), "pcie dma");
-                            dptr[u] = (unsigned long long) vs;
-                        }
-                        lru_old[n_lru] = v;
-                        lru_dem[n_lru] = dem;
-                        lru_new[n_lru++] = e;
-                    }
+                if (want == PCIE && !pre_staged[u] && !stage_one(u, cs, si)) {
+                    // the slots are all in this wave: launch it, then reuse them (the serialized path only)
+                    launch_group(c, ptr, start, dst, tok);
+                    ptr.clear(); start.clear(); dst.clear(); tok.clear();
+                    si = 0;
+                    stage_one(u, cs, si);
                 }
                 ptr.push_back(dptr[u]);
                 start.push_back((int32_t) dst.size());
                 for (int j = 0; j < NE; ++j)
                     if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
             }
+            if (want == PCIE && ovl) {   // every copy queued so far on s_dc is home before this group's kernels
+                ck(cudaEventRecord(gp.ev_dc, gp.s_dc), "record demand copies");
+                ck(cudaStreamWaitEvent(gp.s, gp.ev_dc, 0), "wait demand copies");
+            }
             launch_group(c, ptr, start, dst, tok);
         }
     };
+    if (xprof) cudaEventRecord(xev[0], gp.s);
     launch_site(HIT);
+    if (xprof) cudaEventRecord(xev[1], gp.s);
     // vram_lru, as gpu_run: a prefetched expert the pass used is copied device-to-device into a victim slot (the
     // hits kernel above read the staging copy; this copy only reads it too, and the next prefetch waits for the sync)
     if (lru && npf > 0) {
@@ -3965,6 +4125,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
         im.st.file_ms += now_ms() - tfg;
     }
     launch_site(PCIE);
+    if (xprof) cudaEventRecord(xev[2], gp.s);
     // stashed FILEG blobs -> their arena_adapt victim slots, on the CPU while the card runs the DMAs (both only read
     // the stash slot; the slot is not reissued before this call has returned)
     for (int b = 0; b < nfg; ++b)
@@ -4051,7 +4212,15 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             strata::kernels::decode_rows_sum((const float*) gp.d_parts + (size_t) t * (size_t) K * (size_t) H,
                                              (const float*) ((uint8_t*) gp.d_meta + o_w) + (size_t) t * (size_t) K,
                                              (int) K, H, (float*) out_dev + (size_t) t * (size_t) H, gp.s);
+        if (xprof) cudaEventRecord(xev[3], gp.s);
         ck(cudaStreamSynchronize(gp.s), "sum sync");
+        if (xprof) {
+            float a = 0, b = 0, c = 0;
+            cudaEventElapsedTime(&a, xev[0], xev[1]);
+            cudaEventElapsedTime(&b, xev[1], xev[2]);
+            cudaEventElapsedTime(&c, xev[2], xev[3]);
+            xg[0] += a; xg[1] += b; xg[2] += c;
+        }
     } else {
         ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) NE * (size_t) H * 4, cudaMemcpyDeviceToHost, gp.s), "d2h parts");
         ck(cudaStreamSynchronize(gp.s), "layer sync");
@@ -4084,6 +4253,7 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 ++st.vram_demotes;
             }
             ++st.vram_swaps;
+            if (im.g1 && im.g1->dyn) g1_admit(im, layer, lru_old[i]);   // mab776 STRATA_GPU1_DYN: down to GPU 1
             static const bool check_lru = std::getenv("DS41_CHECK_LRU") != nullptr;
             if (check_lru) {   // the slot and the demoted arena copy against the file, byte for byte
                 static int64_t n_chk = 0, n_bad = 0;
@@ -4143,6 +4313,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                          "sum+sync %.3f admit %.3f | distinct %.2f/call, cpu %.2f, file %.2f\n", xp_n, xp[0] / xp_n,
                          xp[1] / xp_n, xp[2] / xp_n, xp[3] / xp_n, xp[4] / xp_n, xp[5] / xp_n, xp[6] / xp_n,
                          (double) xp_nu / xp_n, (double) xp_cpu / xp_n, (double) xp_file / xp_n);
+            std::fprintf(stderr, "[prof_x] GPU ms/call: hits site %.3f, PCIe site %.3f (DMAs + kernels), sum %.3f (incl. "
+                         "GPU 1's rows)\n", xg[0] / xp_n, xg[1] / xp_n, xg[2] / xp_n);
             // the pool's own phases since the last print: gate/up, the ff quant, down, and its weight-read rate
             const cpu::ExpertPool& pl = *im.pool;
             const double g = pl.ms_multi_gu - xpool0[0], q = pl.ms_multi_q - xpool0[1], d = pl.ms_multi_down - xpool0[2];
@@ -5873,6 +6045,7 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
     vram_demotes += o.vram_demotes;
     skipped += o.skipped;
     gpu1 += o.gpu1;
+    g1_fills += o.g1_fills;
     g1_wait_ms += o.g1_wait_ms;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
