@@ -225,8 +225,49 @@ struct Ds41Dense::Impl {
     std::map<std::pair<int, int>, ggml_tensor *> predict_out_n;   // predict_multi output, by (layer, pass width)
     std::map<int, ggml_tensor *> fpredict_out; // finish_predict graph output, by the predicted layer
     std::map<std::pair<int, int>, std::vector<ggml_tensor *>> fpredict_ahead; // finish_predict_ahead extra outputs
+    // mab776 STRATA_PV_GRAPHS=1: the n > 1 passes' graphs (verify / short-turn / DSpark seeding: begin, attention,
+    // finish, head) kept per key like the n = 1 ones, each in its own context - ggml-cuda keys its CUDA graphs on the
+    // first node's address, so graphs rebuilt in pf_meta share one key and never get past its warmup.  allo_pass
+    // plans them with reuse (release_pass's epoch bump re-plans them); least recently used out past
+    // STRATA_PV_GRAPHS_MAX (default 512).
+    struct PvGraph { ggml_context * ctx = nullptr; ggml_cgraph * gf = nullptr; ggml_tensor * out = nullptr; uint64_t used = 0; };
+    std::map<GKey, PvGraph> pv_graphs;
+    uint64_t pv_tick = 0;
+    void pv_drop(std::map<GKey, PvGraph>::iterator it) {
+        allo_pass.graph_epoch.erase(it->second.gf);
+        ggml_free(it->second.ctx);
+        pv_graphs.erase(it);
+    }
+    void pv_clear() { while (!pv_graphs.empty()) pv_drop(pv_graphs.begin()); }
+    // the graph for key (build(ctx, &out) on a miss: once into pf_meta to size the context, once into its own)
+    template <class F> PvGraph & pv_graph(const GKey & key, F && build) {
+        auto it = pv_graphs.find(key);
+        if (it == pv_graphs.end()) {
+            static const size_t cap_n = std::max<long long>(1, std::getenv("STRATA_PV_GRAPHS_MAX") ? std::atoll(std::getenv("STRATA_PV_GRAPHS_MAX")) : 512);
+            while (pv_graphs.size() >= cap_n) {
+                auto v = pv_graphs.begin();
+                for (auto j = pv_graphs.begin(); j != pv_graphs.end(); ++j) if (j->second.used < v->second.used) v = j;
+                pv_drop(v);
+            }
+            pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
+            ggml_init_params ps = { pf_meta.size(), pf_meta.data(), true };
+            ggml_context * sc = ggml_init(ps);
+            ggml_tensor * so = nullptr;
+            build(sc, &so);
+            const size_t need = ggml_used_mem(sc);
+            ggml_free(sc);
+            PvGraph g;
+            ggml_init_params p = { need + 4096, nullptr, true };
+            g.ctx = ggml_init(p);
+            g.gf = build(g.ctx, &g.out);
+            it = pv_graphs.emplace(key, g).first;
+        }
+        it->second.used = ++pv_tick;
+        return it->second;
+    }
 
     ~Impl() {
+        pv_clear();
         if (span_pin) ggml_backend_buffer_free(span_pin);
         if (nbuf) ggml_backend_buffer_free(nbuf);
         if (nctx) ggml_free(nctx);
@@ -244,9 +285,15 @@ struct Ds41Dense::Impl {
         const auto it = w.t.find("blk." + std::to_string(il) + ".ffn_gate_inp_pred.weight");
         return it != w.t.end() ? it->second : BL(il, "ffn_gate_inp.weight");
     }
-    bool compute(ggml_cgraph * gf, bool cached);
+    bool compute(ggml_cgraph * gf, bool cached, bool pv = false);
     bool upload_inputs(const int * tids, int n, int pos0);
 };
+
+// mab776 STRATA_PV_GRAPHS=1 (see Impl::pv_graphs): for passes of up to 64 tokens (verify / short-turn / DSpark seeding)
+static bool pv_graphs_on(int64_t n = 1) {
+    static const bool on = [] { const char * e = std::getenv("STRATA_PV_GRAPHS"); return e && e[0] == '1'; }();
+    return on && n <= 64;
+}
 
 // ================================================================== weights
 
@@ -442,14 +489,15 @@ struct B {
 
 }  // namespace
 
-bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
-    Allo & a = cached ? allo_dec : allo_pass;
+bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv) {
+    Allo & a = cached ? allo_dec : allo_pass;   // pv (STRATA_PV_GRAPHS): a kept n > 1 graph, allo_pass with reuse
     // mab776 STRATA_DENSE_PROF: the allocator's share (a buffer that changes size = a cudaFree, which waits for the
     // device) vs the graph launch
     const bool pr = Ds41Dense::prof_on() && !cached;
     const size_t sz0 = pr && a.a ? ggml_gallocr_get_buffer_size(a.a, 0) : 0;
     const auto tp0 = std::chrono::steady_clock::now();
-    bool ok_alloc = a.alloc(gf, cached && env_on("DS41_GRAPH_REUSE", true));
+    const bool reuse = (cached || pv) && env_on("DS41_GRAPH_REUSE", true);
+    bool ok_alloc = a.alloc(gf, reuse);
     if (pr) {
         Ds41Dense::Prof & dp = Ds41Dense::prof();
         dp.alloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
@@ -457,7 +505,8 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached) {
     }
     while (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more (each call frees one region)
         std::fprintf(stderr, "ds41_dense: graph buffer did not fit - the tier gave VRAM back, retrying\n");
-        ok_alloc = a.alloc(gf, false);
+        ok_alloc = a.alloc(gf, reuse);   // (mab776: reuse = a new uid for the re-planned graph - ggml-cuda would replay the
+                                         // CUDA graph it captured for the old uid, with the old buffer's addresses)
     }
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
     const auto tl0 = std::chrono::steady_clock::now();
@@ -1004,6 +1053,7 @@ bool Ds41Dense::set_columns(int nc) {
     // every cached graph holds views of the old columns (their addresses are fixed at the first allocation), and the
     // allocators remember graphs by address - all of it goes, and is rebuilt lazily for the new tensors
     im.graphs.clear();
+    im.pv_clear();   // mab776 STRATA_PV_GRAPHS
     im.logits_out.clear();
     im.predict_out.clear();
     im.predict_out_n.clear();
@@ -1180,6 +1230,9 @@ void Ds41Dense::set_oom_hook(std::function<bool()> hook) { p_->oom_hook = std::m
 void Ds41Dense::release_pass() {
     Impl & im = *p_;
     if (!im.allo_pass.a) return;
+    // mab776 STRATA_PV_GRAPHS: the kept graphs go too - their tensors still point into the buffer freed here, and with
+    // graph_epoch cleared the next alloc would take them as allocated (an illegal address after a keep-cache batch)
+    im.pv_clear();
     ggml_gallocr_free(im.allo_pass.a);
     im.allo_pass.a = ggml_gallocr_new(ggml_backend_get_default_buffer_type(im.backend));
     im.allo_pass.graph_epoch.clear();
@@ -1319,17 +1372,20 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
     ggml_cgraph * gf = nullptr;
     const bool cached = n == 1;
     std::vector<uint8_t> meta;
+    const bool pv = !cached && pv_graphs_on(n);   // mab776 STRATA_PV_GRAPHS
     if (cached) {
         auto it = im.graphs.find({ -1, 0, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { -1, 0, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_init(im, c, n); }).gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_init(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached, pv);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1554,18 +1610,21 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
+    const bool pv = !cached && pv_graphs_on(n);   // mab776 STRATA_PV_GRAPHS
     if (cached) {
         const Impl::GKey key { il, 1, cap, 1 };
         auto it = im.graphs.find(key);
         if (it == im.graphs.end()) it = im.graphs.emplace(key, build_attn(im, im.gctx, il, 1)).first;
         gf = it->second;
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { il, 1, cap, n }, [&](ggml_context * c, ggml_tensor **) { return build_attn(im, c, il, n); }).gf;
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
         ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached, pv);
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
@@ -1625,18 +1684,21 @@ bool Ds41Dense::finish(int il, const float * routed_sum) {
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
     const bool cached = n == 1;
+    const bool pv = !cached && pv_graphs_on(n);   // mab776 STRATA_PV_GRAPHS
     std::vector<uint8_t> meta;
     if (cached) {
         auto it = im.graphs.find({ -1, 2, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 2, 0, 1 }, build_finish(im, im.gctx, 1)).first;
         gf = it->second;
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { -1, 2, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_finish(im, c, n); }).gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached);
+    const bool ok = im.compute(gf, cached, pv);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -1698,6 +1760,13 @@ bool Ds41Dense::finish_predict_ahead(int il, const float * routed_sum, int next_
 bool Ds41Dense::logits(int row0, int nrows, float * out) {
     Impl & im = *p_;
     if (row0 < 0 || nrows < 1 || row0 + nrows > im.n) { im.err = "bad logits rows"; return false; }
+    if (pv_graphs_on(nrows)) {   // mab776 STRATA_PV_GRAPHS: the head graph of (row0, nrows) kept too
+        Impl::PvGraph & g = im.pv_graph(Impl::GKey { row0, 7, 0, nrows }, [&](ggml_context * c, ggml_tensor ** o) {
+            return build_head(im, c, row0, nrows, o); });
+        const bool ok = im.compute(g.gf, false, true);
+        if (ok) ggml_backend_tensor_get(g.out, out, 0, (size_t) nrows * (size_t) im.g.vocab * 4);
+        return ok;
+    }
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
