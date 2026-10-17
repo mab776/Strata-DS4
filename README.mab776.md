@@ -795,3 +795,13 @@ every token after the first was id 0; `--pcie 1.0` (no CPU pool) made it coheren
 IQ2_M on the fixed engine (same live config, stack 74): 8k K=2 76.0 / 77.6 tok/s (M13 runs 75.8-79.0), prefill 1,229
 tok/s, no NaN lines.  Q3_K_M vs Q4_K_XL: KLD 0.157 vs 0.013, but decode ~1.3x and prefill ~1.2x faster and ~20 GiB less RAM (78 vs 96-101 GiB).
 Not deployed: stack 74 stays on IQ2_M (live compose, run/ = 6c0c1aea's engine); the fix ships with the next snapshot.sh.
+
+### Q3_K_M live checks (night 10-16/17, stack 74, via the mode page V4 tile)
+- Tile start 85 s, stop + restart 60 s; container 74-78 GiB, host >= 34 GiB free throughout.
+- Needles 246k x 3 depths: 3/3 (232k prompts, ~218 s each). 250k: prefill 1,069 tok/s, decode K=2 52-55 / K=1 57 tok/s.
+- Parking: a 60k chat A, switch to B (12.9 s), back to A + a turn: 0.8 s. Agent loop (10 turns, 57k -> 86k): turns that read
+  ~9k new tokens 9.7 s to first token, small turns 1.8-1.9 s, decode 43-77 tok/s.
+- 8k tuning arms (greedy K=2): base 55.6-58.8; --mtp-device 0 53-54, --vram-grow 1.0 53-54, --pcie 0.8 52-55, --pcie 0.3
+  57-58, --vram-margin 7 54-55 = noise or worse: config unchanged. K=1 = K=2 on greedy prompts.
+- LCB-13 at 32k (same 13 as ram-128gb/v41/lcb13-table.md): Q3_K_M 12/13 vs IQ2_M 9/13, V4.1 9/13, GLM GSQ 3.5 7/13,
+  Qwen NVFP4 7/13 - but Qwen NVFP4 at 128k max tokens = 13/13 at 3.7 min per solved (its 32k losses were all cap hits).
