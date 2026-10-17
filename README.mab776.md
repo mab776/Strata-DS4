@@ -5,6 +5,7 @@ https://github.com/mab776/Strata-DS4. Goal: run DeepSeek-V4-Flash-0731 faster th
 `deepseek-v4`, container `ds4-lcpp`, :8330) using Strata's VRAM hot-expert cache, on OUR unsloth files.
 
 ## STATUS 2026-10-13 - Portainer stack 74 `deepseek-strata` (read this, then the session notes)
+- **2026-10-17: stack 74 runs UD-Q3_K_M** (Marc; UD-IQ2_M DELETED, stack 73 llama.cpp has no model now). Config portainer/deepseek-strata/ds4-server.json (-m /q3km/..., --arena-gib 76 -> 72.6 used, file tier 0), compose mem_limit 96g + /q3km mount, snapshot 2ee91ae8 (fixes da544a75 + 41128c2c). LCB-13 12/13, 15.6k tokens / 5.6 min per solved (IQ2_M 9/13, 22.5k / 5.7); live check: 8k decode K=2 57 tok/s, prefill 913 tok/s, tools 6/6, ~77 GiB. The IQ2_M numbers below are history.
 - **M14 (10-12 night, session notes at the end)**: upstream Strata-DSV4.1 (the DS4 author's renamed repo, remote `dsv41`)
   reviewed; ported: the stale-graph unbind fix (verbatim), the warp top-k router (ggml patch, GGML_CUDA_RANK_ARGSORT=0 =
   old sort, K=2 pass -0.9 % @8k), fused finish+predict (DS4_FUSE_PREDICT=1, opt-in: neutral); deploy config `--pf-b 0`
