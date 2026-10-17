@@ -772,14 +772,25 @@ greedy, 512 tokens, the m14-ab prompts). LCB-13 skipped (Marc 10-16). Engine fix
 | | IQ2_M (live, M13) | UD-Q4_K_XL | UD-Q3_K_M |
 |---|---|---|---|
 | KLD vs full | 0.484 | 0.013 | 0.157 |
-| fits? | yes, 42 GiB | yes: arena 98 GiB, 0 experts on NVMe; container 96-101 GiB, host min 10 GiB free | loads (arena 72.6 GiB, all resident, 74-77 GiB) but **broken**: non-finite logits on the first decoded token of every request (NaN guard, 30 hits) - empty answers, needle 0/1, tools 0/6 |
-| experts on GPUs | ~2,000 GPU1 + GPU0 cache | GPU0 2,309 -> 2,841 (grow) + GPU1 868 (10.8 GiB) of 11,008 | GPU0 2,822 -> 3,478 + GPU1 1,062 |
-| decode K=2 8k / 127k | 78.7 / 75.5 tok/s | **42 / 41 tok/s** (pass 49 / 52 ms); K=1 44.6 / 44.4 | (NaN) |
-| prefill 8k / 127k | 1,286 / 1,523 tok/s | 8.2k **751 tok/s (10.9 s)**, 126k **853 tok/s (148 s)** | 8.2k 1,021 tok/s (8.0 s), 126k 1,060 tok/s (119 s) |
-| needle 127k / tools | 3/3 @240k / ok | FOUND / 6/6 | missed / 0/6 |
+| fits? | yes, 42 GiB | yes: arena 98 GiB, 0 experts on NVMe; container 96-101 GiB, host min 10 GiB free | **yes since 41128c2c** (was NaN, see below): arena 72.6 GiB (7,128 experts), 0 on NVMe; container 75.2 GiB anon + 2.4 pinned (RSS 85 incl. model pages), host min 35.8 GiB free |
+| experts on GPUs | ~2,000 GPU1 + GPU0 cache | GPU0 2,309 -> 2,841 (grow) + GPU1 868 (10.8 GiB) of 11,008 | GPU0 2,822 -> 3,478 (grow) + GPU1 1,062 (10.8 GiB) |
+| decode K=2 8k / 127k | 78.7 / 75.5 tok/s | **42 / 41 tok/s** (pass 49 / 52 ms); K=1 44.6 / 44.4 | **56.2-56.7 / 52.8-53.1 tok/s** (pass 36-39 ms); K=1 53.5 / 54.8 |
+| prefill 8k / 127k | 1,286 / 1,523 tok/s | 8.2k **751 tok/s (10.9 s)**, 126k **853 tok/s (148 s)** | 8.2k **903 tok/s (9.1 s)**, 127k **1,052 tok/s (120.7 s)** |
+| needle 127k / tools | 3/3 @240k / ok | FOUND / 6/6 | **FOUND (118k tokens) / 6/6** |
 
 Q4_K_XL tuning: arena 95 left 206 experts on NVMe = ~700 MB/s of reads during decode, 26 tok/s; arena 98 (all in RAM)
 = 44 tok/s. `--pcie` 0.3 / 0.55 / 0.8 = flat (42-45). Expert hits ~77 % GPU0 + 8.6 % GPU1 + ~15 % CPU/PCIe (IQ2_M ~4 %):
 the expert is 1.7x bigger and two thirds of them live in RAM. K=1 is as fast as K=2 here.
-Q3_K_M NaN: its layout (gate/up IQ3_XXS + down MXFP4, one MXFP4 layer) is the first file with an MXFP4 *down* on the
-IQ3_XXS gate/up kernels - suspect the mixed-format expert path; not debugged (Marc: quick test only).
+**Q3_K_M NaN = fixed (2026-10-16 evening, commit 41128c2c, local).**  Not the mixed formats' kernels: the verify path
+(`gpu_run_n`, every 2+-token pass - MTP verify, and the prompt tail that seeds the MTP window) quantized each token's
+activation for the CPU pool with the LAYER's format but placed and read the rows `im.f.act_bytes` apart = the LARGEST
+layer's layout.  Here that is the one all-MXFP4 layer (Q8_0 rows, 4,352 B) while the IQ3_XXS layers write Q8_K rows
+(4,672 B): the rows overlapped, the CPU-computed experts of every multi-token pass read the next token's bytes, the
+logits went non-finite and the NaN guard ended each request at its first token.  Single-token decode (offset 0) and
+uniform files (IQ2_M all Q8_K, Q4_K_XL all Q8_0) never saw it.  Fix: rows `cpu::kNativeActBytes` apart (as `nact_n` is
+allocated and as the core's multi-token path does) - for uniform files only the offsets change.  Found with
+`ds4_generate --mtp --verify` on the file: single-token decode and the chunked prompt were clean; with verify passes
+every token after the first was id 0; `--pcie 1.0` (no CPU pool) made it coherent -> the CPU pool's multi-token path.
+IQ2_M on the fixed engine (same live config, stack 74): 8k K=2 76.0 / 77.6 tok/s (M13 runs 75.8-79.0), prefill 1,229
+tok/s, no NaN lines.  Q3_K_M vs Q4_K_XL: KLD 0.157 vs 0.013, but decode ~1.3x and prefill ~1.2x faster and ~20 GiB less RAM (78 vs 96-101 GiB).
+Not deployed: stack 74 stays on IQ2_M (live compose, run/ = 6c0c1aea's engine); the fix ships with the next snapshot.sh.
