@@ -1034,6 +1034,17 @@ int main(int argc, char ** argv) {
         lap(3);
         return true;
     };
+    // mab776 GGML_BATCH_INVARIANT=C (with the ggml patch tools/v41/ggml/mab776-batch-invariant.patch): a token decoded
+    // alone (no drafter, or --serve's plain-decode fallback) goes through the verify pass with one row instead of step() -
+    // step()'s one-token MoE kernels (gpu_run) are not the verify pass's batched per-class ones (gpu_run_n_ex), so its
+    // bits would leave the DSpark stream's.  Same speed (one-shot: 21.0 ms a 1-row pass vs ~21.4 ms a step).
+    static const bool one_as_verify = [] { const char * e = std::getenv("GGML_BATCH_INVARIANT"); return e && std::atoi(e) > 0; }();
+    auto decode_one = [&](int tok, int pos, float * lg_out) -> bool {
+        if (!one_as_verify) return step(tok, pos) && dense.logits(0, 1, lg_out);
+        if (!pass_v(&tok, 1, pos)) return false;
+        std::copy(vlog.end() - nv, vlog.end(), lg_out);
+        return true;
+    };
     const int NP = std::max(1, a.prefill_chunk);
     const int SB = std::max(1, S);                 // the dense sub-batch size
     std::vector<int> cids((size_t) NP * top_k);
@@ -1092,10 +1103,18 @@ int main(int argc, char ** argv) {
         ggml_backend_dev_memory(ggml_backend_get_device(be), &fr, &tot);
         seed_free = fr / 1073741824.0;
         seed_gib = std::max(0.0, ((double) fr - a.vram_margin_gib * 1073741824.0) / 1073741824.0);
+        // mab776 STRATA_SEED_GIB=G (test knob, unset = off): the expert cache gets exactly G GiB whatever is free - the
+        // route bias follows the VRAM set, so runs that must compare token for token (two drafters, plain decode) need
+        // the same set; capped at the free VRAM minus the margin
+        if (const char * e = std::getenv("STRATA_SEED_GIB")) seed_gib = std::min(seed_gib, std::atof(e));
         tier.set_slot_gib(a.slots > 0 ? 0.0 : seed_gib);
         const double ts = now_ms();
         if (!tier.seed_from_ranked(ranked, err)) return false;
         seed_s = (now_ms() - ts) / 1000.0;
+        // mab776: the expert cache is sized HERE, after the drafter took its VRAM ("VRAM: ... free after the dense half"
+        // at load time is before it) - a smaller drafter shows up as more experts in VRAM on this line
+        std::fprintf(stderr, "\nVRAM%s: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)\n",
+                     dsp_path ? " with the drafter loaded" : " at the cache seed", seed_free, seed_gib, (long long) tier.resident(), seed_s);
         proxy_res.clear();   // the real VRAM set from here on
         bias_now = true;     // decode: route bias + file penalty on
         apply_bias();
@@ -1921,7 +1940,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!decode_one(tok, pos, lg.data())) { finish = "error"; break; }
                 hist.push_back(tok);
                 ++pos;
                 if (rows_nonfinite(lg.data(), nv, 1)) { nonfinite = true; finish = "nonfinite"; break; }
@@ -2006,7 +2025,10 @@ int main(int argc, char ** argv) {
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
-    const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    // mab776 STRATA_TAIL_PV=1 (test knob, no drafter): the same tail through pass_v, so a drafter-less run's prompt
+    // matches a DSpark run's bit for bit (and, with GGML_BATCH_INVARIANT, its whole token stream)
+    const bool tail_pv = !spec && dm_tail == 0 && defer_vram && std::getenv("STRATA_TAIL_PV") && std::getenv("STRATA_TAIL_PV")[0] == '1';
+    const int sp_tail = spec || tail_pv ? std::min<int>(128, (int) prompt.size() - 1) : 0;
     const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
@@ -2061,8 +2083,20 @@ int main(int argc, char ** argv) {
         apply_bias();
     }
 #endif
+    if (tail_pv) {
+        if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
+        bias_now = false;   // prompt routing, as the DSpark seed's tail
+        apply_bias();
+        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
+            const int m = std::min<int>(16, (int) prompt.size() - i0);
+            if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: tail pass: %s\n", ferr.c_str()); return 1; }
+            if (i0 + m == (int) prompt.size()) std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
+        }
+        bias_now = true;
+        apply_bias();
+    }
     const double prompt_ms = now_ms() - tp0;
-    if (defer_vram && dm_tail == 0 && !spec) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
+    if (defer_vram && dm_tail == 0 && !spec && !tail_pv) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);
@@ -2218,7 +2252,7 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !dense.logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!decode_one(tok, pos, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;
