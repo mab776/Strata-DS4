@@ -6,20 +6,21 @@ DeepSeek engines we serve, tuned for one box: Ryzen 9 7950X, 124 GiB DDR5-4400, 
 (both sm_120), models on NVMe. Branches: **`mab776-main`** = upstream + our changes (the default branch; the stacks build from it) and **`main`** =
 an untouched mirror of upstream `Indras-Mirror/Xolotl` `main`, kept only to sync from.
 
-## STATUS (2026-10-19)
+## STATUS (2026-10-19, after the Xolotl 87157b2e sync)
 | | V4 — Portainer stack 74 `deepseek-strata` | V4.1 — Portainer stack 78 `deepseek-v41` |
 |---|---|---|
 | model | DeepSeek-V4-Flash-0731 unsloth UD-Q3_K_M | DeepSeek-V4.1-Flash GSQ (163 GB) + Engram (203 GB) |
 | engine | `ds4_serve` (tools/ds4) | `ds41_generate --serve` (tools/v41/engine) |
-| live snapshot | tree 3f8c6cfb (tag `mab776-main-x1018-final`), ds4_serve md5 8becae81e296 | tree 026c42f7 (tag `mab776-v41-x1018-final`), ds41_generate md5 488550b66d99 |
-| `mab776-main` builds | ds4_serve 4304948a07ca: same speed, same greedy text (probe below) | ds41_generate 41a2579162ba: one-shot greedy token md5 identical (4bcc9c9e77b1 / e84e4be9c62a) |
+| live snapshot | tree 3f8c6cfb (tag `mab776-main-x1018-final`), ds4_serve md5 8becae81e296 (the sync brought V4 nothing: not redeployed) | tree 84cd7fec + shim d7a276c0, ds41_generate md5 783d89c170fe; run.prev = 026c42f7 |
+| new on 10-19 | - | **images** (`--vision`, DeepSeek's reference ViT on the CPU, resident, ~2.2 GiB) and **exact routing per request** (model ids ending in `-exact`; the plain ids stay 0.5 / 0.3) |
 | port / alias / model id | :8330 / `ds4-lcpp` / `deepseek-v4-flash` (one of the two runs at a time: mode page DeepSeek tile V4 \| V4.1) | the same |
-| prefill 8.7k / 123k | ~940 / ~1,100 tok/s | ~700 / ~2,030 tok/s |
-| decode (sampled, 256 tok) | ~50-58 tok/s (MTP K=2, lookup 7) | ~51-58 tok/s (DSpark depth 5); copy-heavy edits 117-144 tok/s (lookup 14) |
-| RAM | ~77-79 GiB (cap 96) | ~99 GiB (cap 104, margin >= 4 GiB at 500k) |
+| prefill 8.7k / 123k | ~940 / ~1,100 tok/s | ~710 / ~1,995 tok/s |
+| decode (sampled, 256 tok) | ~50-58 tok/s (MTP K=2, lookup 7) | ~50-60 tok/s (DSpark depth 5); copy-heavy edits 117-144 tok/s (lookup 14); `-exact` 26-31 tok/s |
+| RAM | ~77-79 GiB (cap 96) | ~99.5 GiB incl. the image encoder (cap 104, arena 80.0, margin >= 4 GiB at 480k / 246k) |
 
-The md5s of `mab776-main`'s binaries differ from the live ones only because each now also compiles the other engine's shared
-kernels (dead code for it); the next snapshot from `mab776-main` is behaviour-identical, so the stacks were not redeployed.
+Exactness: the merged V4.1 engine with `STRATA_TIER_ROWS=8` + `STRATA_GPU1_RESERVE_GIB=0.745` gives the pre-sync one-shot
+greedy md5 (4bcc9c9e77b1 at arena 82.5); upstream's 16-row tier calls change the text here. The deployed arena is 80.0
+(the encoder's RAM under the 4 GiB rule), so its own md5 differs by residency, not by code. Details: X1018-UPDATE.md "Sync 10-19".
 
 ## What this fork adds to upstream
 - **V4 (tools/ds4)**: unsloth split GGUFs (`--expert-slots auto`, mixed per-class blobs, `DS4_FORCE_MIXED`), the
@@ -33,7 +34,9 @@ kernels (dead code for it); the next snapshot from `mab776-main` is behaviour-id
   draft) + lone tokens decoded through a one-row verify pass; Q3_K split exact kernels (`STRATA_SPLIT_FORK`); kept verify
   graphs, async finish, 128 decode read parts, the layer-wide file reader (`STRATA_WAVE_LAYER`), conversation parking
   (`STRATA_PARK`, RAM + disk store), keep-cache through short batches (`STRATA_KEEP_CACHE`), prompt-lookup drafts up to 14
-  (`STRATA_LOOKUP`), `STRATA_PB_CAP=0` (Xolotl's 24 GB-card prompt-batch cap off), the second-drive blob mirror, served
+  (`STRATA_LOOKUP`), `STRATA_PB_CAP=0` (Xolotl's 24 GB-card prompt-batch cap off), `STRATA_TIER_ROWS` (rows per tier call;
+  8 = the pre-76d16570 split, output-identical), GPU 1's static tier on 16-row calls, the FILEG cap per 8 rows of a call,
+  the shim's special-`</think>` fix (an answer written straight after a quoted line stayed in the reasoning), the second-drive blob mirror, served
   configs and the bench kit (mab776/pf). Report: [docs/mab776/V41-REPORT.md](docs/mab776/V41-REPORT.md); the x1018
   merge + the 10-18/19 night: [docs/mab776/X1018-UPDATE.md](docs/mab776/X1018-UPDATE.md).
 - Kept OFF on purpose: dense Q6_K at load (Marc declined), `STRATA_TIER_BATCH_PCIE` < 1 (lost), the adaptive arena
@@ -47,7 +50,7 @@ Two ggml trees (gitignored, llama.cpp at `third_party/ggml/VERSION.txt` 3cf03257
 - `third_party/llama.cpp-ds4` = V4's: tools/ds4/patches/*.patch (the build script applies what is missing).
 
 ```sh
-ENGINE=ds41 BUILD_DIR=build-x1018 ./mab776-build.sh        # V4.1 -> build-x1018/ds41_generate (CUDA 13 container)
+ENGINE=ds41 BUILD_DIR=build-s1019 ./mab776-build.sh        # V4.1 -> build-s1019/ds41_generate (CUDA 13 container)
 ENGINE=ds4 ./mab776-build.sh                               # V4   -> build-ds4-cu13/ds4_serve (+ ds4_generate)
 ```
 `mab776-build-ds4.sh` mounts the V4 ggml tree at the in-container path the V4 binary was always built with.
@@ -73,6 +76,9 @@ git fetch xolotl                          # https://github.com/Indras-Mirror/Xol
 git push mab776 xolotl/main:main          # main = plain mirror, never commit on it
 git checkout mab776-main && git merge xolotl/main   # resolve, build both engines, gate, then push mab776-main
 ```
+Rule (Marc, 2026-10-19): our diff vs upstream only shrinks. Where upstream has a feature that does the same job as ours,
+adopt upstream's and drop ours (A/B first on the throwaway kit); keep ours only when clearly better, as the smallest
+knob / hook on top of upstream's code, with the reason written down.
 
 ## Branch history -> tags
 | old branch | what it was | tag |

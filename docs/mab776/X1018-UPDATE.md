@@ -1,3 +1,139 @@
+# Sync 10-19: Xolotl 87157b2e -> per-request routing + image input on V4.1 (stack 78)
+Marc's request (relayed, 2026-10-19 morning). Branch layout since this morning: `mab776-main` = upstream + ours (GitHub
+default, the stacks build from it), `main` = an untouched mirror of Xolotl `main`.
+
+## 1. The sync
+`mab776-main` 84cd7fec (pushed) = merge 954821c6 of `xolotl/main` 87157b2e (per-request routing 43bdd869 / 50870132,
+16-row verify as one tier call 76d16570, opt-in D3 DMA stream 0eb8f824, 1017 encoding sync 403e47ec, vision input
+4e843f3e, Windows, dashboard) + one fix commit. `main` refreshed = 87157b2e.
+
+Conflicts (4 files): `serve/server.py` (our mtp_k / lookup keys beside upstream's route keys); `ds41_dense.cpp` (our async
+span sync kept; the route meter forces a sync); `ds41_generate.cpp` (our STRATA_LOOKUP, parking, GPU 1 stats kept beside
+the route-meter line; upstream's own STRATA_SERVE_LOOKUP block stays as in x1018 = ours wins); `ds41_moe.cpp` (our
+STRATA_D3_OVERLAP kept, off when STRATA_D3_DMA_STREAM is on, on upstream's banked staging slots).
+
+Fix commit 84cd7fec (V4.1 only):
+- upstream's 16-row tier calls aborted our GPU 1 static tier at the first 16-row prompt pass ("native MMVQ requires
+  1 <= ncols <= 8"): GPU 1's q8_1 buffer is sized per column and quantized 8 columns a call (what upstream did for GPU 0);
+- `STRATA_TIER_ROWS=r` (default 16 = upstream): rows per tier call; 8 = the split before 76d16570;
+- the file-tier misses one call runs on the card (FILEG) are capped at 8 per 8 rows OF THAT CALL (upstream's own
+  comment); upstream's constant 16 changed what arena_adapt keeps even on <= 8-row calls.
+
+### Exactness (one-shot greedy token md5, 1,536 tokens, served flags, arena 82.5; `mab776/pf/verify_ab.sh`)
+| build / knobs | md5 | decode |
+|---|---|---|
+| live engine (026c42f7) | **4bcc9c9e77b1** | 123.3 tok/s |
+| merged, default (16-row calls) | 83ec63b528a2 (differs from token 10) | 117.7 |
+| merged, `STRATA_TIER_ROWS=8` | 5c7caef814fb (GPU 1 has 1,236 experts, not 1,237) | 99.1 |
+| merged, `STRATA_TIER_ROWS=8` + `STRATA_GPU1_RESERVE_GIB=0.745` + the FILEG fix | **4bcc9c9e77b1 = live** | 123.6 |
+| merged, `--vision`, no image | = the same build without it (83ec63b528a2 vs 83ec63b528a2) | |
+| exact routing: live / merged 8 rows / merged 16 rows | 389fbc4c967a / **389fbc4c967a** / f9308ef5af17 (from token 831) | 28 tok/s |
+
+So the merge is clean; the served config carries `STRATA_TIER_ROWS=8` + `STRATA_GPU1_RESERVE_GIB=0.745` (the bigger
+16-row buffers cost GPU 1 one expert, and with the route bias on the routing follows the resident set).
+
+**76d16570 vs the 16-row exactness gap (report only): it does not close it.** A 16-row tier call is not bit-identical to
+two 8-row calls here (exact routing: the text differs from token 831), and the gap itself is in the dense half
+(GGML_BATCH_INVARIANT covers 8 rows + the open race in <= 8-row tails), which 76d16570 does not touch. Greedy lookup stays off.
+
+**V4 (stack 74): not redeployed.** Its binary changed only through two upstream build fixes (GGML_CUDA_USE_GRAPHS on
+strata_mmq - a Windows layout fix; Windows-compat attributes in the PTQ1 CPU kernel V4 does not use). Greedy probe
+(`ksweep2.py`, throwaway, 8k / 127k, K=1 then 3 x K=2): pass 32-40 ms live vs 31-36 ms merged, prefill 934 / 1,099 vs
+938 / 1,102 tok/s, decode the same. The texts cannot decide it: here even three K=2 repeats from one restored state give
+three md5s (V4's known non-determinism). No V4 feature came with the sync, so the live snapshot stays (3f8c6cfb).
+
+## 2. Routing per request (`-exact`)
+Upstream's serve_ds41.py maps a model name ending in `-exact` to route_bias 0 / file penalty 0 for that request (and
+`-fast` to 0.5 / 0.3); the engine applies a changed bias again before the decode. Stack 78's config lists
+`deepseek-v4-flash-exact` and `deepseek-v4.1-flash-exact` as aliases; the plain ids stay fast (0.5 / 0.3, as live).
+
+Exact vs fast on our box (throwaway, the deploy candidate, sampled 256 tokens; two rounds, ABAB):
+| | fast (default ids) | exact (`-exact`) |
+|---|---|---|
+| 8.7k: prefill / decode | 623-706 tok/s (12.4-14.0 s) / 58-61 tok/s | 758-792 tok/s (11.0-11.5 s) / 28-30 tok/s |
+| 123k: prefill / decode | 1,977-1,997 tok/s (61.6-62.2 s) / 50-52 tok/s | 2,003-2,014 tok/s (61.1-61.4 s) / 27-29 tok/s |
+| turn +300 / +1,500 (32 tokens out) | 4.8-5.2 / 7.3-7.9 s * | 6.1-6.2 / 8.6-9.0 s |
+
+Exact routing halves the decode (every expert the model picks, so far more PCIe and file-tier reads; one-shot greedy: 28
+vs 123 tok/s with DSpark) and adds ~1.2 s to an agent turn; prefill is the same. (* these turns ran with the encoder at
+arena 82.5 - see section 3; the deployed config's fast turns are in the gate below.)
+
+Clients: llm-router lists both `-exact` ids (stopped: "not running"; V4 running: "not served by the running stack" -
+V4 answers them as its plain model). VS Code block `deepseek-strata/vscode-copilot.txt` has a "DeepSeek V4.1 exact"
+entry; OpenHands host has a saved profile `DeepSeek-exact` (`openai/deepseek-v4-flash-exact`, also in
+`openhands/host/seed-settings.sh`).
+
+## 3. Image input (V4.1)
+- Engine `--vision` + the config's `vision` section: upstream's `tools/v41/vision/ds41_vision.py` running DeepSeek's
+  reference ViT + aligner (`vision.py`, `image_processor.py`, MIT, from deepseek-ai/DeepSeek-V4.1-Flash `inference/` @
+  314113f8 -> `models/strata-ds41/vision-ref/`, with model.py / kernel.py / engram.py / config.json / LICENSE) on the
+  CPU in f32, 16 threads, weights from our `V41-MTP-Vision.gguf`.
+- Python: a venv on the models drive, `models/strata-ds41/vision-venv` (torch 2.14.1+cpu, numpy 2.5.4, pillow 13.0;
+  built inside strata-ds4:cu13 so it matches the image's python 3.12; ~1 GB); the image is unchanged. Both are mounted
+  read-only into stack 78 at their host paths.
+- `--vision` alone changes nothing (text md5 above; turns 3.67 / 5.97 s = live).
+- Encoder RSS 2.15-2.23 GiB (4.1 GiB peak while it dequantizes at start - before the engine loads). It runs only before
+  a prompt's prefill (FIFO: the engine is idle then); during decode it sleeps - no CPU taken from the tier.
+- bf16 (DeepSeek's own precision) is broken in upstream's encoder (a dtype mismatch) - f32 as upstream tested.
+- RAM: a resident encoder takes its 2.2 GiB from the file cache inside the 104 GiB cap - at arena 82.5 the +300 turn went
+  3.7 -> 5.5 s and the margin to 3.06 GiB. "lazy" (start with the first image, stop when idle) costs a ~90 s cold start
+  per image (first image 108 s vs 18 s) and its stop logs an "unsupported command" (the elastic VRAM call) - not used.
+  Arena 81.0 failed the live gate's RAM rule (3.54 GiB after the full gate: the steady footprint creeps to ~100.5 GiB as
+  conversations accumulate) -> rolled back, **arena 80.0**.
+
+Tests (throwaway + live, through the API):
+| request | answer | time / prompt tokens |
+|---|---|---|
+| terminal screenshot: which test failed, expected / got, passed, time | test_route_meter, 0.71 / 0.69, 36 passed / 1 failed, 4.82 s - all exact | 17.6 s / 424 |
+| bar chart: every value + the highest | Jan 120, Feb 95, Mar 180, Apr 60, May 240; May - exact | 8.4-9.8 s / 394 |
+| fridge photo of the weekly board (French handwriting): the grocery list | 7/7 items; 4 misspelled (Beurre arachiide, Foumange, Gravu, Trisruits) | 29.3 s / 1,071 |
+| two images in one message | "Green triangle / Yellow circle" (in order) | 7.6 s / 476 |
+| text turn after the chart (same conversation) | 695 (the sum) | 5.1 s / 462 |
+| plain text request after images | correct | 3.8 s / 41 |
+
+## 4. Deploy to stack 78 (2026-10-19 afternoon)
+Snapshot 84cd7fec (engine 783d89c170fe) + compose with the two read-only mounts (venv, vision-ref); `run.prev` = the 00:00
+lookup-14 snapshot 026c42f7 (rollback: stop 78, swap `models/strata-ds41/run` <-> `run.prev`, and PUT the compose from
+`deepseek-v41/docker-compose.yml.bak-20261019-sync`).
+- **First try, arena 81.0: FAILED the RAM rule** (3.54 GiB after the full gate) -> rolled back to run.prev + the old
+  compose, then redeployed at **arena 80.0**.
+- Shim fix d7a276c0 copied into the live snapshot afterwards (only `tools/v41/serve/serve_ds41.py`; noted in VERSION), so
+  run.prev stayed the rollback.
+
+| gate (live stack 78) | sync, arena 80.0 | before (lookup-14 gate, 00:00) |
+|---|---|---|
+| one-shot greedy md5 (code) | = pre-sync at arena 82.5 (4bcc9c9e77b1); the deployed arena 80.0 changes residency, so not compared | 4bcc9c9e77b1 |
+| prefill 8.7k / 123k | 711 tok/s (12.3 s) / 1,995 tok/s (61.6 s) | 699 tok/s (12.5 s) / 2,028 tok/s (60.6 s) |
+| decode 8.7k / 123k (sampled 256) | 54.9 / 49.8 tok/s | ~56 / ~52 |
+| turns fresh / +300 / +1,500 | 10.4-11.0 / 4.11-4.28 / 6.43-6.45 s | 10.60 / 3.84 / 6.08 s |
+| tools | 5/6 (the Unicode-minus case) then 6/6 x3 | 6/6 |
+| images | screenshot, chart, photo, two images, follow-up turn: as in section 3 (live: 8.9-12.8 s) | - |
+| needles (fresh, nonce) | 480k FOUND (235 s); 246k x3 FOUND (~120 s each) | 4/4 |
+| margin under 104 GiB, encoder loaded | **4.73 GiB** (needles) / 4.94 (bench + turns); host >= 13 GiB free; no OOM | 4.79 |
+
+The turn cost (+0.3 s at +300, +0.35 s at +1,500) is the price of the resident encoder + 2.5 GiB less arena under the
+104 GiB cap.
+
+**The empty needle answers (fixed).** Two needles in the first arena-80 runs answered '' - not an engine failure (finish
+stop, 54 / 89 tokens, no nonfinite): the model ended its thinking with a quoted line and the special `</think>` token and
+wrote the answer straight after it (`...Remember it."</think>falcon-quartz-940`). Strata's frontend rule #537 reads a
+`</think>` right after a quote and not followed by a line break as the model QUOTING the tag, so the answer stayed in
+reasoning_content. Same rule in the pre-sync snapshot (not a sync regression). Fix d7a276c0 in the V4.1 shim: the server
+feeds one token's text at a time and `</think>` is ONE special token (id 128822), so a delta that is exactly the tag gets a
+line break after it -> #537 sees the end; a spelled-out tag (several tokens) is still a quote. Unit test: the failing case
+gives content '' with the old shim and 'falcon-quartz-940' with the new; the re-gate above found all four.
+
+**Router (stack 75)** rebuilt + redeployed (rollback image `llm-router:pre-20261019`, `router.py.bak-20261019-v41vision`):
+images pass only to a stack whose live `/v1/models` entry lists `image` in `architecture.input_modalities` (V4.1 does, V4
+doesn't -> the text note), for `auto` and named ids. Live: auto / deepseek-v4-flash / deepseek-v4.1-flash-exact all read
+two images through :8340; from inside the open-webui container -> llm-router:8000 an image request answered "May, 240";
+with stack 74 running, auto + an image -> "1 image(s) -> text note" and V4 says it can't see it. Open WebUI shows the
+image button for every model without a capability override (`vision ?? true`) - the DeepSeek ids have none; the button
+itself was not clicked (no Open WebUI login on the box).
+
+**V4 (stack 74)**: not redeployed (section 1).
+
+
 # MORNING SUMMARY (2026-10-19, overnight unattended)
 **Shipped**
 - **Stack 78 (V4.1)** = x1018 (our branch merged onto upstream Xolotl) + **lookup drafts up to 14 for sampled requests**:
