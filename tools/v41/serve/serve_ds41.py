@@ -76,7 +76,7 @@ def effort_kwargs(value, table=None) -> dict:   # mab776 (main): the tree's fron
     return {"enable_thinking": False} if level == 0 else {"reasoning_effort": level}
 
 
-def budget_effort(tokens) -> dict:
+def budget_effort(tokens, table=None) -> dict:   # mab776 (main): as effort_kwargs
     """Anthropic's thinking budget: under 2K low, under 8K medium, else high (as the server's own)."""
     try:
         n = int(tokens)
