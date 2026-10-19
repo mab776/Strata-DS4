@@ -61,7 +61,7 @@ EFFORT = {"none": 0, "off": 0, "disabled": 0, "false": 0, "minimal": 50, "low": 
           "xhigh": 75, "max": 100, "maximum": 100}
 
 
-def effort_kwargs(value) -> dict:
+def effort_kwargs(value, table=None) -> dict:   # mab776 (main): the tree's frontend passes a family table - V4.1 has its own map
     if value is None or value == "":
         return {}
     if value is False:
