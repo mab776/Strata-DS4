@@ -133,8 +133,8 @@ public:
     bool grow(int64_t want_bytes, std::string& err);
     /// Forgets every expert whose slot is >= `first_slot` (they become misses) and rewinds the sequential admission
     /// to it - what a caller does before `shrink`ing to `first_slot` slots (the per-request elastic cache: the
-    /// prompt borrows the tail's VRAM, `grow` + re-admission give it back for decode; mab776's DS4 M6 server shrink uses
-    /// it the same way).  Returns how many it forgot.
+    /// prompt borrows the tail's VRAM, `grow` + re-admission give it back for decode; mab776's DS4 M6 shrink, ds41
+    /// STRATA_KEEP_CACHE and xolotl's shrink_cache_for use it the same way).  Returns how many it forgot.
     int64_t evict_from(int64_t first_slot);
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;

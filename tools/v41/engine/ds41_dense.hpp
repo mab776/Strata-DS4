@@ -82,6 +82,9 @@ public:
     /// chunk path (the per-layer KV ring / compressed rows / indexer state advances in sub-batch order; layer l's
     /// residual and pre-mix are the columns the sub-batch used) is preserved, so the outputs match --prefill-chunk.
     bool begin_batch(const int * tids, int B, int pos0);
+    /// mab776 STRATA_ENGRAM_AHEAD: start the Engram reads of the NEXT layer-major batch (tids, n tokens at pos0) now, so they
+    /// run while this batch computes; that batch's begin_batch takes them.  At most one in flight; a no-op when Engram is off.
+    bool engram_ahead(const int * tids, int n, int pos0);
     /// Dense half of layer il for the batch's sub-batch starting at column col0 (n tokens, col0 % max_pass == 0):
     /// attention, hc, router, shared expert + the Engram add.  ids / wts / fn land in the batch buffers (batch_ids /
     /// batch_wts / batch_fn) at column col0.  Uses (and advances) layer il's own KV state in sub-batch order.
@@ -99,6 +102,20 @@ public:
     const int32_t * batch_ids() const;
     const float * batch_wts() const;
     const float * batch_fn() const;
+    /// mab776 STRATA_FN_DEV=1: the batch's fn columns on the device ([n_embd, B] token-major, null on the CPU backend);
+    /// attn_router_span then skips fn's host readback (batch_fn() is NOT filled) - the tier copies it on the card.
+    const float * batch_fn_dev() const;
+    static bool fn_dev_on();
+    /// mab776 STRATA_SPAN_ASYNC=1: attn_router_span / _kv queue their uploads + readbacks on the backend's stream and
+    /// return without waiting; call sync() once after a layer's spans, before batch_ids() / batch_wts() are read.
+    static bool span_async_on();
+    void sync();
+    /// mab776 STRATA_DENSE_PROF=1 (timing only, the same work runs): host-time split of the layer-major batch path in
+    /// ms - begin_batch, the span uploads, the Engram wait, graph build, compute (alloc + launch), finish spans; the
+    /// caller adds its sync() waits.  prof() is cleared by the reader.
+    struct Prof { double begin = 0, upload = 0, engram = 0, build = 0, compute = 0, finish = 0, sync = 0, alloc = 0, launch = 0; long spans = 0, reallocs = 0; };
+    static bool prof_on();
+    static Prof & prof();
     int batch_size() const;
     /// finish for the batch's sub-batch at column col0: x_state[.., col0+n) = hc_post(shexp + routed, hap, post_f,
     /// comb_f).  `routed_host` is n_embd * B (token-major); call once per layer, before the sub-batches' finishes.
@@ -113,7 +130,7 @@ public:
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
     /// Called when a graph's buffer cannot be allocated; return true if it freed device memory (the allocation is
-    /// then retried once).  E.g. the expert tier's prestage region.
+    /// then retried, and the hook called again while it fails).  E.g. the expert tier's prestage region.
     void set_oom_hook(std::function<bool()> hook);
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
@@ -129,8 +146,15 @@ public:
     /// predict() for EVERY column of the current pass (call before attn_router(il)): top_ids[t * 16 + i] = token t's
     /// i-th predicted expert of layer il (16 per token).  For the multi-token verify pass's expert prefetch; a hint only.
     bool predict_multi(int il, int * top_ids);
+    /// mab776 STRATA_CHUNK_PRED: layer il's routing predicted for columns [0, n) of a layer-major batch (the state as
+    /// predict() reads it - before il's attention): n x 16 ids, best first.  A rebuilt graph (any n).
+    bool predict_cols(int il, int n, int * top_ids);
     /// routed_sum: n * n_embd floats, the routed experts' weighted sum (host).
-    bool finish(int il, const float * routed_sum);
+    bool finish(int il, const float * routed_sum, bool async = false);
+    /// mab776 STRATA_ASYNC_FINISH: the event the expert tier records after mixing a verify pass's routed sums on the card
+    /// (Ds41MoeTier::set_done_event; a cudaEvent_t, null off CUDA).  finish(il, nullptr, true) waits on it on the card
+    /// and is queued without a host wait - the next graph's sync covers it; host reads of the state drain first.
+    void * sum_event();
     /// Decode (n == 1) fusion: finish(il) and predict(next_il) in ONE cached graph - the router prediction for the next
     /// layer reads the state finish just wrote, so the result is identical to finish() then predict(), with one graph
     /// launch / sync / readback less per layer.  top_ids gets the next layer's top n_top (<= 16) predicted experts.
@@ -149,6 +173,14 @@ public:
     bool snapshot(int pos);
     bool restore();
     int snapshot_pos() const;
+    /// mab776 STRATA_PARK (conversation parking): the state of a conversation at its snapshot point `n` as one blob -
+    /// the snapshot tensors (window rings, ratio-2 compressor state) + the closed compressed-KV and indexer-key rows of
+    /// positions [0, n) of every kv source (position-indexed: the next conversation overwrites them).  park_load writes
+    /// a blob back (snapshot tensors + rows; restore() then makes it live) and park_history the Engram's token history.
+    size_t park_bytes(int n) const;
+    bool park_save(int n, std::vector<uint8_t> & out);
+    bool park_load(int n, const uint8_t * in, size_t bytes);
+    void park_history(const int * ids, int n);
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host

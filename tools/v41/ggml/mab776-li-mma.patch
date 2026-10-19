@@ -1,0 +1,234 @@
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu	2026-10-15 09:14:28.944872618 -0400
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu	2026-10-15 09:14:28.946693329 -0400
+@@ -382,6 +382,209 @@
+     }
+ }
+ 
++#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++// mab776 GGML_LI_MMA=1 (opt-in): tensor-core indexer, ported from the Strata-DS4 fork's li_mma (V4: 5.6x the wmma kernel).
++// 128-dim keys, NH = 32 or 64 heads, f16 / q8_0 / mxfp4 keys. One block = 8 queries x TK keys: the K tile goes to fp16 in
++// shared memory once; each warp (one query) runs m16n8k16 mma over groups of 16 heads. fp16 Q and K, fp32 sums (as wmma).
++namespace li_mma_v41 {
++
++struct block_q8_0_t { half d; int8_t qs[32]; };
++
++template <int TK, int NH>
++struct Smem {
++    static constexpr int KPAD = 136;   // 128 halves + 8: conflict-free fragment loads
++    half  ks[TK][KPAD];
++    float out[8][TK];
++    float ws[8][NH];
++};
++
++static __device__ __forceinline__ uint32_t pack_h2(float a, float b) {
++    const half2 h = __floats2half2_rn(a, b);
++    return *reinterpret_cast<const uint32_t *>(&h);
++}
++
++static __device__ __forceinline__ void mma_16816(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
++    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
++                 "{%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
++}
++
++// KT: 0 = f16 keys, 1 = q8_0, 2 = mxfp4
++template <int TK, int NH, int KT>
++static __global__ void __launch_bounds__(256) kernel(
++        const float * __restrict__ Q, const char * __restrict__ K, const float * __restrict__ W,
++        const half * __restrict__ M, float * __restrict__ dst,
++        int n_batch, int n_kv,
++        size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
++        size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3) {
++#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
++    NO_DEVICE_CODE;
++#else
++    extern __shared__ __align__(16) unsigned char smem_raw[];
++    Smem<TK, NH> & S = *reinterpret_cast<Smem<TK, NH> *>(smem_raw);
++    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
++    const int kv0 = blockIdx.x * TK, q0 = blockIdx.y * 8, stream = blockIdx.z;
++    const char * kbase = K + (size_t) stream * nbk3;
++
++    // K tile -> fp16 shared memory (zeros past n_kv)
++    if constexpr (KT == 1) {
++        for (int i = tid; i < TK * 4; i += 256) {   // TK rows x 4 blocks of 32
++            const int r = i >> 2, b = i & 3, kv = kv0 + r;
++            half * d = &S.ks[r][b * 32];
++            if (kv < n_kv) {
++                const block_q8_0_t * blk = reinterpret_cast<const block_q8_0_t *>(kbase + (size_t) kv * nbk2) + b;
++                const float sc = __half2float(blk->d);
++                const short * qs2 = reinterpret_cast<const short *>(blk->qs);   // 34-byte blocks: read as int8 pairs
++                #pragma unroll
++                for (int j = 0; j < 16; ++j) {
++                    const short p = qs2[j];
++                    const int8_t lo = (int8_t) (p & 0xff), hi = (int8_t) ((p >> 8) & 0xff);
++                    *reinterpret_cast<half2 *>(d + 2 * j) = __floats2half2_rn(sc * (float) lo, sc * (float) hi);
++                }
++            } else {
++                #pragma unroll
++                for (int j = 0; j < 32; j += 2) *reinterpret_cast<half2 *>(d + j) = __floats2half2_rn(0.f, 0.f);
++            }
++        }
++    } else if constexpr (KT == 2) {
++        for (int i = tid; i < TK * 4; i += 256) {   // TK rows x 4 mxfp4 blocks of 32 (17 bytes each)
++            const int r = i >> 2, b = i & 3, kv = kv0 + r;
++            half * d = &S.ks[r][b * 32];
++            if (kv < n_kv) {
++                const block_mxfp4 * blk = reinterpret_cast<const block_mxfp4 *>(kbase + (size_t) kv * nbk2) + b;
++                const float sc = ggml_cuda_e8m0_to_fp32(blk->e) * 0.5f;   // as dequantize_mxfp4
++                #pragma unroll
++                for (int j = 0; j < 16; ++j) {
++                    const uint8_t qv = blk->qs[j];
++                    d[j]      = __float2half(sc * (float) kvalues_mxfp4[qv & 0xf]);
++                    d[j + 16] = __float2half(sc * (float) kvalues_mxfp4[qv >> 4]);
++                }
++            } else {
++                #pragma unroll
++                for (int j = 0; j < 32; ++j) d[j] = __float2half(0.f);
++            }
++        }
++    } else {
++        for (int i = tid; i < TK * 16; i += 256) {   // TK rows x 16 chunks of 8 halves
++            const int r = i >> 4, c = i & 15, kv = kv0 + r;
++            int4 v = make_int4(0, 0, 0, 0);
++            if (kv < n_kv) v = *reinterpret_cast<const int4 *>(kbase + (size_t) kv * nbk2 + c * 16);
++            *reinterpret_cast<int4 *>(&S.ks[r][c * 8]) = v;
++        }
++    }
++    // the block's query weights, zeroed output rows
++    for (int i = tid; i < 8 * NH; i += 256) {
++        const int ql = i / NH, h = i % NH, q = q0 + ql;
++        S.ws[ql][h] = q < n_batch ? W[(size_t) stream * nbw3 / 4 + ((size_t) q * nbw1) / 4 + h] : 0.f;
++    }
++    for (int i = tid; i < 8 * TK; i += 256) (&S.out[0][0])[i] = 0.f;
++    __syncthreads();
++
++    const int q = q0 + warp;
++    if (q < n_batch) {
++        const char * qbase = reinterpret_cast<const char *>(Q) + (size_t) stream * nbq3 + (size_t) q * nbq2;
++        const int r0 = lane >> 2, c2 = (lane & 3) * 2;
++        #pragma unroll 1
++        for (int hg = 0; hg < NH / 16; ++hg) {   // groups of 16 heads
++            uint32_t a[8][4];   // A fragments: rows = heads hg*16 + {r0, r0+8}, cols = dims ks*16 + c2 (+8)
++            const float * qh0 = reinterpret_cast<const float *>(qbase + (size_t) (hg * 16 + r0) * nbq1);
++            const float * qh1 = reinterpret_cast<const float *>(qbase + (size_t) (hg * 16 + r0 + 8) * nbq1);
++            #pragma unroll
++            for (int ks = 0; ks < 8; ++ks) {
++                const float2 x0 = *reinterpret_cast<const float2 *>(qh0 + ks * 16 + c2);
++                const float2 x1 = *reinterpret_cast<const float2 *>(qh1 + ks * 16 + c2);
++                const float2 x2 = *reinterpret_cast<const float2 *>(qh0 + ks * 16 + c2 + 8);
++                const float2 x3 = *reinterpret_cast<const float2 *>(qh1 + ks * 16 + c2 + 8);
++                a[ks][0] = pack_h2(x0.x, x0.y);
++                a[ks][1] = pack_h2(x1.x, x1.y);
++                a[ks][2] = pack_h2(x2.x, x2.y);
++                a[ks][3] = pack_h2(x3.x, x3.y);
++            }
++            const float w0 = S.ws[warp][hg * 16 + r0], w1 = S.ws[warp][hg * 16 + r0 + 8];
++            #pragma unroll 1
++            for (int cc = 0; cc < TK / 64; ++cc) {   // 64 keys at a time (8 n-tiles)
++                float c[8][4];
++                #pragma unroll
++                for (int nt = 0; nt < 8; ++nt) c[nt][0] = c[nt][1] = c[nt][2] = c[nt][3] = 0.f;
++                #pragma unroll
++                for (int ks = 0; ks < 8; ++ks) {
++                    #pragma unroll
++                    for (int nt = 0; nt < 8; ++nt) {
++                        const half * kr = &S.ks[cc * 64 + nt * 8 + r0][ks * 16 + c2];
++                        const uint32_t b0 = *reinterpret_cast<const uint32_t *>(kr);
++                        const uint32_t b1 = *reinterpret_cast<const uint32_t *>(kr + 8);
++                        mma_16816(c[nt], a[ks], b0, b1);
++                    }
++                }
++                // relu x weight, then the sum over the 16 heads (lanes with the same lane & 3)
++                #pragma unroll
++                for (int nt = 0; nt < 8; ++nt) {
++                    float v0 = fmaxf(c[nt][0], 0.f) * w0 + fmaxf(c[nt][2], 0.f) * w1;
++                    float v1 = fmaxf(c[nt][1], 0.f) * w0 + fmaxf(c[nt][3], 0.f) * w1;
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 4);  v1 += __shfl_xor_sync(0xffffffffu, v1, 4);
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 8);  v1 += __shfl_xor_sync(0xffffffffu, v1, 8);
++                    v0 += __shfl_xor_sync(0xffffffffu, v0, 16); v1 += __shfl_xor_sync(0xffffffffu, v1, 16);
++                    if (r0 == 0) {
++                        const int col = cc * 64 + nt * 8 + c2;
++                        S.out[warp][col] += v0;
++                        S.out[warp][col + 1] += v1;
++                    }
++                }
++            }
++        }
++    }
++    __syncthreads();
++    // + mask, out (coalesced over keys)
++    for (int i = tid; i < 8 * TK; i += 256) {
++        const int ql = i / TK, k = i % TK, qq = q0 + ql, kv = kv0 + k;
++        if (qq < n_batch && kv < n_kv) {
++            const char * mrow = reinterpret_cast<const char *>(M) + (size_t) qq * nbm1 + (size_t) (stream % nem3) * nbm3;
++            float * d = reinterpret_cast<float *>(reinterpret_cast<char *>(dst) + (size_t) qq * nb1 + (size_t) stream * nb3);
++            d[kv] = S.out[ql][k] + __half2float(reinterpret_cast<const half *>(mrow)[kv]);
++        }
++    }
++#endif
++}
++
++template <int TK, int NH, int KT>
++static cudaError_t launch(const float * Q, const char * K, const float * W, const half * M, float * dst,
++                          int n_stream, int n_batch, int n_kv,
++                          size_t nb1, size_t nb3, size_t nbq1, size_t nbq2, size_t nbq3, size_t nbk2, size_t nbk3,
++                          size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3, cudaStream_t s) {
++    const size_t smem = sizeof(Smem<TK, NH>);
++    cudaFuncSetAttribute(kernel<TK, NH, KT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
++    dim3 grid((n_kv + TK - 1) / TK, (n_batch + 7) / 8, n_stream);
++    kernel<TK, NH, KT><<<grid, 256, smem, s>>>(Q, K, W, M, dst, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3,
++                                               nbw1, nbw3, nbm1, nbm3, nem3);
++    return cudaGetLastError();
++}
++
++// the li_mma path for one head count: true = it ran
++template <int NH>
++static bool try_launch(const ggml_tensor * k, int cc, const float * q_d, const char * k_d, const float * w_d, const half * m_d,
++                       float * dst_d, int n_stream, int n_batch, int n_kv, size_t nb1, size_t nb3, size_t nbq1, size_t nbq2,
++                       size_t nbq3, size_t nbk2, size_t nbk3, size_t nbw1, size_t nbw3, size_t nbm1, size_t nbm3, int nem3,
++                       cudaStream_t s) {
++    static const bool on = [] { const char * e = getenv("GGML_LI_MMA"); return e && atoi(e) != 0; }();
++    // GGML_LI_MMA_MIN_BATCH (64): prompt batches only - a decode / verify pass (a few queries) fills too few of the 8 warps
++    static const int min_batch = [] { const char * e = getenv("GGML_LI_MMA_MIN_BATCH"); return e ? atoi(e) : 64; }();
++    if (!on || n_batch < min_batch || !GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_AMPERE) return false;
++    if (k->type == GGML_TYPE_MXFP4) {
++        CUDA_CHECK((launch<128, NH, 2>(q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, s)));
++    } else if (k->type == GGML_TYPE_Q8_0) {
++        CUDA_CHECK((launch<128, NH, 1>(q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, s)));
++    } else if (k->type == GGML_TYPE_F16) {
++        CUDA_CHECK((launch<128, NH, 0>(q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3, nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, nem3, s)));
++    } else {
++        return false;
++    }
++    return true;
++}
++
++}  // namespace li_mma_v41
++#endif
++
+ #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
+     if (K->type == (type_K)) {                                                              \
+         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
+@@ -448,6 +651,10 @@
+ 
+     if (n_embd == 128 && n_head == 64) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (li_mma_v41::try_launch<64>(k, cc, q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3,
++                                         nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())) {
++            return;   // mab776 GGML_LI_MMA
++        }
+         // mab776 GGML_LI_WMMA_FP4=1 (opt-in): MXFP4 keys (--kv-fp4) on the wmma kernel too - fp16 is exact for FP4-grid keys and
+         // the fake-quantized queries; the stock choice keeps them on the fp32 vec kernel
+         static const bool li_wmma_fp4 = [] { const char * e = getenv("GGML_LI_WMMA_FP4"); return e && atoi(e) != 0; }();
+@@ -495,6 +702,10 @@
+         }
+     } else if (n_embd == 128 && n_head == 32) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++        if (li_mma_v41::try_launch<32>(k, cc, q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb3, nbq1, nbq2, nbq3,
++                                         nbk2, nbk3, nbw1, nbw3, nbm1, nbm3, (int) nem3, ctx.stream())) {
++            return;   // mab776 GGML_LI_MMA
++        }
+         // mab776 GGML_LI_WMMA_FP4=1 (opt-in): MXFP4 keys (--kv-fp4) on the wmma kernel too - fp16 is exact for FP4-grid keys and
+         // the fake-quantized queries; the stock choice keeps them on the fp32 vec kernel
+         static const bool li_wmma_fp4 = [] { const char * e = getenv("GGML_LI_WMMA_FP4"); return e && atoi(e) != 0; }();

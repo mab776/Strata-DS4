@@ -12,6 +12,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <random>
@@ -168,6 +169,19 @@ int main(int argc, char ** argv) {
                 W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
             }
         if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+        // mab776: TEST_CHUNK_TWICE=1 - the same chunk again (with STRATA_PROMPT_CACHE_GIB the file-tier experts now
+        // come from the prompt cache): every output byte must match the first call
+        if (std::getenv("TEST_CHUNK_TWICE")) {
+            std::vector<float> OUT2((size_t) nchunk * D);
+            const Ds41MoeStats s0 = tier.stats();
+            if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT2.data())) { std::fprintf(stderr, "run_chunk 2 failed\n"); return 1; }
+            const Ds41MoeStats s1 = tier.stats();
+            const bool same = std::memcmp(OUT.data(), OUT2.data(), OUT.size() * 4) == 0;
+            fails += !same;
+            std::printf("%s L%d chunk twice: %s (2nd call: %lld hit, %lld pcie, %lld file)\n", same ? "ok  " : "FAIL", l,
+                        same ? "bit-identical" : "DIFFERS", (long long) (s1.hits - s0.hits), (long long) (s1.pcie - s0.pcie),
+                        (long long) (s1.file_tier - s0.file_tier));
+        }
         int cf = 0, nan_rows = 0;
         double cw = 0;
         for (int t = 0; t < nchunk; ++t) {

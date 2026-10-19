@@ -1,0 +1,45 @@
+mab776 (overnight 2026-10-15): GGML_LI_WMMA_FP4=1 (opt-in) - the lightning indexer's MXFP4 keys (--kv-fp4) on the wmma kernel
+(fp16 tiles; exact for FP4-grid keys and fake-quantized queries) instead of the fp32 vec kernel.
+
+--- a/ggml/src/ggml-cuda/lightning-indexer.cu
++++ b/ggml/src/ggml-cuda/lightning-indexer.cu
+@@ -448,7 +448,10 @@
+ 
+     if (n_embd == 128 && n_head == 64) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
++        // mab776 GGML_LI_WMMA_FP4=1 (opt-in): MXFP4 keys (--kv-fp4) on the wmma kernel too - fp16 is exact for FP4-grid keys and
++        // the fake-quantized queries; the stock choice keeps them on the fp32 vec kernel
++        static const bool li_wmma_fp4 = [] { const char * e = getenv("GGML_LI_WMMA_FP4"); return e && atoi(e) != 0; }();
++        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && (k->type != GGML_TYPE_MXFP4 || li_wmma_fp4)) {
+             // use wmma kernel
+             constexpr int K_VECS_PER_BLOCK = 32;
+             constexpr int WARPS_PER_BLOCK = 8;
+@@ -463,6 +466,7 @@
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q5_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_Q8_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 64, k, GGML_TYPE_MXFP4)   // mab776 GGML_LI_WMMA_FP4
+             GGML_ABORT("fatal error");
+         } else {
+ #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+@@ -491,7 +495,10 @@
+         }
+     } else if (n_embd == 128 && n_head == 32) {
+ #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+-        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && k->type != GGML_TYPE_MXFP4) {
++        // mab776 GGML_LI_WMMA_FP4=1 (opt-in): MXFP4 keys (--kv-fp4) on the wmma kernel too - fp16 is exact for FP4-grid keys and
++        // the fake-quantized queries; the stock choice keeps them on the fp32 vec kernel
++        static const bool li_wmma_fp4 = [] { const char * e = getenv("GGML_LI_WMMA_FP4"); return e && atoi(e) != 0; }();
++        if (GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16 && (k->type != GGML_TYPE_MXFP4 || li_wmma_fp4)) {
+             // use wmma kernel
+             constexpr int K_VECS_PER_BLOCK = 32;
+             constexpr int WARPS_PER_BLOCK = 8;
+@@ -506,6 +513,7 @@
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q5_0)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q5_1)
+             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_Q8_0)
++            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_wmma, 128, 32, k, GGML_TYPE_MXFP4)   // mab776 GGML_LI_WMMA_FP4
+             GGML_ABORT("fatal error");
+         } else {
+ #else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

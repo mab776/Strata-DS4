@@ -338,6 +338,9 @@ struct Ds41MoeConfig {
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
     /// expert; only where the blob sits changes.  Off = the static seed, as before.
     bool vram_lru = false;
+    /// mab776: GPU 1's static expert tier on this CUDA device (-1 = off; the engine sets it from --peer-device N or
+    /// STRATA_GPU1=N).  See Gpu1 in ds41_moe.cpp.
+    int gpu1_device = -1;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -363,9 +366,12 @@ struct Ds41MoeStats {
     int64_t vram_swaps = 0;         ///< vram_lru: misses / prefetches moved into a VRAM slot
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
+    int64_t gpu1 = 0;               ///< mab776 STRATA_GPU1: computed on GPU 1's static tier
+    int64_t g1_fills = 0;           ///< ... STRATA_GPU1_DYN: GPU 0's evictions sent down to GPU 1
+    double g1_wait_ms = 0;          ///< ... time the call waited for GPU 1's rows
 
     void add(const Ds41MoeStats& o);
-    int64_t lookups() const { return hits + cpu + pcie + skipped; }
+    int64_t lookups() const { return hits + cpu + pcie + skipped + gpu1; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
@@ -461,8 +467,13 @@ public:
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
     int64_t blob_bytes(int64_t layer) const;   ///< one expert's gate+up+down bytes in `layer` (0 if not routed)
-    /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).
+    /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).  mab776: GPU 1's
+    /// static tier counts too (STRATA_GPU1; STRATA_GPU1_BIAS=0: only GPU 0's slots - the route bias' old set).
     bool resident(int64_t layer, int64_t expert) const;
+    /// mab776 STRATA_GPU1: whether GPU 1's static tier holds `expert` of `layer`; its expert count, GiB, device.
+    bool in_gpu1(int64_t layer, int64_t expert) const;
+    int64_t gpu1_experts() const;
+    double gpu1_gib() const;
     /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
     bool in_arena(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
@@ -471,6 +482,12 @@ public:
     /// run_multi writing the nt * n_embd sums to device memory `out_dev` instead of the host (D3: the verify pass's
     /// per-token routed rows, one call per layer).  nt*top_k token-major ids/w, x nt*n_embd.  GPU tier only.
     bool run_multi_to_dev(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// mab776 STRATA_ASYNC_FINISH: the NEXT run_multi_to_dev records `ev` (a cudaEvent_t on GPU 0) after its routed sums
+    /// instead of syncing its stream, and waits for GPU 1's rows on the card instead of on the host; event_used() says
+    /// whether it did - the caller's next consumer of out_dev must then wait on ev (on the card), and nothing the tier
+    /// reuses is touched before the host has seen that consumer finish (the next dense readback).  One call, then cleared.
+    void set_done_event(void* ev);
+    bool event_used() const;
     /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
     /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
     /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
@@ -486,6 +503,9 @@ public:
     /// run_chunk writing the n * n_embd sums to device memory `out_dev` (same device, e.g. the dense half's chunk
     /// tensor) instead of the host.  GPU tier only.
     bool run_chunk_dev(int64_t layer, int n, const int32_t* ids, const float* w, const float* x, void* out_dev);
+    /// mab776: run_chunk_dev with the activations already on the card (`x_dev`, n * n_embd floats, same device) -
+    /// copied device to device instead of uploaded from the host (`x` unused).  STRATA_FN_DEV=1 (ds41_generate).
+    bool run_chunk_dev_x(int64_t layer, int n, const int32_t* ids, const float* w, const float* x_dev, void* out_dev);
     /// The arena alone from a routing profile (the order `seed_from_routes` would give it, incl. arena_skip_resident),
     /// WITHOUT opening the VRAM cache - so prompt chunks can run first and `release_chunk` can give their buffers back
     /// before the cache takes the VRAM.  A later `seed_from_routes` keeps this arena and only seeds the cache.
@@ -505,11 +525,25 @@ public:
     /// Gives the layer-prestage region back (VRAM for the dense half when its pass buffer would not fit); prestage
     /// stays off until release_chunk.  False when there was none.
     bool release_prestage();
+    /// mab776: gives the prompt cache's VRAM back (the same use, after release_prestage: a deep prompt's pass buffer
+    /// outgrows STRATA_PROMPT_CACHE_KEEP_GIB); the prompt's later batches read those experts from the file tier
+    /// again, and no new cache opens until release_chunk.  False when there was none.
+    bool release_prompt_cache();
     /// Closes the VRAM expert cache and gives its device memory back (--serve: a multi-token prompt needs that VRAM
     /// for its pass / chunk buffers, as the one-shot deferred seed).  Every expert is then an arena / file-tier
     /// expert until the next seed_from_ranked, which reopens the cache (sized by set_slot_gib) and refills it; the
     /// arena is kept (an LRU-demoted expert stays in the arena slot it took).  No-op without a cache.
     void release_cache();
+    /// mab776 STRATA_KEEP_CACHE=<max new tokens> (opt-in, --serve): the VRAM cache stays open through a short prompt batch.
+    /// With the env set the cache is opened segmented (CUDA VMM, STRATA_KEEP_CACHE_SEG_MIB, default 256); shrink_cache
+    /// gives `free_gib` of its tail back for the batch buffers (those slots' experts become arena / file-tier experts),
+    /// regrow_kept maps the tail again and refills the same experts into the same slots, so decode sees the cache it had.
+    /// set_keep_batch(true) while such a batch runs: run_chunk then copies the resident experts it routes device to
+    /// device into its MMQ-strided stage halves instead of launching them in place (a slot is not at the MMQ stride).
+    static bool keep_cache_on();
+    bool shrink_cache(double free_gib, std::string& err);
+    bool regrow_kept(std::string& err);   // mab776 (xolotl has its own regrow_cache)
+    void set_keep_batch(bool on);
     /// Xolotl s6 (STRATA_SERVE_KEEP_CACHE=1; the cache opens segmented then): give back only the VRAM a small batch
     /// prompt needs instead of the whole cache.  Evicts the cache's TAIL slots (the lowest-ranked seeds) until
     /// `need_bytes` are free, remembering slot -> expert; returns the number evicted (0: it already fits), or -1 when

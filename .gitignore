@@ -41,6 +41,7 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
+/third_party/llama.cpp-ds4
 /models/
 /packs/
 /mtp/

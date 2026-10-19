@@ -1,0 +1,47 @@
+{
+ "exe": "/home/mab776/Documents/portainer/strata-ds41/mab776/ds41-engine.sh",
+ "args": [
+  "-m",
+  "/media/mab776/nvme 2To/models/deepseek-v41/gsq/V41-GSQ.gguf",
+  "--backend",
+  "cuda",
+  "--experts",
+  "gpu",
+  "--engram",
+  "/media/mab776/nvme 2To/models/deepseek-v41/engram-a:/home/mab776/v41-engram/engram-b",
+  "--rank",
+  "/media/mab776/nvme 2To/models/deepseek-v41/gsq/rank.bin",
+  "--ctx",
+  "524288",
+  "--stop",
+  "1",
+  "--arena-adapt",
+  "--kv-fp4",
+  "--route-bias",
+  "0.5",
+  "--route-bias-file",
+  "0.3",
+  "--arena-gib",
+  "88",
+  "--prompt-batch",
+  "16384"
+ ],
+ "cwd": "/home/mab776/Documents/portainer/strata-ds41",
+ "tokenizer": "/media/mab776/nvme 2To/models/deepseek-v41/gsq/tokenizer",
+ "model_name": "deepseek-v4.1-flash-strata-gsq",
+ "log": "/tmp/strata-ds41.log",
+ "port": 8150,
+ "gpu": 0,
+ "sampling": {
+  "temperature": 1.0,
+  "top_p": 0.95
+ },
+ "api_monitor": true,
+ "host": "0.0.0.0",
+ "allowed_hosts": [
+  "127.0.0.1",
+  "localhost",
+  "192.168.0.70",
+  "10.229.135.70"
+ ]
+}

@@ -1,0 +1,6 @@
+# ppl gate 1: code 4k, exact routing - base / radix / strided / everything
+p-base     build-n3 code4k.i32
+p-radix    build-n3 code4k.i32 GGML_TOPK_RADIX=1
+p-strid    build-n3 code4k.i32 STRATA_PSTAGE_STRIDED=1
+p-all      build-n3 code4k.i32 GGML_TOPK_RADIX=1 STRATA_PSTAGE_STRIDED=1 STRATA_FN_DEV=1 STRATA_SPAN_ASYNC=1 STRATA_KALL16=1 STRATA_LAZY_XQ=1
+p-base2    build-n3 code4k.i32

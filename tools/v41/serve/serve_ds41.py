@@ -231,6 +231,7 @@ F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
 # xolotl: the 0.1.44 parser treats a call opener as a call only when Qwen's `<function=` follows it (else it is
 # prose naming the format); this model's follower is DSML (` name="...">`), so with FUNC_START = "" that guard always passes -
 # the pre-0.1.44 behaviour.  Only the opt-in tool_call_recovery reads FUNC_START otherwise (off here).
+# (mab776: on the 0.1.43.1 server the stack used to mount it was 'name="' - this tree's own server is 0.1.44 now.)
 F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
@@ -326,6 +327,44 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
 
 S.Service._note = _note_ds41
 S.Service.run = _run_ds41
+
+# mab776 STRATA_PARK: /health carries the engine's conversation-parking counts (STRATA_PARK_DIR/status.json, written by
+# ds41_generate after every change) as "park"
+def _park_dir():
+    d = os.environ.get("STRATA_PARK_DIR")
+    if d:
+        return d
+    for i, v in enumerate(sys.argv[:-1]):
+        if v == "--config":
+            try:
+                return (json.load(open(sys.argv[i + 1])).get("env") or {}).get("STRATA_PARK_DIR")
+            except Exception:
+                return None
+    return None
+
+
+_make_handler = S.make_handler
+
+
+def _make_handler_ds41(svc):
+    H = _make_handler(svc)
+    _json = H._json
+
+    def _json_park(self, code, obj, headers=None):
+        if isinstance(obj, dict) and obj.get("service") == "strata" and "max_context" in obj and "loaded" in obj:
+            d = _park_dir()
+            if d:
+                try:
+                    obj = dict(obj, park=json.load(open(os.path.join(d, "status.json"))))
+                except Exception:
+                    pass
+        return _json(self, code, obj, headers)
+
+    H._json = _json_park
+    return H
+
+
+S.make_handler = _make_handler_ds41
 
 if __name__ == "__main__":
     for i, v in enumerate(sys.argv[:-1]):   # paths are the caller's; the server runs from Strata's directory
