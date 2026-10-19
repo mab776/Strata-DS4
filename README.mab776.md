@@ -3,7 +3,8 @@
 Fork of upstream **[Indras-Mirror/Xolotl](https://github.com/Indras-Mirror/Xolotl)** (which absorbed Strata-DS4 and
 Strata-DSV4.1 on 2026-10-16/18: both engines plus the Strata core and its server in one tree). This fork keeps the two
 DeepSeek engines we serve, tuned for one box: Ryzen 9 7950X, 124 GiB DDR5-4400, RTX Pro 5000 48 GB + RTX 5070 Ti 16 GB
-(both sm_120), models on NVMe. One branch: **`main`**.
+(both sm_120), models on NVMe. Branches: **`mab776-main`** = upstream + our changes (the default branch; the stacks build from it) and **`main`** =
+an untouched mirror of upstream `Indras-Mirror/Xolotl` `main`, kept only to sync from.
 
 ## STATUS (2026-10-19)
 | | V4 — Portainer stack 74 `deepseek-strata` | V4.1 — Portainer stack 78 `deepseek-v41` |
@@ -11,14 +12,14 @@ DeepSeek engines we serve, tuned for one box: Ryzen 9 7950X, 124 GiB DDR5-4400, 
 | model | DeepSeek-V4-Flash-0731 unsloth UD-Q3_K_M | DeepSeek-V4.1-Flash GSQ (163 GB) + Engram (203 GB) |
 | engine | `ds4_serve` (tools/ds4) | `ds41_generate --serve` (tools/v41/engine) |
 | live snapshot | tree 3f8c6cfb (tag `mab776-main-x1018-final`), ds4_serve md5 8becae81e296 | tree 026c42f7 (tag `mab776-v41-x1018-final`), ds41_generate md5 488550b66d99 |
-| `main` builds | ds4_serve 4304948a07ca: same speed, same greedy text (probe below) | ds41_generate 41a2579162ba: one-shot greedy token md5 identical (4bcc9c9e77b1 / e84e4be9c62a) |
+| `mab776-main` builds | ds4_serve 4304948a07ca: same speed, same greedy text (probe below) | ds41_generate 41a2579162ba: one-shot greedy token md5 identical (4bcc9c9e77b1 / e84e4be9c62a) |
 | port / alias / model id | :8330 / `ds4-lcpp` / `deepseek-v4-flash` (one of the two runs at a time: mode page DeepSeek tile V4 \| V4.1) | the same |
 | prefill 8.7k / 123k | ~940 / ~1,100 tok/s | ~700 / ~2,030 tok/s |
 | decode (sampled, 256 tok) | ~50-58 tok/s (MTP K=2, lookup 7) | ~51-58 tok/s (DSpark depth 5); copy-heavy edits 117-144 tok/s (lookup 14) |
 | RAM | ~77-79 GiB (cap 96) | ~99 GiB (cap 104, margin >= 4 GiB at 500k) |
 
-The md5s of `main`'s binaries differ from the live ones only because each now also compiles the other engine's shared
-kernels (dead code for it); the next snapshot from `main` is behaviour-identical, so the stacks were not redeployed.
+The md5s of `mab776-main`'s binaries differ from the live ones only because each now also compiles the other engine's shared
+kernels (dead code for it); the next snapshot from `mab776-main` is behaviour-identical, so the stacks were not redeployed.
 
 ## What this fork adds to upstream
 - **V4 (tools/ds4)**: unsloth split GGUFs (`--expert-slots auto`, mixed per-class blobs, `DS4_FORCE_MIXED`), the
@@ -66,11 +67,19 @@ ENGINE=ds4 ./mab776-build.sh                               # V4   -> build-ds4-c
 - Exactness harness: one-shot greedy token md5 (`mab776/pf/verify_ab.sh`); V4 is not bit-reproducible across restarts,
   so its check is the greedy probe from one restored state (`bench/mab776-m2/work/m6reg/ksweep2.py`).
 
+## Syncing with upstream
+```bash
+git fetch xolotl                          # https://github.com/Indras-Mirror/Xolotl
+git push mab776 xolotl/main:main          # main = plain mirror, never commit on it
+git checkout mab776-main && git merge xolotl/main   # resolve, build both engines, gate, then push mab776-main
+```
+
 ## Branch history -> tags
 | old branch | what it was | tag |
 |---|---|---|
-| `mab776-main` | the V4 fork (M1-M14, Q3_K_M) | `mab776-main-pre-x1018` (733ce42a), `mab776-main-final` |
+| `mab776-main` (before 10-19) | the V4 fork (M1-M14, Q3_K_M) | `mab776-main-pre-x1018` (733ce42a), `mab776-main-final` |
 | `mab776-v41` | the V4.1 fork on Strata-DSV4.1 | `mab776-v41-pre-x1018` (74faff41), `mab776-v41-final` |
 | `mab776-main-x1018` | V4 merged onto Xolotl f7c561b7 | `mab776-main-x1018-final` (3f8c6cfb) |
 | `mab776-v41-x1018` | V4.1 merged onto Xolotl f7c561b7 | `mab776-v41-x1018-final` (026c42f7) |
 | `main` (before 10-19) | a stale 10-09 copy of upstream Strata-DS4 | `upstream-main-1009` (924516a0) |
+| `main` (10-19 night, 415938a6) | briefly the merged branch; since 10-19 that is `mab776-main` again and `main` mirrors upstream | — |
