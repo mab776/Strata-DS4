@@ -228,10 +228,11 @@ def ds41_parse_tool_call(body: str, schema=None):
 
 
 F.CALL_START, F.CALL_END = INVOKE_OPEN, INVOKE_CLOSE
-# mab776: Strata >= 0.1.43 takes an opener as a call only when FUNC_START follows it (#1058, else prose): DSML's
-# follower is ' name="X">' (lstripped).  Only read with tool_call_recovery off by function_end/_bare_opener.
-if hasattr(F, "FUNC_START"):
-    F.FUNC_START = 'name="'
+# xolotl: the 0.1.44 parser treats a call opener as a call only when Qwen's `<function=` follows it (else it is
+# prose naming the format); this model's follower is DSML (` name="...">`), so with FUNC_START = "" that guard always passes -
+# the pre-0.1.44 behaviour.  Only the opt-in tool_call_recovery reads FUNC_START otherwise (off here).
+# (mab776: on the 0.1.43.1 server the stack used to mount it was 'name="' - this tree's own server is 0.1.44 now.)
+F.FUNC_START = ""
 F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
 _op_init, _op_feed, _op_finish = F.OutputParser.__init__, F.OutputParser.feed, F.OutputParser.finish
@@ -258,7 +259,7 @@ def _op_feed_ds41(self, delta: str):
     return _op_feed(self, _strip_wrappers(self, delta, False))
 
 
-def _op_finish_ds41(self, *a, **k):   # mab776: newer Strata servers pass the stop reason
+def _op_finish_ds41(self, *a, **k):   # *a/**k: the 0.1.44 server's finish(reason=...)
     out = _op_feed(self, _strip_wrappers(self, "", True)) if self.dsml_hold else []
     return out + _op_finish(self, *a, **k)
 
@@ -308,7 +309,7 @@ def _note_ds41(self, n, evs, st=None, rate=None):
     return _svc_note(self, n, evs, st, rate)
 
 
-def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **_kw):   # mab776: newer Strata servers pass force=
+def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # **kw: the server's newer keywords (0.1.44: force=)
     t0 = _time.time()
     _text_state["kind"] = None
     _text_write(f"\n\n===== {_time.strftime('%Y-%m-%d %H:%M:%S')}  request: prompt {len(ids):,} tokens, max {max_new}, "
