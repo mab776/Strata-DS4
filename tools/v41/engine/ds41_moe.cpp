@@ -4148,13 +4148,13 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // ---- one grouped launch per (site, class); groups = distinct experts, entries = the tokens routing to them.
     // The PCIe site (arena misses + FILEG) DMAs into the kMaxParts d_stage slots IN WAVES: when the slots run out
     // mid-class, the group so far is launched and the slots are reused - every copy and kernel is on gp.s, so a
-    // copy into a slot queues behind the kernel that reads it. ----
+    // copy into a slot queues behind the kernel that reads it.
     // STRATA_D3_DMA_STREAM: the same copies, in the same order, on gp.s_dn into two banks of gp.d3_bank slots.  A wave
     // fills one bank (as above: `si` runs on across classes, and a full bank launches the group so far), then the
     // next wave fills the other bank while this one's kernel runs.  Before each launch `s` waits for the copies
     // issued so far (dn_ev[1]); after it, dn_ev[2 + bank] marks the bank's readers, and the copy stream waits on that
     // before it writes the bank again.  At d3_bank == kMaxParts the waves (and so every launch) are the stream-off
-    // ones; only the slot addresses differ.
+    // ones; only the slot addresses differ. ----
     const int bank_w = dn ? gp.d3_bank : kMaxParts;
     int bank = 0;                           // the bank being filled (dn only; bank 0 = the stream-off slots)
     bool bank_read[2] = {false, false};     // dn_ev[2 + b] is recorded after a kernel of this call that reads bank b
@@ -4171,75 +4171,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             bank_read[bank] = true;
         }
     };
-    // One PCIe-site expert's bytes onto the card (on stream `cs`): a d_stage slot (si = the next one), or - LRU
-    // admission, arena-held PCIe misses only, as gpu_run - its victim's VRAM slot.  False: no d_stage slot left.
-    auto stage_one = [&](int u, cudaStream_t cs, int& si) -> bool {
-        const int32_t e = ue[u];
-        const int64_t BL = BLX(e);
-        const uint8_t* src = gp.arena.ptr(layer, e);
-        if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
-            int b = 0;
-            while (fg_u[b] != u) ++b;
-            src = fg_src[b];
-        }
-        int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
-        if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
-        const bool demote = v >= 0 && arena_slot(v) < 0;
-        if ((v < 0 || demote) && si == bank_w) return false;
-        if (v < 0 || demote) {   // through a d_stage slot (the kernel reads it there)
-            uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
-            ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
-            dptr[u] = (unsigned long long) to;
-            ++si;
-        }
-        if (v >= 0) {
-            uint8_t* vs = gp.cache->device_slot(gp.cache->slot_of(layer, v));
-            im.vlast[(size_t) (layer * NXL + v)] = im.tick;   // not again in this pass
-            int32_t dem = -1;
-            if (demote) {   // stage holds e; victim -> e's arena slot (D2H after e's H2D read it), stage -> victim slot
-                dem = arena_slot(e);
-                ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) dem], vs, (size_t) BLX(v),
-                                   cudaMemcpyDeviceToHost, cs), "lru demote");
-                ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
-            } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
-                ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
-                dptr[u] = (unsigned long long) vs;
-            }
-            lru_old[n_lru] = v;
-            lru_dem[n_lru] = dem;
-            lru_new[n_lru++] = e;
-        }
-        return true;
-    };
-    // mab776 STRATA_D3_OVERLAP=1: the arena-held PCIe share is staged on the demand-copy stream BEFORE the hits kernels
-    // are queued (launch_site(HIT) below), so its DMAs land while those run; the PCIe site's groups wait for ev_dc.  The
-    // destinations (d_stage, LRU victims: not routed by this pass) are slots no hits kernel reads.  A call needing more
-    // d_stage slots than kMaxParts (waves) takes the serialized path.
-    // Not with STRATA_D3_DMA_STREAM (s_dn): that one moves the same copies to its own stream.
-    static const bool d3_ovl = std::getenv("STRATA_D3_OVERLAP") && std::getenv("STRATA_D3_OVERLAP")[0] == '1';
-    if (d3_ovl && !gp.s_dc) {
-        ck(cudaStreamCreateWithFlags(&gp.s_dc, cudaStreamNonBlocking), "dc stream");
-        ck(cudaEventCreateWithFlags(&gp.ev_dc, cudaEventDisableTiming), "ev_dc");
-    }
-    xsub(-1);
-    bool pre_staged[kMaxEnt] = {};
-    int si_pre = 0;
-    bool ovl = false;
-    if (d3_ovl && !dn) {
-        int need = 0;   // d_stage slots the whole PCIe site could need (every PCIe + file-tier miss, an upper bound)
-        for (int u = 0; u < nu; ++u) need += cls[u] == PCIE || cls[u] == FILEG;
-        ovl = need > 0 && need <= kMaxParts;
-        for (int u = 0; ovl && u < nu; ++u)
-            if (cls[u] == PCIE && (pre_staged[u] = stage_one(u, gp.s_dc, si_pre)) == false) ovl = false;
-        if (ovl) ck(cudaEventRecord(gp.ev_dc, gp.s_dc), "record demand copies");
-    }
     auto launch_site = [&](int want) {
         bool used[kMaxEnt] = {};
         auto in_site = [&](int u) { return cls[u] == want || (want == PCIE && cls[u] == FILEG); };
         int left = 0;
         for (int u = 0; u < nu; ++u) if (in_site(u)) ++left;
-        int si = want == PCIE && ovl ? si_pre : 0;   // the next d_stage slot (of the current bank)
-        const cudaStream_t wcs = want == PCIE && ovl ? gp.s_dc : cs;   // this site's copies (cs: s_dn when it is on)
+        int si = 0;   // the next d_stage slot (of the current bank)
         while (left > 0) {
             int c = -1;
             for (int u = 0; u < nu && c < 0; ++u)
@@ -4250,30 +4187,62 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
             for (int u = 0; u < nu; ++u) {
                 if (used[u] || !in_site(u) || im.g.cls(layer, ue[u]) != c) continue;
                 used[u] = true; --left;
-                if (want == PCIE && !pre_staged[u] && !stage_one(u, wcs, si)) {
-                    // the slots are all in this wave: launch it, then reuse them (the serialized path only)
-                    pcie_launch(c, ptr, start, dst, tok);
-                    ptr.clear(); start.clear(); dst.clear(); tok.clear();
-                    si = 0;
-                    if (dn) {   // the other bank; its last readers (an earlier wave) must be done first
-                        bank ^= 1;
-                        if (bank_read[bank]) ck(cudaStreamWaitEvent(gp.s_dn, gp.dn_ev[2 + bank], 0), "d3 dn bank wait");
+                if (want == PCIE) {
+                    const int32_t e = ue[u];
+                    const int64_t BL = BLX(e);
+                    const uint8_t* src = gp.arena.ptr(layer, e);
+                    if (cls[u] == FILEG) {   // its staging (or arena_adapt victim) slot = its index in fg_u
+                        int b = 0;
+                        while (fg_u[b] != u) ++b;
+                        src = fg_src[b];
                     }
-                    stage_one(u, wcs, si);
+                    // LRU admission (arena-held PCIe misses only, as gpu_run)
+                    int32_t v = (lru && cls[u] == PCIE && admit_ok(e)) ? lru_victim(e) : -1;
+                    if (v >= 0 && arena_slot(v) < 0 && arena_slot(e) < 0) v = -1;   // nowhere to demote to
+                    const bool demote = v >= 0 && arena_slot(v) < 0;
+                    if (v < 0 || demote) {   // through a d_stage slot (the kernel reads it there)
+                        if (si == bank_w) {   // the slots are all in this wave: launch it, then reuse them
+                            pcie_launch(c, ptr, start, dst, tok);
+                            ptr.clear(); start.clear(); dst.clear(); tok.clear();
+                            si = 0;
+                            if (dn) {   // the other bank; its last readers (an earlier wave) must be done first
+                                bank ^= 1;
+                                if (bank_read[bank]) ck(cudaStreamWaitEvent(gp.s_dn, gp.dn_ev[2 + bank], 0), "d3 dn bank wait");
+                            }
+                        }
+                        uint8_t* to = (uint8_t*) gp.d_stage + (size_t) (bank * bank_w + si) * (size_t) B;
+                        ck(cudaMemcpyAsync(to, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                        dptr[u] = (unsigned long long) to;
+                        ++si;
+                    }
+                    if (v >= 0) {
+                        uint8_t* vs = gp.cache->device_slot(gp.cache->slot_of(layer, v));
+                        im.vlast[(size_t) (layer * NXL + v)] = im.tick;   // not again in this pass
+                        int32_t dem = -1;
+                        if (demote) {   // stage holds e; victim -> e's arena slot (D2H after e's H2D read it), stage -> victim slot
+                            dem = arena_slot(e);
+                            ck(cudaMemcpyAsync((uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) dem], vs, (size_t) BLX(v),
+                                               cudaMemcpyDeviceToHost, cs), "lru demote");
+                            ck(cudaMemcpyAsync(vs, (const void*) dptr[u], (size_t) BL, cudaMemcpyDeviceToDevice, cs), "lru stage copy");
+                        } else {        // the DMA lands in the victim slot: the kernel reads it there, and it stays
+                            ck(cudaMemcpyAsync(vs, src, (size_t) BL, cudaMemcpyHostToDevice, cs), "pcie dma");
+                            dptr[u] = (unsigned long long) vs;
+                        }
+                        lru_old[n_lru] = v;
+                        lru_dem[n_lru] = dem;
+                        lru_new[n_lru++] = e;
+                    }
                 }
                 ptr.push_back(dptr[u]);
                 start.push_back((int32_t) dst.size());
                 for (int j = 0; j < NE; ++j)
                     if (ent_u[j] == u) { dst.push_back(j); tok.push_back(j / (int) K); }
             }
-            if (want == PCIE && ovl) {   // every copy queued so far on s_dc is home before this group's kernels
-                ck(cudaEventRecord(gp.ev_dc, gp.s_dc), "record demand copies");
-                ck(cudaStreamWaitEvent(gp.s, gp.ev_dc, 0), "wait demand copies");
-            }
             if (want == PCIE) pcie_launch(c, ptr, start, dst, tok);
             else launch_group(c, ptr, start, dst, tok);
         }
     };
+    xsub(-1);
     xsub(0);
     if (xprof) cudaEventRecord(xev[0], gp.s);
     launch_site(HIT);
