@@ -649,6 +649,10 @@ std::vector<std::pair<int32_t, int32_t>> rank_routes(const std::string& path, in
 
 }  // namespace
 
+#if defined(DS4_MOE_CUDA)
+void quantize_rows_q8_1(const float* x, void* xq, int64_t H, int nt, cudaStream_t s);   // below: <= 8 columns a call
+#endif
+
 // ================================ Ds41MoeImpl ================================
 
 struct Rebal;        ///< STRATA_ARENA_REBAL: the conversation-adaptive arena (defined with rebalance_*; null in a CPU build)
@@ -786,7 +790,9 @@ bool open_gpu1(Ds41MoeImpl& im, int dev, std::string& err) {
                ok(cudaEventCreateWithFlags(&g.ev, cudaEventDisableTiming), "event") &&
                ok(cudaEventCreateWithFlags(&g.c_ev, cudaEventDisableTiming), "event") &&
                ok(cudaMalloc(&g.d_x, (size_t) kMaxTok * H4), "d_x") &&
-               ok(cudaMalloc(&g.d_xq, strata::kernels::native_q8_1_bytes((int) H, kMaxTok)), "d_xq") &&
+               // kMaxTok (16 since xolotl 76d16570) q8_1 columns; the quantizer sizes at most 8, so one column x kMaxTok
+               // (the layout is per-column contiguous: Ds41MoeTier::init checks it)
+               ok(cudaMalloc(&g.d_xq, (size_t) kMaxTok * strata::kernels::native_q8_1_bytes((int) H, 1)), "d_xq") &&
                ok(cudaMalloc(&g.d_parts, (size_t) kMaxEnt * H4), "d_parts") &&
                ok(cudaMalloc(&g.d_meta, kMetaBytes), "d_meta") &&
                ok(cudaMalloc(&g.d_scratch, strata::kernels::native_expert_scratch_bytes(kMaxEnt, FF)), "d_scratch") &&
@@ -1126,7 +1132,7 @@ bool g1_launch(Ds41MoeImpl& im, int64_t layer, int nt, const float* x_host, int 
     if (!x_host) ck(cudaStreamWaitEvent(g.s, g.ev_x0, 0), "gpu1 wait x");
     ck(cudaMemcpyAsync(g.d_x, g.h_x, (size_t) nt * (size_t) H * 4, cudaMemcpyHostToDevice, g.s), "gpu1 x");
     ck(cudaMemcpyAsync(g.d_meta, g.h_meta, at, cudaMemcpyHostToDevice, g.s), "gpu1 meta");
-    strata::kernels::native_quantize_q8_1((const float*) g.d_x, g.d_xq, (int) H, nt, g.s);
+    quantize_rows_q8_1((const float*) g.d_x, g.d_xq, H, nt, g.s);   // > 8 rows (a 16-row pass): 8 per quantizer call
     const uint8_t* dm = (const uint8_t*) g.d_meta;
     for (const L& l : ls) {
         const int n = l.g1 - l.g0, ne = gstart[l.g1] - gstart[l.g0];
@@ -3976,9 +3982,12 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
     // (DS41_PROF_X: 1.6 ms of a 2.9 ms call).  STRATA_FILE_GPU=0: the pool computes them (the old path).
     static const bool file_gpu = !(std::getenv("STRATA_FILE_GPU") && std::getenv("STRATA_FILE_GPU")[0] == '0');
     int fg_u[kMaxFg], nfg = 0;
+    // mab776: kMaxParts per cpu::MAXT tokens OF THIS CALL (as the comment at kMaxFg says) - a <= 8-row call keeps the 8 it
+    // always had (kMaxFg for every call ran more misses on the card, and arena_adapt then kept another set)
+    const int fg_cap = std::min(kMaxFg, kMaxParts * ((nt + strata::kernels::cpu::MAXT - 1) / strata::kernels::cpu::MAXT));
     if (file_gpu) {
         for (int u = 0; u < nu; ++u)
-            if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < kMaxFg) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxFg blobs
+            if (cls[u] == CPU && !gp.arena.ptr(layer, ue[u]) && nfg < fg_cap) { cls[u] = FILEG; fg_u[nfg++] = u; }   // h_fstage: kMaxFg blobs
     }
     // arena_adapt (as gpu_run): every lookup is a use; each FILEG blob is read STRAIGHT into the arena slot of the
     // layer's least-recently-used arena expert not routed now (its slot big enough) - the DMA then sources it there,

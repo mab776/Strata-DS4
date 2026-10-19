@@ -1066,7 +1066,10 @@ int main(int argc, char ** argv) {
                 // D3: ONE batched per-class tier call for the pass's m tokens (the union of their experts is served
                 // once), not m run_to_dev calls.  Split at Ds41MoeTier::kMaxMulti (16: a depth-4 pass and a 16-row
                 // lookup verify / prompt pass are one call each).
-                constexpr int kMM = Ds41MoeTier::kMaxMulti;
+                // mab776 STRATA_TIER_ROWS=r (1..kMaxMulti, default kMaxMulti): rows per tier call - 8 = the split before
+                // xolotl 76d16570 (with a route bias on, the call size shapes the VRAM LRU set and so the output)
+                static const int kMM = std::getenv("STRATA_TIER_ROWS") ? std::max(1, std::min(Ds41MoeTier::kMaxMulti,
+                                           std::atoi(std::getenv("STRATA_TIER_ROWS")))) : Ds41MoeTier::kMaxMulti;
                 void * const sev = async_fin && m <= kMM ? dense.sum_event() : nullptr;
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
