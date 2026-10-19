@@ -19,8 +19,13 @@ docker run --rm --name ds4-build -e NVIDIA_VISIBLE_DEVICES=none --memory ${BUILD
       curl -sL https://github.com/ggml-org/llama.cpp/archive/\$COMMIT.tar.gz | tar -xz -C /tmp
       cp -a /tmp/llama.cpp-\$COMMIT/. third_party/llama.cpp/
     fi
-    # mab776: our ggml patches (tools/ds4/patches, e.g. the M10 tensor-core lightning indexer), applied once
-    for p in tools/ds4/patches/*.patch; do
+    # mab776: the V4 ggml patches, applied once in this order: V4's own (tools/ds4/patches: the lightning indexer, the
+    # hyper-connection ops) + the ones it shares with the V4.1 tree (tools/v41/ggml: top-k radix select - V4 sets
+    # GGML_TOPK_RADIX=1 -, the F16 vector kernel for verify passes, upstream's rank-argsort and llama.cpp fixes)
+    for p in tools/ds4/patches/ggml-lightning-indexer-count-mask.patch tools/ds4/patches/ggml-lightning-indexer-mma.patch \
+             tools/v41/ggml/mab776-topk-radix-select.patch tools/ds4/patches/ggml-zz-dsv4-hc-gates.patch \
+             tools/v41/ggml/mab776-mmvf-f16-batch.patch tools/ds4/patches/ggml-zzz-dsv4-hc-fused.patch \
+             tools/v41/ggml/rank-argsort.patch tools/v41/ggml/upstream-fixes.patch; do
       [ -f \"\$p\" ] || continue
       if (cd third_party/llama.cpp && git apply --check -R /src/\$p 2>/dev/null); then echo \"ggml patch already in: \$p\";
       elif (cd third_party/llama.cpp && git apply --check /src/\$p 2>/dev/null); then
