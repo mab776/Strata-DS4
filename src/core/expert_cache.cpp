@@ -645,18 +645,6 @@ int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
     return residency_[(size_t) (layer * n_expert_ + expert)];
 }
 
-int64_t ExpertCache::evict_from(int64_t first) {
-    if (per_layer_ || first < 0) return 0;
-    int64_t n = 0;
-    for (int32_t& r : residency_)
-        if (r != kNotResident && (int64_t) r >= first) {
-            r = kNotResident;
-            ++n;
-        }
-    if (next_free_ > first) next_free_ = first;
-    return n;
-}
-
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);

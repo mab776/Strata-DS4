@@ -288,7 +288,6 @@ struct Ds4MoeConfig {
     /// mab776 M7a: elastic GPU 0 cache (Strata-GLM's): opened in 64 MiB segments for `slot_gib_max` bytes in ranked
     /// order, seeded and mapped only up to `slot_gib` (the prompt chunks' VRAM stays free), and `grow_cache` maps +
     /// fills the rest after the prompt from the arena, which keeps that grow set.  0 = off.  Mixed blob sizes only.
-    double slot_gib_max = 0.0;
     /// vram_lru: the first `vram_pin_frac` of the seeded slots (the ranked order's head - the census-hot core) are
     /// never LRU victims; the rest of the cache follows the conversation (helios pins the census top 60%).
     double vram_pin_frac = 0.0;

@@ -443,7 +443,6 @@ struct Ds4MoeImpl {
     std::vector<std::pair<int32_t, int32_t>> seed_ranked;   ///< elastic cache: the seed's ranking, for grow_cache
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
     std::unique_ptr<Gpu1> g1;         ///< mab776 M7a: GPU 1's static tier (null = off)
-    std::vector<std::pair<int32_t, int32_t>> seed_ranked;   ///< mab776 M7a: the elastic seed's ranking (grow_cache)
     int64_t prompt_slots = 0;   ///< mab776 M6: the elastic cache's slots within the prompt budget (shrink_cache's target)
 };
 
@@ -1077,8 +1076,8 @@ bool ds4_moe_layer_layout(const Ds4MoeGeom& g, int64_t l, cpu::NativeFmt& f, std
 bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string& err) {
     try {
         // every shard of a split model (unsloth UD-Q3_K_M / UD-Q4_K_XL: shard 1 = metadata only, the experts later)
-        const GgufModel m = GgufModel::open(gguf);
-        const GgufFile& f = m.meta();
+        const GgufModel model = GgufModel::open(gguf);
+        const GgufFile& f = model.meta();
         // the architecture's own key prefix: deepseek4.*, mimo2.*, ... (the key names are llama.cpp's, shared)
         std::string arch = "deepseek4";
         if (const MetaValue* a = f.get("general.architecture"); a && a->type == MetaType::STRING) arch = a->s;
@@ -1117,7 +1116,7 @@ bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string&
             for (int r = 0; r < 3; ++r) {
                 char name[64];
                 std::snprintf(name, sizeof name, "blk.%lld.ffn_%s_exps.weight", (long long) l, roles[r]);
-                const TensorInfo* ti = m.find(name);
+                const TensorInfo* ti = model.find(name);
                 if (!ti) continue;
                 ++have;
                 // ne0 is the input width: gate/up are [n_embd, n_ff, n_experts], down is [n_ff, n_embd, n_experts].
