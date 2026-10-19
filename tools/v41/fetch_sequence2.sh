@@ -5,7 +5,7 @@
 #   then pack 48 (layer-14 Engram, Team CX2) in well before layer 14, then the rest of the backbone
 #   (17-46 = layers 14-39 + head/MTP).  Log: $MAIN/sequence2.log
 set -u
-F=~/AI/Strata-DS4/tools/v41/fetch_v41.sh
+F=~/AI/Xolotl/tools/v41/fetch_v41.sh
 MAIN=/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8
 E47=/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8
 E48="/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"

@@ -131,12 +131,13 @@ public:
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.
     bool grow(int64_t want_bytes, std::string& err);
+    /// Forgets every expert whose slot is >= `first_slot` (they become misses) and rewinds the sequential admission
+    /// to it - what a caller does before `shrink`ing to `first_slot` slots (the per-request elastic cache: the
+    /// prompt borrows the tail's VRAM, `grow` + re-admission give it back for decode; mab776's ds41 STRATA_KEEP_CACHE and
+    /// xolotl's shrink_cache_for use it the same way).  Returns how many it forgot.
+    int64_t evict_from(int64_t first_slot);
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
-    /// mab776 (ds41 STRATA_KEEP_CACHE): forgets every resident expert in slots [first, ...) - the caller's step before
-    /// `shrink` - and restarts the uniform admission counter there, so admitting the same experts again in slot order
-    /// hands out the same slots.  Uniform admission only (a per-layer cache returns 0 and changes nothing).
-    int64_t evict_from(int64_t first);
     /// The bytes the first `n` slots span.
     int64_t bytes_of(int64_t n) const { return slot_end(n < 0 ? 0 : n > slots_ ? slots_ : n); }
 
@@ -147,6 +148,11 @@ public:
     /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
+    /// Xolotl s6: put `expert` into a SPECIFIC free slot (one `evict_from` emptied) - how a shrunk cache gets the
+    /// experts it evicted back into exactly the slots they had (a sized cache's slot fits only its own blob class).
+    /// Not on the per-layer path.  Returns the slot, or kNotResident when the slot is out of range / taken / the
+    /// expert is already resident elsewhere.
+    int32_t admit_at(int64_t layer, int64_t expert, int32_t slot);
 
     /// Publish a same-layer replacement after its slot copy has completed.
     void replace(int64_t layer, int32_t old_expert, int32_t new_expert) {

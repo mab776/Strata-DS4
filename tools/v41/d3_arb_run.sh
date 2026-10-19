@@ -1,10 +1,10 @@
 #!/bin/bash
 # independent full-path prefill of prompt + a DSpark stream: every row's logits (row p predicts token p+1)
-DS=/home/mal/AI/Strata-DS4
+DS=/home/mal/AI/Xolotl
 G="/media/mal/SSD NVME/AI/V41-GSQ/V41-GSQ.gguf"
 EN="/media/Crucial1TB/V41-Engram:/media/mal/SSD NVME/AI/V41-Engram"
 R="/media/mal/SSD NVME/AI/V41-GSQ/rank.bin"
-W=/home/mal/AI/v41-dev/d2; cd "$DS" || exit 1
+W=/home/mal/AI/Strata-Backup/v41-dev/d2; cd "$DS" || exit 1
 for tag in "$@"; do
   until [ "$(awk '/MemAvailable/{printf "%d",$2/1048576}' /proc/meminfo)" -ge 75 ]; do sleep 5; done
   echo ">> arb_$tag $(date +%T)"

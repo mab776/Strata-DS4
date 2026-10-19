@@ -2,7 +2,7 @@
 
     python3 tools/v41/hf/hf_upload.py --dry-run           # show the plan, touch nothing remote, hash nothing
     bash tools/v41/hf/upload-start.sh                     # run it detached (survives closing the terminal / Claude)
-    tail -f ~/AI/v41-dev/hf/upload.log                    # watch it;  bash tools/v41/hf/upload-stop.sh  to pause
+    tail -f ~/AI/Strata-Backup/v41-dev/hf/upload.log                    # watch it;  bash tools/v41/hf/upload-stop.sh  to pause
 
 Resumable: every run lists what is already on the Hub and skips it.  The unit of work is one ~10 GiB part
 (V41-GSQ.gguf.part-NN-of-MM); an interrupted part is uploaded again (hf_xet usually skips the chunks it already has).
@@ -30,7 +30,7 @@ SMALL = [os.path.join(SRC_DIR, "rank.bin"), os.path.join(SRC_DIR, "V41-GSQ.gguf.
 TOKENIZER = os.path.join(SRC_DIR, "tokenizer")
 SIDECAR = "/media/mal/NVME1TB/Models/V41-Sidecar/V41-MTP-Vision.gguf"
 STAGE = "/media/mal/NVME1TB/hf-staging"
-WORK = os.path.expanduser("~/AI/v41-dev/hf")
+WORK = os.path.expanduser("~/AI/Strata-Backup/v41-dev/hf")
 STATE = os.path.join(WORK, "state.json")
 REPO = "IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored"
 PART = 10 << 30

@@ -5,7 +5,7 @@
 //
 //   ds41_generate -m V41-GSQ.gguf (--ids 1,2,3 | --ids-file f.i32) [-n 64] [--backend cuda|cpu] [--experts gpu|cpu]
 //                 [--engram DIR:DIR:DIR] [--slots auto|N] [--vram-margin GiB] [--arena-gib 60] [--rank r.bin]
-//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
+//                 [--vram-lru] [--arena-adapt] [--pcie 0.25] [--tier-batch-pcie 1.0] [--prefill-chunk N] [--prompt-batch B] [--chunk-mmq] [--ctx N]
 //                 [--temp 0] [--seed 1] [--stop id,id] [--ppl] [--no-actquant] [--kv-fp4] [--serve] [--quiet]
 //                 [--enc-skip|--no-enc-skip] [--enc-replay N] [--dump-last F] [--peer-device N]
 // --enc-skip (layer-major batches only; DEFAULT for one-shot runs, --no-enc-skip = full path): prompt tokens before the last --enc-replay (default 2560 = 128 * 20) stop
@@ -80,6 +80,7 @@ struct Args {
     int64_t slots = 0;            // 0 = auto (free VRAM after the dense half, minus --vram-margin)
     // defaults = the measured best decode config on the 4090 (2026-10-11): --pcie 0.75 --pf-b 1.43 --vram-lru
     double vram_margin_gib = 1.0, pcie = 0.75, arena_gib = 60.0, pf_b = 1.43;
+    double tier_batch_pcie = -1.0;   // < 0 = STRATA_TIER_BATCH_PCIE / 1.0
     int threads = 0, prefill_chunk = 0, prompt_batch = 8192;   // prompt_batch: layer-major batch B (0 = the chunk path)
     int64_t ctx = 0;
     float temp = 0.0f;
@@ -125,6 +126,7 @@ bool parse(int argc, char ** argv, Args & a) {
         else if (k == "--no-vram-lru") a.vram_lru = false;
         else if (k == "--arena-adapt") a.arena_adapt = true;
         else if (k == "--pcie") a.pcie = std::atof(next().c_str());
+        else if (k == "--tier-batch-pcie") a.tier_batch_pcie = std::atof(next().c_str());
         else if (k == "--pf-b") a.pf_b = std::atof(next().c_str());
         else if (k == "--prefill-chunk") a.prefill_chunk = std::atoi(next().c_str());
         else if (k == "--prompt-batch") a.prompt_batch = std::atoi(next().c_str());
@@ -639,6 +641,7 @@ int main(int argc, char ** argv) {
     mc.slots = a.slots > 0 ? a.slots : TG.n_layers * TG.n_experts;
     mc.slot_gib = a.slots > 0 ? 0.0 : slot_gib;
     mc.pcie_frac = a.pcie;
+    mc.tier_batch_pcie = a.tier_batch_pcie;
     mc.pf_b = a.pf_b;   // predicted prefetch (Ds41Dense::predict -> tier.prefetch), experts per layer
     mc.threads = a.threads;
     mc.arena_gib = a.arena_gib;
@@ -1107,9 +1110,28 @@ int main(int argc, char ** argv) {
         // route bias follows the VRAM set, so runs that must compare token for token (two drafters, plain decode) need
         // the same set; capped at the free VRAM minus the margin
         if (const char * e = std::getenv("STRATA_SEED_GIB")) seed_gib = std::min(seed_gib, std::atof(e));
-        tier.set_slot_gib(a.slots > 0 ? 0.0 : seed_gib);
+        // A slot budget of 0 is the tier's "NO LIMIT" (--slots given: the ranked head, up to `slots` experts).  The
+        // AUTO path passed it too whenever the card had no room (`free <= margin` clamps seed_gib to 0) - and "no
+        // limit" there asked for the WHOLE model's experts: s13 run8 hit exactly that (142.38 GiB requested, 0.53
+        // GiB free -> "VRAM seed failed" -> HTTP 400).  With no usable room the cache stays SHUT for this seed and
+        // the arena + file tier serve every miss: a slower decode, never a failed request.
+        const double min_gib = 1.0;   // below this the admission traffic is not worth the slots
+        const bool explicit_slots = a.slots > 0;
+        const bool cache_room = explicit_slots || seed_gib >= min_gib;
+        tier.set_cache_enabled(cache_room);
+        tier.set_slot_gib(explicit_slots ? 0.0 : seed_gib);
+        if (!cache_room) std::fprintf(stderr, "serve: VRAM %.2f GiB free (margin %.2f) - no room for the expert cache, "
+                                             "the arena + file tier serve the decode\n", seed_free, a.vram_margin_gib);
         const double ts = now_ms();
-        if (!tier.seed_from_ranked(ranked, err)) return false;
+        if (!tier.seed_from_ranked(ranked, err)) {
+            // the cache's own allocation is what fails on a busy card (the arena is host RAM and is built first):
+            // one more try with the cache off, so the request still runs
+            if (cache_room) {
+                std::fprintf(stderr, "serve: cache seed failed (%s) - seeding again with the VRAM cache off\n", err.c_str());
+                tier.set_cache_enabled(false);
+                if (!tier.seed_from_ranked(ranked, err)) return false;
+            } else return false;
+        }
         seed_s = (now_ms() - ts) / 1000.0;
         // mab776: the expert cache is sized HERE, after the drafter took its VRAM ("VRAM: ... free after the dense half"
         // at load time is before it) - a smaller drafter shows up as more experts in VRAM on this line
@@ -1148,12 +1170,49 @@ int main(int argc, char ** argv) {
     int64_t cp_st[7] = {};         // ... routed, then (predicted, hit) for top-6 / 8 / 12, summed over the batch's layers
     int bcap_n = 0, bcap_got = 0;  // serve DSpark seed captured from a layer-major batch (see the layer loop below)
     std::vector<float> bcap_vh;    // [bcap_n][3 * n_embd], as pass_v's vh
+    // the layer-major batch width for THIS turn: PB, clamped per request by the VRAM actually free (the --serve loop
+    // sets it; a one-shot run keeps PB)
+    int pb_cap = PB;
+    // STRATA_VRAM_TRACE=1: every allocation-relevant step prints the free VRAM (debugging a shared card)
+    const bool vram_trace = std::getenv("STRATA_VRAM_TRACE") != nullptr;
+    auto vram_log = [&](const char * where, int a) {
+        if (!vram_trace) return;
+        size_t tf = 0, tt = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(be), &tf, &tt);
+        std::fprintf(stderr, "vram trace: %s %d free %.2f GiB\n", where, a, tf / 1073741824.0);
+    };
     auto feed = [&](const int * ids, int n, int pos0, const std::function<void(int)> & progress,
                     std::vector<float> * all_logits) -> bool {
         for (int c0 = 0; c0 < n; ) {
             if (PB > 1 && n - c0 >= 2) {
                 // ---- layer-major: up to B tokens of every layer, the experts run once per layer over the whole batch
-                const int B = std::min(PB, n - c0);
+                int B = std::min(pb_cap, n - c0);
+                // The batch must FIT: its state columns (~0.31 MiB a column) and its graph (~0.17 MiB a column,
+                // 8192 -> 1424 MiB) come out of whatever is left after everything else sharing the card (a
+                // desktop's STT server, DSpark's 2.9 GB, the dense half).  A batch that does not fit is retried at
+                // HALF the width (twice the sweeps over the file tier, the same answer) down to SB, so a tight card
+                // makes a prompt slower instead of failing the request (s13 run8: "prefill failed: graph allocation
+                // failed" on a 21K prompt with Whisper's 2.5 GB resident).
+                for (;;) {
+                    if (B > dense.columns()) {
+                        if (dense.set_columns(B)) { if (rdev1) rdev1 = dense.routed_dev(); }
+                        else if (B > SB) {
+                            std::fprintf(stderr, "ds41_generate: %d state columns did not fit (%s) - retrying at %d\n",
+                                         B, dense.last_error().c_str(), std::max(SB, B / 2));
+                            B = std::max(SB, B / 2);
+                            continue;
+                        } else { ferr = dense.last_error(); return false; }
+                    }
+                    if (dense.begin_batch(ids + c0, B, pos0 + c0)) break;
+                    if (B > SB) {
+                        std::fprintf(stderr, "ds41_generate: batch of %d did not fit (%s) - retrying at %d\n",
+                                     B, dense.last_error().c_str(), std::max(SB, B / 2));
+                        B = std::max(SB, B / 2);
+                        continue;
+                    }
+                    ferr = dense.last_error();
+                    return false;
+                }
                 // enc-skip: columns whose global position is before `pos0 + n - ER` are phase A (layers past layer 20
                 // are never read for them), rounded DOWN to a sub-batch boundary so a straddling sub-batch still runs
                 // the full path (more work, never wrong); the last sub-batches holding the final token are always full.
@@ -1166,11 +1225,6 @@ int main(int argc, char ** argv) {
                     if (!enc_reported) { enc_reported = true; std::fprintf(stderr, "enc-skip: first batch B=%d, cut=%d (phase A %d cols, phase B %d)\n", B, cut, cut, B - cut); }
                 }
                 double t0 = now_ms();
-                if (B > dense.columns()) {
-                    if (!dense.set_columns(B)) { ferr = dense.last_error(); return false; }
-                    if (rdev1) rdev1 = dense.routed_dev();
-                }
-                if (!dense.begin_batch(ids + c0, B, pos0 + c0)) { ferr = dense.last_error(); return false; }
                 // mab776 STRATA_ENGRAM_AHEAD=1 (opt-in): the next batch's Engram reads start now, behind this batch's in
                 // the reader pool, so they land while this batch computes (123k fresh: the dense half waited ~5 s on them)
                 static const bool eng_ahead = std::getenv("STRATA_ENGRAM_AHEAD") && std::getenv("STRATA_ENGRAM_AHEAD")[0] == '1';
@@ -1179,6 +1233,7 @@ int main(int argc, char ** argv) {
                     if (B2 >= 2 && !dense.engram_ahead(ids + c0 + B, B2, pos0 + c0 + B)) { ferr = dense.last_error(); return false; }
                 }
                 for (int l = 0; l < n_layer; ++l) {
+                    if (l < 4) vram_log("batch layer", l);
                     // layer 20 is the last kv source: for phase A only its persistent KV writes run; layers 21-39 run
                     // nothing at all for phase A (their output columns are never read, and no later layer reads state
                     // a phase-A position would leave past layer 20)
@@ -1253,6 +1308,7 @@ int main(int argc, char ** argv) {
                     float * rdev = routed_host ? nullptr : dense.routed_dev();
                     // mab776 STRATA_FN_DEV=1: the experts' input stays on the card (attn_router_span skipped its readback)
                     const float * fdev = rdev && Ds41Dense::fn_dev_on() ? dense.batch_fn_dev() : nullptr;
+                    if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
                         const bool ok = fdev ? tier.run_chunk_dev_x(l, pn, dense.batch_ids() + (size_t) s * top_k,
@@ -1397,7 +1453,25 @@ int main(int argc, char ** argv) {
         std::vector<int> hist;
         int snap_len = -1;
         std::vector<float> snap_logits;   // the last prompt row's logits at the snapshot (a repeated prompt samples from them)
+        // s6: DSpark's seed rows (main_hidden) of the snapshot's prompt tail - a repeated prompt (regenerate / a client
+        // retry) feeds no new tokens, so without them DSpark had nothing to seed from and the whole answer decoded
+        // without drafts (measured: 21.9 vs 31.8 tok/s on the same 1200-token edit).  cur_seed = this prompt's tail.
+        std::vector<float> snap_seed, cur_seed;
+        int snap_seed_n = 0, cur_seed_n = 0;
         int n_req = 0;
+        // STRATA_SERVE_PARK (default on): an agent harness sends short UNRELATED requests between the turns of its main
+        // conversation (titles, summaries).  Each wrote its own positions from 0 over the main conversation's caches, so
+        // the next main turn re-read the whole prompt (2026-10-15 harness: a 454-token side call -> the 20,736-token
+        // system prompt again, 69.5 s).  Now the main conversation is parked (Ds41Dense::park: the snapshot rings + the
+        // rows the side request can write, to host memory) and unparked when a request continues it.
+        // STRATA_SERVE_PARK_MIN: only conversations of >= this many tokens (default 2048); STRATA_SERVE_PARK_MAX: the
+        // most positions a side request may write (prompt + max tokens, default 65536 ~ 1 GB of host memory).
+        const bool park_on = !(std::getenv("STRATA_SERVE_PARK") && std::getenv("STRATA_SERVE_PARK")[0] == '0');
+        const int park_min = std::getenv("STRATA_SERVE_PARK_MIN") ? std::atoi(std::getenv("STRATA_SERVE_PARK_MIN")) : 2048;
+        const int64_t park_max = std::getenv("STRATA_SERVE_PARK_MAX") ? std::atoll(std::getenv("STRATA_SERVE_PARK_MAX")) : 65536;
+        std::vector<int> park_hist;       // the parked conversation's tokens (its snapshot length)
+        std::vector<float> park_logits;
+        int64_t park_rows = 0;            // positions saved: a request writing past this invalidates the park
         bool cache_open = !defer_vram;   // deferred: the arena only until the first decode
         static constexpr uint64_t kDspMagic = 0x4b50534431345344ull;   // mab776: a parked blob's DSpark trailer ("DS41DSPK")
 #if defined(DS41_HAVE_DSPARK)
@@ -1535,11 +1609,57 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+            bool unparked = false;
+            int reuse_override = -1;   // a partial unpark: resume at the longest common prefix (see below)
+            size_t lp_show = 0;        // how far this request actually continues the PARKED conversation (logged)
+            if (dense.parked()) {   // does this request continue the parked conversation (better than the live one)?
+                size_t lp = 0;
+                while (lp < park_hist.size() && lp < ids.size() && park_hist[lp] == ids[lp]) ++lp;
+                lp_show = lp;
+                // STRATA_SERVE_PARK_PARTIAL (default on): a request that continues MOST of the parked conversation is
+                // worth restoring, not only one that continues ALL of it.  A chat template that re-renders its tail -
+                // or an EMPTY assistant turn, as the s13 harness produces - leaves lp just under park_hist.size(), and
+                // requiring an exact prefix threw away a 21,349-token cache over a 27-token difference: run8/run15 both
+                // logged "reuse lcp=27 hist=0 snap=-1 prompt=23531 -> reused=0" and re-read the whole prompt.
+                // Positional caches make a partial resume safe: unpark() restores positions [0, park_size) and the
+                // forward pass then re-feeds from lp, overwriting the stale tail (that is the documented fix: "resume
+                // at the longest common prefix even when it is below the snapshot").
+                static const bool park_partial = !(std::getenv("STRATA_SERVE_PARK_PARTIAL") && std::getenv("STRATA_SERVE_PARK_PARTIAL")[0] == '0');
+                const size_t lp_min = (size_t) std::max<int64_t>(park_min, (int64_t) park_hist.size() * 3 / 4);
+                if (park_partial && lp < park_hist.size() && lp >= lp_min && lp > lcp && dense.unpark()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation at lcp %zu (partial: re-feeds from there)\n",
+                                 park_hist.size(), lp);
+                    hist = park_hist;
+                    snap_len = -1;        // the tail under the park's end is re-fed, so no snapshot survives this
+                    reuse_override = (int) lp;
+                    lcp = lp;
+                    unparked = true;
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;        // DSpark's window holds the side request's states
+#endif
+                } else if (lp == park_hist.size() && lp > lcp && dense.unpark()) {
+                    std::fprintf(stderr, "serve: unparked the %zu-token conversation\n", park_hist.size());
+                    hist = park_hist;
+                    snap_len = (int) park_hist.size();
+                    snap_logits = park_logits;
+                    snap_seed_n = 0;
+                    lcp = lp;
+                    unparked = true;   // the live rings are the side request's: resume through restore()
+#if defined(DS41_HAVE_DSPARK)
+                    dsp_next = -1;     // DSpark's window holds the side request's states
+#endif
+                } else if ((int64_t) ids.size() + std::max(0, max_new) > park_rows) {
+                    dense.drop_park();   // this request writes past the saved rows
+                    std::fprintf(stderr, "serve: park dropped (request reaches past %lld positions)\n", (long long) park_rows);
+                }
+            }
             int reused = 0;
 #if defined(DS41_HAVE_DSPARK)
             bool dsp_regen = false;   // mab776 STRATA_DSPARK_SNAP: a regenerate with the drafter's window restored
 #endif
-            if (!hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
+            bool regen = false;   // the snapshot's own prompt again: nothing new to feed
+            if (reuse_override >= 0) reused = reuse_override;   // a partial unpark: positions [0, lp) are the parked one's
+            else if (!unparked && !hist.empty() && lcp == hist.size() && lcp < ids.size()) reused = (int) lcp;
             else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len == ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);   // the same prompt again (regenerate): its end state + saved logits
                 reused = snap_len;
@@ -1548,6 +1668,7 @@ int main(int argc, char ** argv) {
                 dsp_restore(reused);
                 dsp_regen = dsp_next == reused;
 #endif
+                regen = true;
             } else if (snap_len > 0 && lcp >= (size_t) snap_len && (size_t) snap_len < ids.size() && dense.restore()) {
                 hist.resize((size_t) snap_len);
                 reused = snap_len;
@@ -1568,11 +1689,20 @@ int main(int argc, char ** argv) {
                 dsp_restore(reused);   // its ring slot for that position is rewritten by the tail, as the trunk's rows
 #endif
             } else {
+                // an unrelated request: park the conversation it would overwrite (see STRATA_SERVE_PARK)
+                const int64_t rows = (int64_t) ids.size() + (max_new > 0 ? max_new : park_max) + 64;
+                if (park_on && !park.on && !dense.parked() && snap_len >= park_min && hist.size() >= (size_t) snap_len && rows <= park_max
+                    && dense.park(rows)) {
+                    park_hist.assign(hist.begin(), hist.begin() + snap_len);
+                    park_logits = snap_logits;
+                    park_rows = rows;
+                    std::fprintf(stderr, "serve: parked the %d-token conversation (%lld positions saved)\n", snap_len, (long long) rows);
+                }
                 hist.clear();
                 snap_len = -1;
             }
-            std::fprintf(stderr, "serve: reuse lcp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp, hist.size(), snap_len,
-                         ids.size(), reused);
+            std::fprintf(stderr, "serve: reuse lcp=%zu park=%zu lp=%zu hist=%zu snap=%d prompt=%zu -> reused=%d\n", lcp,
+                         park_hist.size(), lp_show, hist.size(), snap_len, ids.size(), reused);
             if (reused > 0) { std::printf("RESUME %d\n", reused); std::fflush(stdout); }
             const int total = (int) ids.size();
             // a long prompt runs layer-major without the VRAM cache (its pass / chunk buffers need that VRAM) and with
@@ -1627,7 +1757,11 @@ int main(int argc, char ** argv) {
             static const int keep_max = std::getenv("STRATA_KEEP_CACHE") ? std::atoi(std::getenv("STRATA_KEEP_CACHE")) : 0;
             static const double keep_free = std::getenv("STRATA_KEEP_CACHE_FREE_GIB") ? std::atof(std::getenv("STRATA_KEEP_CACHE_FREE_GIB")) : 10.0;
             bool kept = false;
+            bool kept_x = false;   // xolotl STRATA_SERVE_KEEP_CACHE (opt-in)
             double ph_shrink = 0;
+            if (Ds41MoeTier::keep_cache_mode() && !by_step && dh >= 2 && !(defer_vram && cache_open))
+                std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
+                             (int) cache_open);
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 std::string kerr;
                 const double tk0 = now_ms();
@@ -1636,14 +1770,45 @@ int main(int argc, char ** argv) {
                     tier.set_keep_batch(true);
                 } else {
                     if (keep_max > 0 && dh <= keep_max) std::fprintf(stderr, "keep-cache: shrink refused (%s) - released\n", kerr.c_str());
-                    tier.release_cache();
-                    cache_open = false;
+                    static const int keep_max_x = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
+                    if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max_x && !mc.cpu_only) {
+                        const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
+                                            a.vram_margin_gib * 1073741824.0;
+                        std::string kerr;
+                        const int64_t g = tier.shrink_cache_for((int64_t) need, kerr);
+                        if (g >= 0) {
+                            kept_x = true;
+                            std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
+                                         dh, (long long) g, (long long) tier.resident());
+                        } else if (!kerr.empty()) {
+                            std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
+                        }
+                    }
+                    if (!kept_x) {
+                        tier.release_cache();
+                        cache_open = false;
+#if defined(DS41_HAVE_DSPARK)
+                        // STRATA_SERVE_DSPARK_EVICT=N (s6, opt-in until measured; 0 = off): a batch of >= N new tokens also
+                        // frees DSpark's ~2.9 GB of weights for its duration - the prompt batch is sized from free VRAM
+                        // (s6: 8731 columns before DSpark loads, 5434 after), so a long prompt takes fewer expert sweeps.
+                        // open_cache() re-creates it for the tail (~1-4 s); the window is re-seeded by the tail as always.
+                        static const int dsp_evict = std::getenv("STRATA_SERVE_DSPARK_EVICT") ? std::atoi(std::getenv("STRATA_SERVE_DSPARK_EVICT")) : 0;
+                        if (dsp && dsp_evict > 0 && dh >= dsp_evict) {
+                            dsp.reset();
+                            std::fprintf(stderr, "serve: DSpark weights freed for a %d-token batch\n", dh);
+                        }
+#endif
+                    }
                 }
                 ph_shrink = now_ms() - tk0;
                 bias_now = a.bias_prompt > 0;
                 apply_bias();
             }
+            tier.rebalance_begin_prompt();
             tier.reset_stats();
+            if (const char* rl = std::getenv("STRATA_ROUTE_LOG")) {   // a turn marker for the route log (see ds41_moe.cpp)
+                if (FILE* f = std::fopen(rl, "a")) { std::fprintf(f, "# turn %d new %d %s\n", n_req, dh, by_step ? "passes" : "batch"); std::fclose(f); }
+            }
             const double tp0 = now_ms();
             auto pp = [&](int done) {
                 const double ms = now_ms() - tp0;
@@ -1668,12 +1833,53 @@ int main(int argc, char ** argv) {
             static const int dump_tail = std::getenv("STRATA_SERVE_DUMP_TAIL") ? std::atoi(std::getenv("STRATA_SERVE_DUMP_TAIL")) : 0;
             tail_keep = dump_tail > 0 ? std::min(dump_tail, delta) : 0;
             tail_logits.clear();
+            // VRAM-aware batch width for this turn (feed() halves it again if even this does not fit): the batch's
+            // state columns + graph are ~0.48 MiB a column, and the card is shared with whatever else the desktop
+            // runs.  This is what lets a big --prompt-batch stay OPT-IN: the engine takes what is actually free.
+            pb_cap = PB;
+            if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
+                size_t frb = 0, totb = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(be), &frb, &totb);
+                // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
+                // run9/run13/run14, a 4 GiB foreign process): free 9.28 GiB with B=8192 failed, free 9.26 with
+                // B=5210 passed, free 5.92 with B=2411 failed, a free card with B=8192 passed - all four fit
+                //     need(B) ~= 4.3 GiB + 0.95 MiB * B
+                // 4.3 GiB fixed = the tier's two 1 GiB stage halves + a ~2.19 GiB graph buffer that is the SAME
+                // SIZE at B=2411 and B=8192 (so it is not the piece buffers; identity unconfirmed - see the
+                // residuals in V41_START_HERE).  0.95 MiB a column = columns 0.32 + graph 0.17 + part buffers 0.41,
+                // measured directly.  Per-tensor arithmetic undercounted the tier 2x and let a 2.19 GiB allocation
+                // fail while cudaMemGetInfo still said 6.83 GiB free.  A free card (>= 13 GiB) still gets its full PB.
+                // run20 (2026-10-16) fixes the GRAPH term: the pass-graph buffer is B-INDEPENDENT - the B=16384 leg
+                // OOM'd on "allocating 1424.31 MiB", the very size this comment records for 8192, so "graph 0.17 MiB
+                // a column" is a mis-derivation (1424/8192) and the decomposition is really ~5.7 GiB fixed + 0.78 a
+                // column.  Same line, same fit - but it matters: a wide batch's per-column STATE is what starves the
+                // fixed graph buffer (16384 = 5.14 GiB of state, 1.03 GiB short), not the graph itself.
+                const double room = (double) frb - a.vram_margin_gib * 1073741824.0 - 4.3 * 1073741824.0;
+                const int fit = (int) std::max<int64_t>(2, (int64_t) (room / (0.95 * 1048576.0)));
+                pb_cap = std::min(PB, std::max(SB, fit));
+                if (vram_trace) std::fprintf(stderr, "vram trace: cap free %.2f GiB room %.2f GiB fit %d -> pb_cap %d\n",
+                                             frb / 1073741824.0, room / 1073741824.0, fit, pb_cap);
+                if (pb_cap < PB) std::fprintf(stderr, "serve: VRAM %.2f GiB free -> prompt batch %d (of %d)\n",
+                                              frb / 1073741824.0, pb_cap, PB);
+            }
             const double tph0 = now_ms();
             const double fd0[3] = { fd_dense, fd_tier, fd_logits };   // this request's batch split (stderr)
             bcap_n = bcap; bcap_got = 0;
             if (bcap > 0) bcap_vh.assign((size_t) bcap * 3 * n_embd, 0.0f);
             bool ok = total == reused || dh == 0 || (by_step ? feed_steps() : feed(ids.data() + reused, dh, reused, pp, nullptr));
             bcap_n = 0;
+            if (kept_x) {   // xolotl: the batch is done: the tail slots back (exactly the evicted experts), decode biases on
+                std::string kerr;
+                dense.release_pass();   // the batch's pass buffers first (open_cache does the same before a seed)
+                if (tier.regrow_cache(kerr) < 0) {
+                    std::fprintf(stderr, "serve: keep-cache regrow: %s - re-seeding\n", kerr.c_str());
+                    tier.release_cache();
+                    cache_open = false;
+                } else {
+                    bias_now = true;
+                    apply_bias();
+                }
+            }
             double ph_feed = now_ms() - tph0, ph_open = 0, ph_tail = 0;   // the request's prompt phases (stderr)
             double ph_regrow = 0;
             bool nonfinite = false;   // mab776 STRATA_NAN_GUARD
@@ -1683,7 +1889,7 @@ int main(int argc, char ** argv) {
                 tier.set_keep_batch(false);
                 dense.release_pass();   // the pass allocator grew for the batch graphs: its VRAM is the tail's
                 std::string kerr;
-                if (!tier.regrow_cache(kerr)) {
+                if (!tier.regrow_kept(kerr)) {
                     std::fprintf(stderr, "keep-cache: regrow failed (%s) - the cache reopens\n", kerr.c_str());
                     tier.release_cache();
                     cache_open = false;
@@ -1715,6 +1921,11 @@ int main(int argc, char ** argv) {
                         for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
                         const bool last = i0 + m == total;
                         if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // the batch's last row
+                        if (i0 == c0s) cur_seed_n = 0;
+                        cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
+                        std::copy_n(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, (size_t) m * 3 * n_embd,
+                                    cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
+                        cur_seed_n += m;
                         if (!dsp->step(bcap_vh.data() + (size_t) (i0 - c0s) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
                                        last ? sp_ids : sp_tmp, sp_conf)) {
                             ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
@@ -1732,6 +1943,10 @@ int main(int argc, char ** argv) {
                         std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
                         sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
                     }
+                    if (i0 == total - sp_tail) cur_seed_n = 0;
+                    cur_seed.resize((size_t) (cur_seed_n + m) * 3 * n_embd);
+                    std::copy_n(vh.data(), (size_t) m * 3 * n_embd, cur_seed.data() + (size_t) cur_seed_n * 3 * n_embd);
+                    cur_seed_n += m;
                     if (!dsp->step(vh.data(), spos.data(), m, last ? sp_t : -1, last ? sp_ids : sp_tmp, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); ok = false; break;
                     }
@@ -1742,8 +1957,30 @@ int main(int argc, char ** argv) {
             } else if (ok && dsp_regen && delta == 0 && !nonfinite) {   // mab776 STRATA_DSPARK_SNAP: a regenerate's first
                 sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // token, and its drafts from the
                 if (!dsp->redraft(sp_t, sp_ids, sp_conf)) sp_t = -1;                   // restored window (else: plain decode)
+            } else if (ok && regen && dsp && snap_seed_n > 0) {   // a repeated prompt: re-seed DSpark from the snapshot's rows
+                const double tt0 = now_ms();
+                dsp->reset();
+                std::vector<int> spos;
+                const int s0 = total - snap_seed_n;
+                for (int i0 = s0; i0 < total; i0 += 16) {
+                    const int m = std::min(16, total - i0);
+                    spos.resize((size_t) m);
+                    for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
+                    const bool last = i0 + m == total;
+                    if (last) sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);
+                    if (!dsp->step(snap_seed.data() + (size_t) (i0 - s0) * 3 * n_embd, spos.data(), m, last ? sp_t : -1,
+                                   last ? sp_ids : sp_tmp, sp_conf)) {
+                        std::fprintf(stderr, "serve: DSpark re-seed: %s (decoding without drafts)\n", dsp->last_error().c_str());
+                        dsp->reset();
+                        sp_t = -1;
+                        break;
+                    }
+                }
+                ph_tail = now_ms() - tt0;
+                std::fprintf(stderr, "serve: repeated prompt - DSpark re-seeded from %d saved rows (%.2f s)\n", snap_seed_n, ph_tail / 1000.0);
             }
 #endif
+            dense.prof_report("turn");
             std::fprintf(stderr, "serve: prompt phases: %d new = %d %s (%.2f s: dense %.2f, experts %.2f, logits %.2f) + DSpark tail %d%s "
                          "(cache open %.2f s, seed %.2f s)%s\n", delta, dh, by_step ? "passes" : "batch", ph_feed / 1000.0,
                          (fd_dense - fd0[0]) / 1000.0, (fd_tier - fd0[1]) / 1000.0, (fd_logits - fd0[2]) / 1000.0,
@@ -1779,7 +2016,10 @@ int main(int argc, char ** argv) {
 #if defined(DS41_HAVE_DSPARK)
                 dsp_snap_len = dsp_snap_on && dsp && dsp->save_state(dsp_snap) ? total : -1;
 #endif
+                snap_seed.swap(cur_seed);   // this prompt's DSpark tail rows (0 rows when DSpark is off / no tail ran)
+                snap_seed_n = cur_seed_n;
             }
+            cur_seed_n = 0;
             if (const char * dd = std::getenv("STRATA_SERVE_DUMP")) {   // exactness checks: request N's last-row logits
                 char nb[32];
                 std::snprintf(nb, sizeof(nb), "/req%03d.f32", n_req);
@@ -1808,6 +2048,7 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: VRAM %.2f GiB free -> %lld experts in VRAM (seed %.2f s)\n", seed_free,
                              (long long) tier.resident(), seed_s);
             }
+            if (ok) tier.rebalance_plan();
             tier.reset_stats();
             const double td0 = now_ms();
             int gen = 0, pos = total;
@@ -1918,6 +2159,7 @@ int main(int argc, char ** argv) {
                     dirty = acc < nd;
                     P += 1 + acc;
                     t = tn;
+                    tier.rebalance_tick();   // xolotl STRATA_ARENA_REBAL
                     if (!more) break;
                 }
                 dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
@@ -1944,6 +2186,7 @@ int main(int argc, char ** argv) {
                 hist.push_back(tok);
                 ++pos;
                 if (rows_nonfinite(lg.data(), nv, 1)) { nonfinite = true; finish = "nonfinite"; break; }
+                tier.rebalance_tick();
             }
             const double dec_ms = now_ms() - td0;
             if (nonfinite) {   // mab776 STRATA_NAN_GUARD: everything that may carry the poison goes; the next request reads from 0
@@ -1977,6 +2220,7 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: lookup %ld of the passes, %ld drafted, %ld accepted (%.0f %%)\n", lk_passes,
                              lk_drafts, lk_acc, 100.0 * (double) lk_acc / std::max(1L, lk_drafts));
 #endif
+            tier.rebalance_tick(true);   // the gap until the next request: retire a large batch for the reader
             std::printf("DONE %d %d %.1f %.1f %s 0 0 %d %lld %lld 0 %lld 0 %d\n", gen, total, prompt_ms, dec_ms, finish, reused,
                         (long long) (st.hits + st.gpu1), (long long) st.lookups(), (long long) st.file_tier, total - reused);   // (GPU 1: hits)
             std::fflush(stdout);
@@ -2155,6 +2399,9 @@ int main(int argc, char ** argv) {
     // for it), except the ratio-2 compressor's 2-slot state ring: a pass writes its LAST 2 tokens' states, so after a
     // rejection a pass that starts at an odd position re-feeds the last accepted token (its group's state then comes
     // from inside the pass).
+    // STRATA_ROUTE_TRACE=<file> (measurement only): the verify passes' routing + acceptance, for
+    // tools/v41/sim/route_sim.py (session 13: in-pass draft pruning and the VRAM replacement policy, replayed offline)
+    if (const char * rt = std::getenv("STRATA_ROUTE_TRACE")) tier.trace_open(rt);
     long sp_pass = 0, sp_acc = 0, sp_refeed = 0, sp_full = 0;
     const bool sp_noacc = std::getenv("STRATA_DSPARK_NOACC") != nullptr;
     double sp_vms = 0, sp_dms = 0;
@@ -2217,6 +2464,11 @@ int main(int argc, char ** argv) {
                 for (int i = 0; i < spec_depth; ++i) std::fprintf(conf_log, " %.4f", sig(sp_conf[i]));
                 std::fprintf(conf_log, "\n");
                 std::fflush(conf_log);
+            }
+            {   // STRATA_ROUTE_TRACE: 'P' {m, k, acc, refeed, verify ms, conf p0..p4}
+                float pm[10] = { (float) vt.size(), (float) k, (float) acc, (float) refeed, (float) (now_ms() - tv) };
+                for (int i = 0; i < 5; ++i) pm[5 + i] = i < spec_depth ? sig(sp_conf[i]) : 0.0f;
+                tier.trace_mark(pm, 10);
             }
             int spos[6];
             for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;

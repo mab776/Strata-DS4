@@ -16,15 +16,15 @@ namespace strata::kernels::cpu {
 
 /// Bytes of the largest quantized gate/up activation any native layer uses.  DeepSeek-V4's n_embd 4096 as Q8_K
 /// (IQ2_XXS's vec_dot_type) is 16 x 292 = 4672, the largest; Qwen's 2560 as Q8_K is 2920 and 4096 as Q8_0 is 4352.
-inline constexpr size_t kNativeActBytes = 5840;   // Strata-DS4 fork: DeepSeek-V4.1 n_embd 5120 as Q8_K (20 x 292)
+inline constexpr size_t kNativeActBytes = 5840;   // xolotl: the MAX over every merged model (DS4 n_embd 5120 as Q8_K = 20 x 292)
 /// Bytes of the largest quantized down activation.  DeepSeek-V4's n_ff 2048 as Q8_K (Q2_K's vec_dot_type) is
 /// 8 x 292 = 2336, the largest; Qwen's 640 as Q8_0 is 20 x 34 = 680.
-inline constexpr size_t kNativeHBytes = 2628;   // Strata-DS4 fork: DeepSeek-V4.1 n_ff 2304 as Q8_K (9 x 292)
+inline constexpr size_t kNativeHBytes = 2628;   // xolotl: the MAX over every merged model (DS4 n_ff 2304 as Q8_K = 9 x 292)
 /// The widest native expert intermediate (n_ff) any model has.  DeepSeek-V4's 2048 is twice Qwen's 640, so the
 /// pool's per-expert row buffers (ExpertPool::SplitBufMulti::ff) must be sized by THIS and not by the canonical
 /// `FF` (640) that the Q2_0 pack path uses: `native_gu_rows` writes rows [0, n_ff) of the model's own width, and
 /// a buffer sized for Qwen overflows silently into the neighbouring struct (found by tools/ds4/moe_replay).
-inline constexpr int kNativeFFMax = 2304;   // Strata-DS4 fork: DeepSeek-V4.1 n_ff
+inline constexpr int kNativeFFMax = 2304;   // xolotl: the MAX over every merged model (DS4 n_ff 2304 > GLM 2048) - undersizing overflows silently
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -43,7 +43,14 @@ struct NativeFmt {
     /// DeepSeek-V4's SwiGLU clamp (`swiglu_clamp_exp`): gate -> min(gate, lim), up -> clamp(up, -lim, lim) before
     /// silu(gate) * up.  +inf (the default, every other model) = no clamp, bit-identical to the unclamped kernels.
     float swiglu_limit = std::numeric_limits<float>::infinity();
+    /// NVFP4 (ggml type 40) only: the blob ends with {s_gate, s_up, s_down, 0} at this offset, the per-expert
+    /// weight_scale_2 the block format has no room for (tools/iq_pack.py). 0 = no tail. Each scale goes on its own
+    /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
+    /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
+    size_t tail_off = 0;
 };
+constexpr int kNvfp4Type = 40;
+constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;

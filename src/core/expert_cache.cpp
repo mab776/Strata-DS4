@@ -3,7 +3,7 @@
 
 // #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
 // the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
 #define STRATA_EC_NO_VMM 1
 #endif
 
@@ -630,18 +630,19 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
+int64_t ExpertCache::evict_from(int64_t first_slot) {
+    if (first_slot < 0) first_slot = 0;
+    int64_t n = 0;
+    for (auto& r : residency_)
+        if (r != kNotResident && r >= first_slot) { r = kNotResident; ++n; }
+    if (next_free_ > first_slot) next_free_ = first_slot;
+    admitted_ = admitted_ > n ? admitted_ - n : 0;
+    return n;
+}
+
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     return residency_[(size_t) (layer * n_expert_ + expert)];
-}
-
-int64_t ExpertCache::evict_from(int64_t first) {
-    if (per_layer_ || first < 0) return 0;
-    int64_t n = 0;
-    for (auto& r : residency_)
-        if (r != kNotResident && (int64_t) r >= first) { r = kNotResident; ++n; }
-    if (next_free_ > first) next_free_ = first;
-    return n;
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
@@ -662,6 +663,19 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
+}
+
+int32_t ExpertCache::admit_at(int64_t layer, int64_t expert, int32_t slot) {
+    if (per_layer_ || layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
+    if (slot < 0 || slot >= live_slots_) return kNotResident;
+    const size_t at = (size_t) (layer * n_expert_ + expert);
+    if (residency_[at] != kNotResident) return kNotResident;
+    for (const int32_t r : residency_)   // the slot must be empty (evict_from cleared it)
+        if (r == slot) return kNotResident;
+    residency_[at] = slot;
+    if (next_free_ < (int64_t) slot + 1) next_free_ = (int64_t) slot + 1;
+    ++admitted_;
+    return slot;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {

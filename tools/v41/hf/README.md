@@ -24,12 +24,18 @@ tags:
 
 **A 552B-parameter MoE running on one gaming PC — RTX 4090 (24 GB) + 90 GB RAM + NVMe**
 
-**Prefill ~250 tok/s (exact) · Decode ~26 tok/s (~27 with the opt-in ggml patch)**
+**Prefill ~250 tok/s (exact) · DSpark decode 17–30 tok/s at the coding-safe bias · 512K context**
 
 Runs on **[Strata-DSV4.1](https://github.com/Indras-Mirror/Strata-DSV4.1)**, an engine built for exactly this model and
 this class of machine, on top of [Strata](https://github.com/Niko1221/Strata).
 
 </div>
+
+> **Update 2026-10-15:** the engine's defaults are now the **coding-safe route bias ×0.5** (HumanEval 20/21 and tool calls
+> 10/10, vs 16/21 at the old full bias) with DSpark speculative decoding **in the server** (exact speculative sampling),
+> a confidence-gated verify (prose 9.5 → 17.3, code 18.8 → 25.5, python 26.6 → 29.1 tok/s), a **bit-exact 4-bit KV cache**
+> (`--kv-fp4`, +1.1 GiB VRAM at 512K) and ~2× faster conversational turns (+1000-token turn 40 → 20 s at 512K).
+> Details: the repo README "Latest".
 
 > **Upload complete (2026-10-13):** all 16 model parts, `V41-MTP-Vision.gguf` and the small files are on the Hub.
 > `SHA256SUMS` lists every part; `reassemble.sh` refuses to join until all of them are present and intact.
@@ -163,9 +169,27 @@ checkpoint ("teacher"):
 Top-1 token agreement: 0.674 (GSQ) vs 0.701 (teacher). In the engine, a 4096-token code prompt gives ppl 2.380 and top-1 0.822.
 
 **Prompt processing is exact:** every prefill speed-up in the engine keeps the last-token logits byte-identical.
-**Decode uses two selection-only routing biases by default:** a bonus for VRAM-resident experts and a penalty for
-NVMe ones. They trade a little perplexity for speed (code 2.38 → 2.87). The mixing weights stay exact, every expert
-stays reachable, and `--route-bias 0 --route-bias-file 0` gives fully exact routing, which is much slower.
+**Decode uses two selection-only routing biases by default:** a bonus (+1.0) for VRAM-resident experts and a penalty
+(−0.6) for NVMe ones. The mixing weights stay exact and every expert stays reachable, but the bias changes *which*
+experts compute each token, and it costs more quality than perplexity suggested (code 2.38 → 2.87). On DwarfStar's
+112 official DeepSeek-API fixtures (teacher-forced over the API's own continuations, 6,922 positions; scorer in
+[`tools/v41/quality/`](https://github.com/Indras-Mirror/Strata-DSV4.1/tree/main/tools/v41/quality)):
+
+| Routing | API top-1 agreement | NLL | Decode tok/s (docs / python prompt) |
+| --- | ---: | ---: | ---: |
+| exact (`--route-bias 0 --route-bias-file 0`) | 86.2% | 0.516 | ~2.6 (I/O-bound: most experts on NVMe) |
+| bias × 0.25 (`--route-bias 0.25 --route-bias-file 0.15`) | 85.2% | 0.551 | 12.6 / 7.4 |
+| bias × 0.5 | 81.7% | 0.676 | 18.4 / 11.2 |
+| default bias (1.0 / 0.6) | 72.1% | 1.111 | 29.9 / 20.6 |
+
+(102 short prompts; the 10 long prompts route exactly either way: 94.1%.)  For reference, DwarfStar's own
+IQ2_XXS-Q2_K build scores 89.9% / 95.0% on the same short / long groups.  The default bias also causes repetition
+loops on some prompts under greedy decoding.  Pick the bias for your use: speed-first = default, quality-first = 0.25.
+Smarter biases that only bend near-ties were measured and lose to a flat scale.
+
+**On real tasks** (21 HumanEval problems + 10 tool-call cases, greedy, through the server): exact-ish x0.25 20/21,
+**x0.5 20/21 (the default since 2026-10-15)**, x0.75 19/21, full bias 16/21 (the extra failures are logic slips on easy
+problems); tool calling 10/10 at every setting.
 
 ## Speed (RTX 4090 24 GB · Ryzen 7 5700X · 90 GB DDR4 · NVMe)
 
@@ -174,6 +198,7 @@ stays reachable, and `--route-bias 0 --route-bias-file 0` gives fully exact rout
 | Prefill, 8K-token prompt | 244–248 tok/s one-shot (tensor-core experts) |
 | Prefill, 16K / 20K prompt | 288 / 266 tok/s |
 | Decode (256-token prompt) | 25.5–26.3 tok/s · 26.6–28.9 with the opt-in fused ggml op |
+| Decode with **DSpark** speculative decoding (one-shot, greedy) | **31.7–39.5 tok/s** (docs 39.5 vs 29.9 plain, python 31.7 vs 20.6, code 35.6 vs 26.7: 1.32–1.53×) |
 | Decode in a real agent session (20–32K context) | 22.7–28.2 tok/s |
 | Model load | ~50 s |
 
@@ -191,7 +216,8 @@ How each number was reached, step by step:
 | `V41-GSQ.gguf.experts.json` | per-expert offsets and formats |
 | `rank.bin` | expert hotness ranking, used to seed the VRAM cache and RAM arena |
 | `tokenizer/` | V4.1 tokenizer + chat template |
-| `V41-MTP-Vision.gguf` | the **DSpark** speculative-draft stack (`mtp.0-2`: experts MXFP4, a lossless repack of the original FP4; the rest Q8_0) plus the **vision tower** (Q8_0). Engine support is in progress. |
+| `V41-MTP-Vision.gguf` | the **DSpark** speculative-draft stack (`mtp.0-2`: experts MXFP4, a lossless repack of the original FP4; the rest Q8_0) plus the **vision tower** (Q8_0). |
+| `V41-MTP-Vision.Q2_K.gguf` | **recommended for DSpark:** the same file with the draft experts requantized to Q2_K (5.66 GB vs 8.42 GB). Frees 2.76 GB of VRAM for the expert cache at the same acceptance (3.23 vs 3.28 accepted drafts/pass offline) - that alone is +10% decode. Use with `STRATA_DSPARK=V41-MTP-Vision.Q2_K.gguf STRATA_DSPARK_DEPTH=4` (one-shot `ds41_generate`; in `--serve` via `STRATA_SERVE_DSPARK`, on by default in the repo's `ds41-engine.sh` - exact speculative sampling at any temperature). Vision engine support is still in progress. |
 
 ## Quick start (4 steps)
 

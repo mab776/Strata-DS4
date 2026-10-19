@@ -168,6 +168,9 @@ struct Ds41Dense::Impl {
         ggml_tensor * rbias = nullptr;    // F32 [NE]        selection-only routing bias (set_route_bias), 0 = model routing
     };
     int snap_pos = -1;
+    struct ParkedRows { ggml_tensor * t; size_t off; std::vector<uint8_t> b; };
+    std::vector<ParkedRows> parked;     // park(): host copies of the snapshot rings + the cache rows an unrelated request overwrites
+    int parked_pos = -1;
     std::vector<Layer> ly;
 
     // ---- per-pass inputs (ictx / ibuf), uploaded by begin()
@@ -189,6 +192,12 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_cpos[3] = {};         // I32 [NC]   RoPE position of that row (group start)
     ggml_tensor * i_sidx = nullptr;       // I32 [2 * NC] ratio-2 state rows per token, of [state ring | pass states]
     ggml_tensor * i_sslot = nullptr;      // I32 [min(NC, 2)]
+    // upload_span's last (pos0, col0, n): its four index tensors depend only on these, not on the layer, so the 39
+    // layers after the first skip identical re-uploads.  Those tiny H2D copies queued behind the chunk prestage's
+    // ~1.5 GiB DMA of the next layer's experts and cost ~65 ms a layer (~2.5 s a turn).  Any other writer of the four
+    // tensors (upload_inputs) or their reallocation (alloc_state) resets it.
+    int64_t span_memo_pos0 = -1;
+    int span_memo_col0 = -1, span_memo_n = -1;
     ggml_tensor * i_lastblk = nullptr;    // F32 [NC]   (nvis - 1) / block size: the pinned candidate block (ratio 1)
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
@@ -509,6 +518,14 @@ struct B {
 };
 
 }  // namespace
+
+// STRATA_DENSE_PROF=1 (diagnostic, off by default): where a layer-major batch's dense time goes - graph build, gallocr
+// allocation, GPU compute, Engram wait, readback - summed per prompt and printed by prof_report()
+static const bool g_dprof_on = std::getenv("STRATA_DENSE_PROF") != nullptr;
+static double g_dprof[8] = {};   // build, alloc, compute, engram, readback, finish build, upload, calls
+static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute() charges: set by the span callers
+
 
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;   // pv (STRATA_PV_GRAPHS): a kept n > 1 graph, allo_pass with reuse
@@ -1056,6 +1073,7 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_emb = ggml_new_tensor_2d(c, GGML_TYPE_F32, D, NC);
     im.i_pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, NC);
     im.i_widx = ggml_new_tensor_1d(c, GGML_TYPE_I32, im.SWA * NC);
+    im.span_memo_pos0 = -1;   // new tensors: nothing uploaded yet
     im.i_wmask = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.SWA, NC);
     im.i_wslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, im.RAW));
     for (int r = 1; r <= 2; ++r) {
@@ -1067,6 +1085,16 @@ static bool alloc_cols(Ds41Dense::Impl & im, int64_t NC, std::string & err) {
     im.i_sslot = ggml_new_tensor_1d(c, GGML_TYPE_I32, std::min<int64_t>(NC, 2));
     im.i_lastblk = ggml_new_tensor_1d(c, GGML_TYPE_F32, NC);
     for (int e = 0; e < 2; ++e) im.i_eng[e] = ggml_new_tensor_2d(c, GGML_TYPE_F32, im.EC * im.ED, NC);
+    // STRATA_VRAM_TRACE: WHICH state tensor owns the columns' VRAM (s13c: a batch's state alloc was 2.45-2.76 GiB and
+    // a 2193.81 MiB allocation later failed with 6.83 GiB "free" - name the owner before sizing anything).
+    if (std::getenv("STRATA_VRAM_TRACE")) {
+        double tot = 0;
+        for (ggml_tensor * t = ggml_get_first_tensor(c); t; t = ggml_get_next_tensor(c, t)) tot += (double) ggml_nbytes(t);
+        std::fprintf(stderr, "vram trace: state NC=%d wants %.2f GiB (i_eng %lld x %d = %.2f GiB each, i_wmask %.1f MiB, "
+                             "i_widx %.1f MiB)\n", NC, tot / 1073741824.0, (long long) im.EC, (int) im.ED,
+                     (double) ggml_nbytes(im.i_eng[0]) / 1073741824.0, (double) ggml_nbytes(im.i_wmask) / 1048576.0,
+                     (double) ggml_nbytes(im.i_widx) / 1048576.0);
+    }
     im.nbuf = ggml_backend_alloc_ctx_tensors(c, im.backend);
     if (!im.nbuf) { err = "cannot allocate " + std::to_string(NC) + " state columns"; return false; }
     ggml_backend_buffer_clear(im.nbuf, 0);
@@ -1296,6 +1324,7 @@ static bool engram_ready(Ds41Dense::Impl & im) {
 bool Ds41Dense::Impl::upload_inputs(const int * tids, int n, int pos0) {
     Impl & im = *this;
     im.drain();   // mab776 STRATA_ASYNC_FINISH: the uploads below use another stream
+    im.span_memo_pos0 = -1;   // this writes i_widx / i_wslot / i_sidx / i_sslot: upload_span's memo is stale
     const int64_t D = im.D, SWA = im.SWA, RAW = im.RAW;
     // embeddings (F16 rows on the mmap)
     im.host_emb.resize((size_t) (D * n));
@@ -1433,7 +1462,7 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
 
 // ================================================================== the layer-major prompt batch
 
-static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }   // mab776 STRATA_DENSE_PROF
+// (dprof_now: defined with the STRATA_DENSE_PROF globals above - mab776's and xolotl's profilers share it)
 
 bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
     Impl & im = *p_;
@@ -1476,6 +1505,11 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     im.pass_cap[2] = im.span_cap[si][2];
     if (Ds41Dense::span_async_on() && !im.cpu) return upload_span_async(im, col0, n, si);
     const int64_t pbase = (int64_t) im.batch_pos0 + col0;
+    static const bool memo_on = !(std::getenv("STRATA_SPAN_MEMO") && std::getenv("STRATA_SPAN_MEMO")[0] == '0');
+    if (memo_on && im.span_memo_pos0 == (int64_t) im.batch_pos0 && im.span_memo_col0 == col0 && im.span_memo_n == n) return true;
+    im.span_memo_pos0 = (int64_t) im.batch_pos0;
+    im.span_memo_col0 = col0;
+    im.span_memo_n = n;
     {
         std::vector<int32_t> widx((size_t) (im.SWA * n));
         for (int t = 0; t < n; ++t) {
@@ -1621,13 +1655,25 @@ bool Ds41Dense::finish_span(int il, int col0, int n) {
     const double tq = prof_on() ? dprof_now() : 0;
     struct Lap { double t; ~Lap() { if (t > 0) Ds41Dense::prof().finish += dprof_now() - t; } } lap_{ tq };
     if (col0 < 0 || n < 1 || im.S < 1 || col0 % im.S != 0 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
+    const double tf0 = g_dprof_on ? dprof_now() : 0;
     std::vector<uint8_t> meta(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
     ggml_init_params p = { meta.size(), meta.data(), true };
     ggml_context * gc = ggml_init(p);
     ggml_cgraph * gf = build_finish(im, gc, n, col0);
+    if (g_dprof_on) g_dprof[5] += dprof_now() - tf0;
+    g_dprof_slot = 0;
     const bool ok = im.compute(gf, false);
+    g_dprof_slot = -1;
     ggml_free(gc);
     return ok;
+}
+
+void Ds41Dense::prof_report(const char * tag) {
+    if (!g_dprof_on) return;
+    std::fprintf(stderr, "dense prof %s: %d attn spans: build %.0f ms, alloc %.0f, gpu compute %.0f, engram wait %.0f, "
+                 "readback %.0f, upload %.0f, finish build %.0f\n", tag, (int) g_dprof[7], g_dprof[0], g_dprof[1], g_dprof[2],
+                 g_dprof[3], g_dprof[4], g_dprof[6], g_dprof[5]);
+    for (double & v : g_dprof) v = 0;
 }
 
 int Ds41Dense::batch_size() const { return (int) p_->batch; }
@@ -1962,6 +2008,50 @@ void Ds41Dense::park_history(const int * ids, int n) {
     if (!im.engram.enabled()) return;
     for (int p = 0; p < n; ++p) im.engram.set_token(p, ids[p]);
 }
+
+bool Ds41Dense::park(int64_t positions) {
+    Impl & im = *p_;
+    if (im.snap_pos < 0 || positions < 1) return false;
+    ggml_backend_synchronize(im.backend);
+    im.parked.clear();
+    auto put = [&](ggml_tensor * t, size_t off, size_t n) {
+        Impl::ParkedRows r{ t, off, std::vector<uint8_t>(n) };
+        ggml_backend_tensor_get(t, r.b.data(), off, n);
+        im.parked.push_back(std::move(r));
+    };
+    for (auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) put(t, 0, ggml_nbytes(t));
+        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            put(t, 0, (size_t) n * t->nb[1]);
+            put(t, (size_t) (rows - 1) * t->nb[1], t->nb[1]);   // the spare row (open compressor groups write it)
+        }
+    }
+    im.parked_pos = im.snap_pos;
+    return true;
+}
+
+bool Ds41Dense::unpark() {
+    Impl & im = *p_;
+    if (im.parked_pos < 0) return false;
+    ggml_backend_synchronize(im.backend);
+    for (auto & r : im.parked) ggml_backend_tensor_set(r.t, r.b.data(), r.off, r.b.size());
+    ggml_backend_synchronize(im.backend);
+    im.snap_pos = im.parked_pos;
+    drop_park();
+    return true;
+}
+
+void Ds41Dense::drop_park() {
+    p_->parked.clear();
+    p_->parked.shrink_to_fit();
+    p_->parked_pos = -1;
+}
+
+bool Ds41Dense::parked() const { return p_->parked_pos >= 0; }
 
 bool Ds41Dense::read_sel(int il, std::vector<int> & sel, std::vector<float> & mask, int * K) {
     Impl & im = *p_;

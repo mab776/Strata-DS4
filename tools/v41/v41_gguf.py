@@ -52,11 +52,14 @@ sys.path.insert(0, HERE)
 import v41_formats as F  # noqa: E402
 import v41_gguf_meta as MD  # noqa: E402
 
-MAIN = "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
-DIRS = [MAIN, "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
-        "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]          # = v41_calib.DIRS
-NAME = "DeepSeek V4.1 Flash UNCENSORED (Strata v41 GSQ-RCO mixed tier)"
-URL = "https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
+# V41_SRC="dir1:dir2:..." = another checkpoint (see v41_calib.py); V41_SRC_NAME / V41_SRC_URL = its GGUF metadata name
+# and HF page.  Unset = the dealignai FP8.
+_SRC = [d for d in os.environ.get("V41_SRC", "").split(":") if d]
+MAIN = _SRC[0] if _SRC else "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
+DIRS = _SRC or [MAIN, "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
+                "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]          # ~ v41_calib.DIRS
+NAME = os.environ.get("V41_SRC_NAME", "DeepSeek V4.1 Flash UNCENSORED (Strata v41 GSQ-RCO mixed tier)")
+URL = os.environ.get("V41_SRC_URL", "https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8")
 ROLES = (("gate", "w1"), ("up", "w3"), ("down", "w2"))
 ENGRAM_ROW = 264
 ALIGN = MD.GGUF_ALIGNMENT

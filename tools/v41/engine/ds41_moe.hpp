@@ -277,7 +277,11 @@ std::vector<std::pair<int32_t, int32_t>> ds41_read_ranked(const std::string& pat
 /// past it is read from the blob source on demand (the file tier).
 struct Ds41MoeConfig {
     int64_t slots = 2150;         ///< VRAM expert slots (6.75 MiB each); 0 or `no_cache` = none
-    double pcie_frac = 0.25;      ///< share of the (non-prefetched) misses computed on the GPU
+    double pcie_frac = 0.25;      ///< share of the (non-prefetched) misses computed on the GPU - single-token decode only
+    /// The same share for the batched path (gpu_run_n_ex): prompt passes AND every DSpark/serve decode or verify call.
+    /// < 0 = STRATA_TIER_BATCH_PCIE, else 1.0 (every arena miss over PCIe; measured best on 8-core dual-channel DDR4).
+    /// Many-core / many-channel hosts want it low: 0.0 = +60% serve decode on a 24-core Threadripper (GitHub #3).
+    double tier_batch_pcie = -1.0;
     int threads = 0;              ///< CPU pool workers; 0 = every physical core but the first
     bool pin = true;              ///< register the host arena with CUDA so the PCIe share DMAs out of it
     double arena_gib = 72.6;      ///< host arena budget; the file tier takes the rest
@@ -406,6 +410,9 @@ public:
     bool build_arena_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
     /// VRAM slot budget for a cache not opened yet (deferred seed: measured after the prompt freed its buffers)
     void set_slot_gib(double gib);
+    /// Turn the VRAM expert cache on/off for the NEXT seed (off: the arena + file tier serve every miss - slower
+    /// decode, no VRAM).  An ALREADY OPEN cache is not dropped by this; release_cache() does that.
+    void set_cache_enabled(bool on);
 
     /// Ranks every (layer, expert) by routing frequency over the TRAIN half of a `ds4routes.bin` file
     /// (alternating 512-token blocks - the split `tools/ds4/route_skew.py` scores with), builds the host arena
@@ -481,6 +488,12 @@ public:
     /// reuses is touched before the host has seen that consumer finish (the next dense readback).  One call, then cleared.
     void set_done_event(void* ev);
     bool event_used() const;
+    /// Measurement only (session 13): open a binary routing trace.  Writes a header snapshot (per (layer, expert):
+    /// class, VRAM-resident, in arena), then one record per run_multi_to_dev call (the verify path): its distinct
+    /// experts with the first pass row routing each and the class the call served it as.  `trace_mark` appends a
+    /// caller record (the pass's acceptance).  Replayed by tools/v41/sim/route_sim.py.
+    void trace_open(const std::string& path);
+    void trace_mark(const float* v, int n);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
@@ -499,6 +512,16 @@ public:
     bool build_arena_from_routes(const std::string& routes_bin, int batch_tokens, std::string& err);
     /// Frees run_chunk's device and pinned buffers (the next run_chunk allocates them again).
     void release_chunk();
+    /// The conversation-adaptive arena (on by default; STRATA_ARENA_REBAL=0 turns it off) - routed-token counts per expert, a swap
+    /// plan after each prompt (frequent file-tier experts in, rarely used arena experts out), executed by a reader thread
+    /// in the idle NVMe time.  begin_prompt: before a prompt (pauses the reads, takes back every retired swap the reader
+    /// has not started - the victim gets its slot back - and publishes finished ones); plan: after it (plans, resumes);
+    /// tick with request_end at the end of a request (a large batch, so the gap until the next request is used), and
+    /// every decode pass only with STRATA_ARENA_REBAL_DECODE=1 (s6: reads during decode cost it 5-19 %).  The prompt's
+    /// logits do not depend on it (routing is exact).
+    void rebalance_begin_prompt();
+    void rebalance_plan();
+    void rebalance_tick(bool request_end = false);
     /// Gives the layer-prestage region back (VRAM for the dense half when its pass buffer would not fit); prestage
     /// stays off until release_chunk.  False when there was none.
     bool release_prestage();
@@ -514,13 +537,22 @@ public:
     /// mab776 STRATA_KEEP_CACHE=<max new tokens> (opt-in, --serve): the VRAM cache stays open through a short prompt batch.
     /// With the env set the cache is opened segmented (CUDA VMM, STRATA_KEEP_CACHE_SEG_MIB, default 256); shrink_cache
     /// gives `free_gib` of its tail back for the batch buffers (those slots' experts become arena / file-tier experts),
-    /// regrow_cache maps the tail again and refills the same experts into the same slots, so decode sees the cache it had.
+    /// regrow_kept maps the tail again and refills the same experts into the same slots, so decode sees the cache it had.
     /// set_keep_batch(true) while such a batch runs: run_chunk then copies the resident experts it routes device to
     /// device into its MMQ-strided stage halves instead of launching them in place (a slot is not at the MMQ stride).
     static bool keep_cache_on();
     bool shrink_cache(double free_gib, std::string& err);
-    bool regrow_cache(std::string& err);
+    bool regrow_kept(std::string& err);   // mab776 (xolotl has its own regrow_cache)
     void set_keep_batch(bool on);
+    /// Xolotl s6 (STRATA_SERVE_KEEP_CACHE=1; the cache opens segmented then): give back only the VRAM a small batch
+    /// prompt needs instead of the whole cache.  Evicts the cache's TAIL slots (the lowest-ranked seeds) until
+    /// `need_bytes` are free, remembering slot -> expert; returns the number evicted (0: it already fits), or -1 when
+    /// the cache is not segmented (the caller then falls back to release_cache).
+    int64_t shrink_cache_for(int64_t need_bytes, std::string& err);
+    /// After that prompt: map the tail back and refill exactly the evicted experts into exactly their slots (from the
+    /// RAM arena, else the file).  Returns the number refilled, or -1 with `err`.
+    int64_t regrow_cache(std::string& err);
+    static bool keep_cache_mode();
     /// REAP accumulators (Ds41MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
     const std::vector<double>& saliency_sum() const;
     const std::vector<int64_t>& saliency_count() const;

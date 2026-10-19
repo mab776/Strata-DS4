@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Start (or resume) the Hugging Face upload detached from this terminal.  Log: ~/AI/v41-dev/hf/upload.log
+# Start (or resume) the Hugging Face upload detached from this terminal.  Log: ~/AI/Strata-Backup/v41-dev/hf/upload.log
 # A supervisor loop reruns hf_upload.py until it reports ALL DONE (each run skips what is already on the Hub; xet
 # dedup skips chunks already sent).  Pause with upload-stop.sh (stops the loop first).
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-W=~/AI/v41-dev/hf
+W=~/AI/Strata-Backup/v41-dev/hf
 mkdir -p $W
 if [ -f $W/loop.pid ] && kill -0 "$(cat $W/loop.pid)" 2>/dev/null; then echo "already running (loop pid $(cat $W/loop.pid))"; exit 0; fi
 # hf_xet's adaptive controller ramped to ~27 parallel 64 MB uploads on a home uplink: requests timed out and were

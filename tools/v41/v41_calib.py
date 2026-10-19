@@ -33,10 +33,13 @@ import model as M  # noqa: E402
 import kernel as K  # noqa: E402  (our torch stand-in)
 import v41_gptq as G  # noqa: E402
 
-MAIN = "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
-DIRS = [MAIN, "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",   # shard 48 (Engram L14) copied here 2026-10-11: NVMe, not Team CX2
-        "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
-        "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]
+# V41_SRC="dir1:dir2:..." = another checkpoint (e.g. the 1017): dir1 = MAIN (config, index, tokenizer), every dir is
+# searched for <shard>.ok.  Unset = the dealignai FP8 below.  Read by v41_calib, calib_layers.sh, v41_gguf, v41_sidecar.
+_SRC = [d for d in os.environ.get("V41_SRC", "").split(":") if d]
+MAIN = _SRC[0] if _SRC else "/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"
+DIRS = _SRC or [MAIN, "/media/mal/NVME1TB/Models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",   # shard 48 (Engram L14) copied here 2026-10-11: NVMe, not Team CX2
+                "/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8",
+                "/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"]
 WORK = os.environ.get("V41_WORK", "/media/Crucial1TB/v41-calib")
 D, HC, NE, TOPK = 5120, 4, 384, 6
 TIERS = list(G.TIERS)
@@ -116,7 +119,7 @@ def _local_texts():
         h = hashlib.sha1(t.encode()).hexdigest()
         if h not in seen and len(t) > 2000:
             seen.add(h); lst.append(t)
-    for pat in ["~/AI/Strata-DS4/src/**/*.cpp", "~/AI/Strata-DS4/src/**/*.cu", "~/AI/Strata-DS4/tools/**/*.py",
+    for pat in ["~/AI/Xolotl/src/**/*.cpp", "~/AI/Xolotl/src/**/*.cu", "~/AI/Xolotl/tools/**/*.py",
                 "~/AI/QuetzaCodetl/src/**/*.ts", "~/AI/Odin/mcp-server/*.js"]:
         for p in sorted(glob.glob(os.path.expanduser(pat), recursive=True)):
             add(code, p)
@@ -198,6 +201,10 @@ def cmd_prep(a):
             "multi": mix(cj("antirez_translation"), eu),
         }
         want = {"agentic_long": 10, "agent": 5, "code": 6, "reason": 4, "web": 2, "zh": 3, "chat": 1, "multi": 1}
+    for kv in filter(None, (a.mix or "").split(",")):   # --mix chat=4,agentic_long=7: per-domain sequence weights
+        k, v = kv.split("=")
+        assert k in want, f"--mix: unknown domain {k} (have {sorted(want)})"
+        want[k] = int(v)
     scale = a.n / sum(want.values())
     want = {k: max(1, round(v * scale)) for k, v in want.items()}
 
@@ -451,6 +458,8 @@ def cmd_layer(a):
     with torch.device(dev):
         blk = M.Block(L, args, layout)
     n = load_block(blk, L)
+    if getattr(a, "block_hook", None) is not None:   # v41_e2e: e.g. fake-quantize the dense weights
+        a.block_hook(L, blk)
     torch.set_default_device(dev)
     log(f"layer {L}: {n} tensors loaded ({time.time() - t0:.0f} s), ratio {args.compress_ratios[L]}, "
         f"engram {blk.engram is not None}, kv_src {blk.attn.is_kv_source}, idx_src {blk.attn.is_index_source}")
@@ -497,6 +506,8 @@ def cmd_layer(a):
         for c in range(0, T, 65536):
             wts[c:c + 65536], idx[c:c + 65536] = blk.ffn.gate(X[c:c + 65536])
         is_eval_tok = torch.tensor(meta["is_eval"], device=dev).repeat_interleave(S)
+        if getattr(a, "want_ctx", False):   # v41_repair: the hooks see the layer's MoE input and routing
+            a.moe_ctx = (X, wts, idx)
         Y = torch.zeros((T, D), dtype=torch.float32, device=dev)
         stats, lim = {}, args.swiglu_limit
         hook = getattr(a, "expert_hook", None)
@@ -546,7 +557,8 @@ def cmd_layer(a):
         os.makedirs(wpath("route"), exist_ok=True)
         np.savez(wpath("route", f"L{L:02d}.npz"), idx=idx.to(torch.int16).cpu().numpy(), w=wts.half().cpu().numpy())
         counts = torch.bincount(idx.flatten(), minlength=NE).float()
-        summ = {"layer": L, "tokens": T, "n_eval_tok": int(is_eval_tok.sum()), "routed_energy": routed_energy,
+        summ = {"layer": L, "ablate": ABL.manifest_id() or "none",
+                "tokens": T, "n_eval_tok": int(is_eval_tok.sum()), "routed_energy": routed_energy,
                 "h_rms_out": float(xo.float().square().mean().sqrt()),
                 "load_cv": float(counts.std() / counts.mean()), "unused_experts": int((counts == 0).sum()),
                 "seconds": round(time.time() - t0, 1), "tiers": TIERS, "min_fit": a.min_fit, "damps": a.damps}
@@ -619,6 +631,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("prep"); p.add_argument("--n", type=int, default=128); p.add_argument("--seq", type=int, default=2048)
     p.add_argument("--corpus", default=None, help="build_corpus.py output dir (agentic-first V4.1 mix)")
+    p.add_argument("--mix", default=None, help="override domain weights, e.g. agentic_long=7,chat=4,multi=2 (default = the V4.1 mix)")
     sub.add_parser("init")
     p = sub.add_parser("prep-ids"); p.add_argument("ids", nargs="+"); p.add_argument("--domain", default="custom")
     p = sub.add_parser("head"); p.add_argument("--layer", type=int, default=40, help="h/L to read (40 = after the last block)")

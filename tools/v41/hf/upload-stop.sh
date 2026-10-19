@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Pause the upload: stop the supervisor loop, then the uploader (by PID only).  upload-start.sh resumes.
-W=~/AI/v41-dev/hf
+W=~/AI/Strata-Backup/v41-dev/hf
 l=$(cat $W/loop.pid 2>/dev/null)
 if [ -n "$l" ] && kill -0 "$l" 2>/dev/null; then kill "$l" && echo "stopped loop (pid $l)"; fi
 rm -f $W/loop.pid

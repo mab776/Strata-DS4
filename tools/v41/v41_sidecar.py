@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "..", "third_party", "llama.cpp", "g
 import gguf  # noqa: E402
 from gguf import quants  # noqa: E402
 
-from v41_gguf import MAIN, Source  # noqa: E402
+from v41_gguf import MAIN, URL, Source  # noqa: E402
 
 Q8 = gguf.GGMLQuantizationType.Q8_0
 MX = gguf.GGMLQuantizationType.MXFP4
@@ -111,8 +111,8 @@ def write(args):
     mtps = [int(x) for x in args.mtp.split(",")] if args.mtp else []
     pl = plan(src, mtps, not args.no_vision)
     w = gguf.GGUFWriter(args.out + ".tmp", "deepseek41-sidecar")
-    w.add_name("DeepSeek V4.1 Flash UNCENSORED - MTP heads + vision tower (Strata v41 sidecar)")
-    w.add_string("deepseek41.sidecar.source", "https://huggingface.co/dealignai/DeepSeek-V4.1-Flash-UNCENSORED-FP8")
+    w.add_name(os.environ.get("V41_SRC_NAME", "DeepSeek V4.1 Flash UNCENSORED") + " - MTP heads + vision tower (Strata v41 sidecar)")
+    w.add_string("deepseek41.sidecar.source", URL)
     w.add_array("deepseek41.sidecar.mtp_blocks", mtps)
     w.add_string("deepseek41.sidecar.mtp_experts_type", "MXFP4 (lossless repack of the checkpoint FP4)")
     if not args.no_vision:

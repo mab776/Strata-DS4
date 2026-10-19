@@ -24,10 +24,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 V41 = HERE.parent
-STRATA = Path.home() / "AI" / "Strata"
+# xolotl: the server is THIS tree's serve/ (it used to import ~/AI/Strata's, a separate upstream checkout at 0.1.39)
+STRATA = V41.parent.parent
 sys.path.insert(0, str(STRATA))
 sys.path.insert(0, str(STRATA / "tools"))
-sys.path.insert(0, str(V41.parent))          # Strata-DS4/tools: strata_tokenizer.py with the joyai-llm pre-split
+sys.path.insert(0, str(V41.parent))          # tools/: strata_tokenizer.py with the joyai-llm pre-split
 sys.path.insert(0, str(V41))
 
 import strata_tokenizer as ST  # noqa: E402
@@ -134,12 +135,27 @@ def to_encoder_messages(messages, tools):
     return out
 
 
+_ChatTemplate = F.ChatTemplate   # the server's own, kept for its capability probe
+
+
 class Ds41Template:
     """Stands in for F.ChatTemplate: render(messages, tools, add_generation_prompt, **kwargs) -> prompt text."""
     source = "{# DeepSeek-V4.1: rendered by serve_ds41.py with DeepSeek's encoder (dsv41_encoding.py) #}"
 
     def __init__(self, path=None):
-        pass
+        self._caps = None
+
+    @property
+    def caps(self):
+        """xolotl: the 0.1.44 server reports the template's capabilities (props: chat_template_caps), detected by
+        F.ChatTemplate._detect_caps through render() and the tool-call parser - both DeepSeek's here."""
+        if self._caps is None:
+            try:
+                self._caps = _ChatTemplate._detect_caps(self)
+            except Exception:   # noqa: BLE001 - a hint only (as in the server): never fail a request over it
+                self._caps = {"supports_tools": True, "supports_tool_calls": True, "supports_system_role": True,
+                              "supports_parallel_tool_calls": True, "supports_preserve_reasoning": False}
+        return self._caps
 
     def render(self, messages, tools=None, add_generation_prompt=True, **kw):
         mode = "chat" if kw.get("enable_thinking") is False else "thinking"
@@ -299,7 +315,7 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **_kw):   #
                 f"thinking {'on' if thinking else 'off'}, tools {len(tools or [])} =====\n")
     end = "(stream closed)"
     try:
-        for item in _svc_run(self, ids, thinking, tools, max_new, sampling, cancel):
+        for item in _svc_run(self, ids, thinking, tools, max_new, sampling, cancel, **kw):
             if item[0] == "done" and isinstance(item[1], dict):
                 d = item[1]
                 end = f"finish {d.get('finish')}, {d.get('completion_tokens')} tokens"

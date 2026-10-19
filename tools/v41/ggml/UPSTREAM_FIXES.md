@@ -64,3 +64,10 @@ Rebuild: `mmq.cu.o` plus every TU that includes `mmq.cuh` — `quantize.cu.o`, `
   getrows.cu, dequantize.cuh, fattn-common.cuh, lightning-indexer.cu, ggml-cuda.cu.  Apply after the others.
 - Verified: `test_ds41_kvfp4 --cuda` (5.2M fake-quantized values through set_rows/get_rows, 0 differ) and the engine
   gate (8000-token prompt, exact routing, `STRATA_PRESTAGE_GIB=1.5` both arms): last-row logits bitwise identical.
+
+## Local (not upstream): `cuda-graph-max-tokens.patch` (s6, 2026-10-17)
+`GGML_CUDA_GRAPH_MAX_TOKENS=N` (default 0 = off): a graph whose MUL_MAT / MUL_MAT_ID take more than N token columns
+runs without a CUDA graph. GLM's fresh ~30K / ~44K prompts died in `cudaGraphInstantiate` (out of memory: the chunk's
+graph was captured after the engine had handed the chunk its VRAM). `tools/glm/serve/glm-engine.sh` sets 64.
+Measured (verify/s6/glm-oom, bias-0.25 config): BASE OOM at 30K and 44K; graphs off everywhere OK but decode
+20.4 -> 16.9 tok/s; this patch OK at 6K / 30K / 44K (prefill 292 / 368 / 376 tok/s), decode 19.5-21.7 tok/s.

@@ -66,7 +66,7 @@ def solve(items, budget, a, layer_n):
     # per-layer ternary cap: promote the cheapest-to-promote ternary picks to the next tier
     for L, nl in layer_n.items():
         tern = [k for k, it in enumerate(items) if it[0] == L and it[3][sel[k]][0] == "ptq1"]
-        cap = int(a.max_ternary_frac * nl * (2 if a.per_proj else 1))
+        cap = int(a.cap_at.get(L, a.max_ternary_frac) * nl * (2 if a.per_proj else 1))
         if len(tern) > cap:
             tern.sort(key=lambda k: items[k][3][sel[k] + 1][1] - items[k][3][sel[k]][1], reverse=True)
             for k in tern[: len(tern) - cap]:
@@ -108,6 +108,8 @@ def main():
     ap.add_argument("--min-eval", type=int, default=8)
     ap.add_argument("--unseen-floor", default="q2_0", choices=TIERS)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--ternary-cap-at", default="", help="per-layer caps, e.g. 20-31,33-35=1.0;36-39=0.75")
+    ap.add_argument("--budget-gib", type=float, default=0, help="expert bytes to spend (default: the all-Q2_0 count)")
     a = ap.parse_args()
     layers = None
     if a.layers:
@@ -117,7 +119,16 @@ def main():
     assert stats, "no stats"
     items = items_for(stats, a)
     layer_n = {L: len(j["experts"]) for L, j in stats.items()}
+    a.cap_at = {}
+    for grp in filter(None, a.ternary_cap_at.split(";")):
+        rng, v = grp.split("=")
+        for part in rng.split(","):
+            lo_, _, hi_ = part.partition("-")
+            for L in range(int(lo_), int(hi_ or lo_) + 1):
+                a.cap_at[L] = float(v)
     budget = sum(it[3][[c[0] for c in it[3]].index("q2_0")][2] for it in items)
+    if a.budget_gib:   # a smaller (or larger) file than the all-Q2_0 byte count
+        budget = a.budget_gib * 2**30
     sel, used = solve(items, budget, a, layer_n)
     err = lambda t: sum(next(c[1] for c in it[3] if c[0] == t) for it in items if t in [c[0] for c in it[3]])
     mixed_err = sum(items[k][3][i][1] for k, i in enumerate(sel))

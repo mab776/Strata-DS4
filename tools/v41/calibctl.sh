@@ -9,7 +9,7 @@
 #   v41calib log              follow the run log (Ctrl-C to leave; the run keeps going)
 set -u
 W=${V41_WORK:-/media/Crucial1TB/v41-calib}
-REPO=/home/mal/AI/Strata-DS4
+REPO=/home/mal/AI/Xolotl
 PIDF="$W/driver.pid"
 mkdir -p "$W/logs"
 

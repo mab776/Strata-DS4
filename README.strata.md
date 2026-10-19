@@ -66,6 +66,7 @@ Experimental, written and tested by community members on their own machines:
 
 - **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
 - **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
+- **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
 - **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
 - **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
 
@@ -90,6 +91,12 @@ you how to connect your apps. AI tools can also install, start and stop Strata t
 [Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 **Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
 
+**Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
+(`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
+**`./setup.sh`**. It builds the Mac engine on your Mac (about 7 minutes), asks the same questions, downloads the model
+and starts it. Next time, `./setup.sh` starts it right away. Which size fits your Mac and how fast it is:
+[docs/MAC.md](docs/MAC.md).
+
 The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
 asks you a few questions:
 
@@ -108,6 +115,8 @@ download stops, run it again: it continues where it left off. Your browser opens
 **Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
 its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
 several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
+
+**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
 
 ## Which model should I pick?
 
@@ -129,8 +138,10 @@ sizes are faster. Larger sizes are a bit smarter.
 - **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
   UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
   while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL](docs/MODELS.md#unsloth-ud-q4_k_xl-experimental)** (experimental): the closest to the full
-  model. But Strata reads most of it from the SSD while it answers, so it writes only 7-8.5 tokens/s on a 64 GB PC.
+- **[Unsloth UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0):**
+  4- to 8-bit, closer to the full model (93-95% the same next token as Q8_0). Fast where every expert fits in RAM
+  (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with less RAM Strata reads part of them from the SSD while it
+  answers, which is much slower (7-8.5 tokens/s for UD-Q4_K_XL on a 64 GB PC).
 - **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
   not in the installer's menu.
 
@@ -161,6 +172,26 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
   messages start in seconds.
 
 More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
+
+### Optional: more speed on one card when the whole model fits in RAM
+
+Two opt-in settings (by RubenTorney, #1904 and #1905). They help when you run one graphics card and your RAM holds
+every expert (Strata's arena mode, for example Q2_0 or IQ3_XXS on a 64 GB PC). Open your config,
+`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)), and add:
+
+- **Faster decode:** `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread
+  instead of pausing the answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long
+  documents. Answers can differ slightly from the default (they stay the same from run to run).
+- **Faster prompt reading on Windows:** `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block. Windows can lock only about
+  half the RAM for the graphics card; this locks the experts the card actually needs first. Measured on the RTX 5070:
+  +4.4% prompt reading.
+
+```json
+"args": [ ..., "--adapt-async", "1" ],
+"env": { "STRATA_PIN_BY_NEED": "1" }
+```
+
+Restart Strata (`START-HERE.bat` or `./setup.sh`) after the change. To undo, remove the two entries.
 
 ## Something went wrong?
 
@@ -210,3 +241,119 @@ parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md
 Strata is free and open source. If it is useful to you, you can support its development:
 
 <p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+
+---
+
+## DeepSeek-V4.1-Flash
+
+V4.1-Flash is a different shape from V4-Flash: **40 layers × 384 routed experts (top-6)**, an **Engram** n-gram
+memory (hashed rows read from a ~300 GB table on disk at layers 1 and 14), and **shared compressed-KV / indexer
+layers** (a few "KV source" layers own the compressed cache; the layers above read it and keep only their own
+128-token window). Its experts do not fit in RAM even at 2 bits, so the engine (`tools/v41/engine`) keeps them in
+three tiers:
+
+| Tier | What lives there | How it is fed |
+| --- | --- | --- |
+| VRAM cache | the hottest ~1,300-1,600 experts (sized from measured free VRAM after the prompt) | `--vram-lru`, `--route-bias` |
+| Pinned RAM arena | ~6,700 experts (60 GiB, `cudaHostRegister`) | DMA straight to the GPU |
+| NVMe file tier | the other ~8,700 experts | O_DIRECT reads at ~4.5 GB/s, prefetched a layer ahead |
+
+A bigger arena does not help on this box: 62 / 65 GiB cut NVMe reads 10% but decode stayed within run-to-run noise
+(24.4-25.2 tok/s at 60, 24.5 at 62, 24.7 at 65), because the file penalty already keeps decode routing off the NVMe tier.
+
+### The model file: GSQ mixed tiers (152 GiB)
+
+Download: **[huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
+(16 byte-split parts + `reassemble.sh`, which verifies and joins them; also the DSpark draft stack + vision tower sidecar).
+The upload scripts are in `tools/v41/hf/`.
+
+`tools/v41` holds a GPTQ-style quantisation pipeline (`v41_calib.py`, `v41_alloc.py`, `v41_quant.py`,
+`v41_gptq_graph.py`) that gives every expert its own format from calibration statistics: **PTQ1_0** (ternary,
+1.75 bpw), **Q2_0** (2.25 bpw) or **Q3_K**, early layers richer (~2.5 bpw) and late layers leaner (~2.0 bpw).
+Quality on held-out data against the FP8 original ("teacher"):
+
+| Domain | GSQ ppl | Teacher ppl |
+| --- | ---: | ---: |
+| All (head gate) | 5.645 | 4.915 |
+| agent | 2.118 | 2.121 |
+| reasoning | 6.19 | 5.83 |
+| code | 1.98 | 1.74 |
+| zh | 7.64 | 6.83 |
+
+Top-1 agreement 0.674 vs 0.701. In the engine: 4096-token code prompt ppl 2.380, top-1 0.822.
+
+### Results (RTX 4090 24 GB · Ryzen 7 5700X · 90 GB DDR4 · NVMe, 2026-10-12)
+
+| | First working GPU run (2026-10-11 morning) | Now |
+| --- | ---: | ---: |
+| Prefill, 8192-token prompt | ~27 tok/s (chunk 512) | **244-248 tok/s** (one-shot) · 250-269 tok/s (server, before MMQ) |
+| Prefill, 16K / 20K prompt | - | **288 / 266 tok/s** |
+| Decode (256-token prompt, 256 tokens) | 3.4 tok/s | **25.5-26.3 tok/s** (27.7 with the opt-in ggml patch) |
+| Decode in a real agent session (20-32K context, server) | - | 22.7-28.2 tok/s |
+| Model load | 211 s | ~50 s |
+
+- **The prompt is exact.** Every prefill speed-up keeps the last-token logits byte-identical (8192-token check md5
+  `ee31507a0e88`), also through the server and its conversation reuse. The prompt's routed experts run on int8
+  tensor cores (MMQ; the ternary experts through a lossless PTQ1_0 -> Q2_0 transcode on the card): +12% over the
+  dp4a kernels (`--no-chunk-mmq`, md5 `4d229102872a`) at equal quality (4096-token code ppl 2.3790 vs 2.3799).
+- **Decode routes with two selection-only biases** (`--route-bias 1.0`, `--route-bias-file 0.6`, both defaults):
+  a bonus for experts already in VRAM and a penalty for experts that would be read from NVMe. Mixing weights stay
+  exact and every expert stays reachable. Cost on 4096-token perplexity: code 2.38 -> 2.87, agentic text 15.11 -> 6.39
+  (better: the GSQ quant gave its cheapest formats to rarely-used experts). `--route-bias 0 --route-bias-file 0` =
+  exact routing at ~3.5 tok/s.
+- Where the time goes - prefill (8192 tokens, ~37 s): dense half ~11 s, experts ~26 s (the grouped expert kernels and
+  ~10 GB/s of expert uploads). Decode (~38 ms/token): dense half ~19 ms (its Q8_0 weights read at ~880 GB/s - the
+  card's bandwidth), expert tier ~16 ms.
+
+How each number was reached, step by step: [docs/ds4/V41_PROGRESS.md](docs/ds4/V41_PROGRESS.md).
+
+### Running the V4.1 engine
+
+```bash
+cmake -S . -B build-ds4-gpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
+      -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp
+ninja -C build-ds4-gpu ds41_generate test_ds41_moe_gpu
+# once: copy the Engram tables (202.8 GB) off slow storage, one file per drive if needed
+python3 tools/v41/extract_engram.py /path/to/DeepSeek-V4.1-Flash-FP8 --to layers.1=/fast/a --to layers.14=/fast/b
+# defaults are the tuned config (layer-major prompt, prefetch, enc-skip, prestage, route bias 1.0 + file penalty 0.6)
+STRATA_NO_LARGEPAGES=1 bash tools/ds4/memguard.sh 84 70 -- build-ds4-gpu/ds41_generate -m V41-GSQ.gguf \
+     --ids-file prompt.i32 -n 128 --backend cuda --experts gpu --engram "/fast/a:/fast/b" --rank rank.bin
+```
+
+`STRATA_NO_LARGEPAGES=1` pins the 60 GiB arena at 1.2 GB/s (load ~50 s) instead of ~0.16 GB/s. Optional +5% decode:
+`patch -p1 -d third_party/llama.cpp < tools/v41/ggml/dsv41-fake-quant.patch`, configure with `-DSTRATA_DSV41_FQ_OP=ON`,
+and check `build-ds4-gpu/test_ds41_fq --cuda` says bit for bit (it adds one op to ggml; the stock build does not need it). `--ppl` /
+`--dump-logits F` / `--dump-last F` for quality checks; `test_ds41_moe_gpu GGUF --layers 0,20,39 --tokens 2 --gpu
+--chunk 64` checks the expert tier against a dequantised F32 reference. Full engineering log, every measurement and
+the next steps: [docs/ds4/V41_RESUME_PROMPT.md](docs/ds4/V41_RESUME_PROMPT.md).
+
+### Serving it (OpenAI + Anthropic API, tool calls)
+
+```bash
+# Strata's server (~/AI/Strata/serve) with V4.1's tokenizer, DeepSeek's chat encoder, DSML tool calls, reasoning effort
+~/AI/Strata/.venv/bin/python tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/strata-ds41.json --port 8150
+# or with QuetzaCodetl in front (starts the server, attaches if it is already up)
+tools/v41/serve/strata-ds41-quetza.wrapper
+```
+
+`ds41_generate --serve` runs every request the way the one-shot path does; measured at 512K context on a 20K-token
+conversation:
+
+| Request | Path | Time |
+| --- | --- | --- |
+| fresh 20,000-token prompt | layer-major batch, exact | 75 s (266 tok/s) |
+| new turn of <= 96 tokens (tool result, short message) | exact passes from the VRAM cache | 41 tokens: 6.9 s |
+| new turn of 97+ tokens | layer-major batch, exact (a short batch still streams almost every expert) | 300 / 641 tokens: 18.5 / 18.7 s |
+| 11,260-token tool result on 20K reused (a live agent session) | layer-major batch, exact | 49 s (230 tok/s) |
+| the same prompt again (regenerate) | snapshot + saved logits | no prefill |
+
+Every prompt token routes exactly by default. Exact passes and the batch agree to KL 0.012 on the next-token
+distribution (batch-shape float noise). An opt-in **fast quick path** runs turns of up to 768 tokens with the decode
+biases at 40-57 tok/s (300 tokens in 6.4 s), but measurably shifts the output (KL 0.10-0.15):
+`STRATA_SERVE_STEP_MAX=768 STRATA_SERVE_PASS_BIAS=1`. A conversation that extends the last request continues from it;
+one whose re-rendered history differs (DeepSeek's encoder drops earlier turns' thinking) restores the snapshot taken at
+the end of the last prompt. The server writes every request's thinking, answer and tool calls to
+`/tmp/strata-ds41-text.log` (`STRATA_TEXT_LOG`) and keeps the last 100 requests at `/api-monitor`.
+
+---
+

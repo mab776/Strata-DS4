@@ -45,6 +45,11 @@ K = C.K
 CALIB = C.WORK
 WRITE_THREADS = int(os.environ.get("V41_WRITE_THREADS", "3"))
 FF = 2304   # moe_intermediate_size (checked against each expert's w2)
+REFINE = os.environ.get("V41_REFINE") == "1"
+ACT_ORDER = os.environ.get("V41_ACT_ORDER") == "1"
+REFINE_STEPS = int(os.environ.get("V41_REFINE_STEPS", "200"))
+if REFINE:
+    import v41_repair as R  # noqa: E402
 
 
 def set_work(qwork):
@@ -68,8 +73,12 @@ def tiers_for(a, L):
     return gu, dn
 
 
-def quant(Ws, H, tier, damp, do_gptq):
-    """GPTQ of the stacked Ws (sharing H) at `tier`: [(Q, S)] per W, S in the stored format (v41_formats input)."""
+def quant(Ws, H, tier, damp, do_gptq, act_order=None):
+    """GPTQ of the stacked Ws (sharing H) at `tier`: [(Q, S)] per W, S in the stored format (v41_formats input).
+    act_order (default: V41_ACT_ORDER=1): GPTQ visits the columns by descending diag(H) - the static per-group scales
+    were chosen first, so they just travel with their columns; only the integers change (same format)."""
+    if act_order is None:
+        act_order = ACT_ORDER
     Cc = H.shape[0]
     d = torch.diag(H).clamp_min(0) + 1e-8
     lo, hi, _, _ = G.TIERS[tier]
@@ -78,9 +87,18 @@ def quant(Ws, H, tier, damp, do_gptq):
     Sst = torch.cat([G.expand_scales(s, tier, Cc) for s in S])
     lov = torch.full((Wst.shape[0], 1), float(lo), device=Wst.device)
     hiv = torch.full((Wst.shape[0], 1), float(hi), device=Wst.device)
-    if do_gptq:
+    if do_gptq and act_order:
+        perm = torch.argsort(torch.diag(H), descending=True)
+        inv = torch.argsort(perm)
+        Hinv, dead = G.hinv_chol(H[perm][:, perm], damp)
+        Q = GG.gptq(Wst[:, perm].contiguous(), Sst[:, perm].contiguous(), lov, hiv, Hinv, dead)[:, inv].contiguous()
+        if REFINE:
+            Q = R.refine(Wst, Q, Sst, lo, hi, H, steps=REFINE_STEPS)
+    elif do_gptq:
         Hinv, dead = G.hinv_chol(H, damp)
         Q = GG.gptq(Wst, Sst, lov, hiv, Hinv, dead)
+        if REFINE:   # V41_REFINE=1: GSQ/AdaRound-style rounding refinement of the GPTQ codes (v41_repair.refine)
+            Q = R.refine(Wst, Q, Sst, lo, hi, H, steps=REFINE_STEPS)
     else:
         Q = G.rtn(Wst, Sst, lov, hiv)
     out, r0 = [], 0
@@ -285,6 +303,7 @@ def main():
         if name == "head":
             p.add_argument("--layer", type=int, default=40)
             p.add_argument("--device", default="cuda")
+            p.add_argument("--save-argmax", action="store_true")   # v41_calib.cmd_head reads it
     a = ap.parse_args()
     if a.cmd == "fill":
         cmd_fill(a)

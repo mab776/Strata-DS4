@@ -7,7 +7,7 @@
 #         quant_layers.sh /media/Crucial1TB/v41-quant-q2 0 39 -- --tier q2_0                  (the all-Q2_0 control)
 # Log: $QWORK/quant.log, per layer $QWORK/logs/LNN.log.   Env: NEED_GIB=38 MAX_GIB=44
 set -u
-cd /home/mal/AI/Strata-DS4
+cd /home/mal/AI/Xolotl
 W=$1; FROM=$2; TO=$3; shift 3; [ "${1:-}" = "--" ] && shift
 mkdir -p "$W/logs"
 LOCK=~/.quetza-data/conductor/ds4-gpu.lock

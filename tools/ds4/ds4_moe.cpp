@@ -37,6 +37,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_profiler_api.h>
 #if defined(DS4_MOE_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -108,6 +109,15 @@ struct Arena {
     int64_t n_layers = 0, n_experts = 0;
     bool from_ranked = false;       ///< built from a routing profile (not just index order)
     double seconds = 0.0;           ///< how long the fill took (the startup report wants this number)
+    /// --arena-lazy: the fill runs in the background and publishes each slot only AFTER its bytes land, so the
+    /// decode path reads a miss (the file tier) until then and answers seconds after start instead of waiting for
+    /// the whole fill.  `filler` is empty when the fill was blocking (the default); `fill_stop` ends it on close.
+    std::unique_ptr<std::thread> filler;   ///< --arena-lazy: the background fill (joined in close()/~Arena)
+    std::shared_ptr<std::atomic<bool>> fill_stop = std::make_shared<std::atomic<bool>>(false);
+    Arena() = default;
+    Arena(Arena&&) = default;
+    Arena& operator=(Arena&&) = default;
+    ~Arena() { if (filler && filler->joinable()) { fill_stop->store(true); filler->join(); } }
 
     const uint8_t* ptr(int64_t layer, int64_t expert) const {
         if (!base || layer < 0 || layer >= n_layers || expert < 0 || expert >= n_experts) return nullptr;
@@ -115,6 +125,7 @@ struct Arena {
         return s < 0 ? nullptr : (const uint8_t*) base + (size_t) off[(size_t) s];
     }
     void close() {
+        if (filler && filler->joinable()) { fill_stop->store(true); filler->join(); }
         owner.reset();
         base = nullptr;
         bytes = 0;
@@ -142,6 +153,14 @@ struct Gpu {
     uint8_t* h_dummy = nullptr;   ///< pinned zero blob: a guess outside the arena still costs its DMA
     float* h_x = nullptr;         ///< pinned host copy of x (the H2D source and the CPU tier's input)
     void* h_parts = nullptr;      ///< pinned D2H landing pad for the expert outputs
+    /// pinned staging for launch_group's metadata, one region per group (0 = hits, 1 = PCIe).  The old pageable
+    /// std::vector sources made each cudaMemcpyAsync wait for the stream (s28): the PCIe group's launch blocked the
+    /// host until the hits kernel and every PCIe DMA were done, so the CPU pool started only after them.
+    struct Meta {
+        unsigned long long ptr[kMaxEnt];
+        int32_t start[kMaxEnt + 1], ng, dst[kMaxEnt], tok[kMaxEnt], exp[kMaxEnt];
+    };
+    Meta* h_meta = nullptr;
 
     /// run_chunk (prompt chunks, MiMo prefill): allocated on first use, for up to `c_tok` tokens.  The streamed
     /// experts go through two device halves of `c_half` bytes (copy stream `s_cp` fills one while `s` computes
@@ -155,7 +174,7 @@ struct Gpu {
     std::vector<int32_t> c_pre_e;
     void *c_w = nullptr, *c_out = nullptr;   ///< run_chunk: the top-k weights and the summed rows on the card
     void *c_x = nullptr, *c_xq = nullptr, *c_parts = nullptr, *c_scratch = nullptr, *c_ptr = nullptr,
-         *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_stage[2] = {};
+         *c_start = nullptr, *c_ng = nullptr, *c_dst = nullptr, *c_tokv = nullptr, *c_exp = nullptr, *c_stage[2] = {};
     uint8_t* c_bounce[2] = {};
     float* c_hparts = nullptr;
     cudaStream_t s_cp = nullptr;
@@ -166,6 +185,10 @@ struct Gpu {
     void *m_gu = nullptr, *m_h = nullptr, *m_xg = nullptr, *m_xu = nullptr, *m_xd = nullptr, *m_bnd = nullptr,
          *m_iota = nullptr;
     std::vector<int8_t> m_ok;
+    /// Routed-expert LoRA (Ds4MoeConfig::lora): per-layer device deltas (all-null = off) + the per-entry expert ids
+    /// the grouped path's correction kernels read (`d_ent_exp`, one int32 per entry, kMaxEnt long).
+    std::vector<strata::kernels::NativeExpertLora> lora;
+    void* d_ent_exp = nullptr;
 #if defined(DS4_MOE_MMQ)
     /// Created once and never destroyed: a binary that also links ggml-cuda (mimo_generate's dense backend) resolves
     /// ~ggml_backend_cuda_context to ggml-cuda's real one, which segfaults on the context strata_mmq built.
@@ -191,7 +214,8 @@ struct Gpu {
         if (h_dummy) cudaFreeHost(h_dummy);
         if (h_x) cudaFreeHost(h_x);
         if (h_parts) cudaFreeHost(h_parts);
-        for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_stage[0], c_stage[1], c_w, c_out})
+        if (h_meta) cudaFreeHost(h_meta);
+        for (void* p : {c_x, c_xq, c_parts, c_scratch, c_ptr, c_start, c_ng, c_dst, c_tokv, c_exp, c_stage[0], c_stage[1], c_w, c_out})
             if (p) cudaFree(p);
         for (uint8_t* p : c_bounce)
             if (p) cudaFreeHost(p);
@@ -201,6 +225,12 @@ struct Gpu {
             if (c_used[i]) cudaEventDestroy(c_used[i]);
         }
         if (s_cp) cudaStreamDestroy(s_cp);
+        for (auto& lo : lora) {   // the per-layer deltas (null when the layer carries none)
+            for (void* p : {(void*) lo.a_g, (void*) lo.b_g, (void*) lo.a_u, (void*) lo.b_u, (void*) lo.a_d, (void*) lo.b_d})
+                if (p) cudaFree(p);
+            lo = strata::kernels::NativeExpertLora();
+        }
+        if (d_ent_exp) cudaFree(d_ent_exp);
         free_mmq();
         cache.reset();
         arena.close();
@@ -291,13 +321,25 @@ struct Ds4MoeImpl {
     bool inited = false;
     int64_t admitted = 0;
     double pcie_carry = 0.0, pf_carry = 0.0;
+    /// pcie_frac < 0 (--pcie auto, FreeToken-style bandwidth balance): EMAs of the measured cost of one PCIe expert,
+    /// one CPU-pool expert and a layer's VRAM-hit kernel, so the split makes the card and the pool finish together.
+    double ema_pcie = 0.0, ema_cpu = 0.0, ema_hit = 0.0;
     int32_t pf_e[Ds4MoeConfig::kMaxPf] = {};
     int pf_n = 0;                     ///< staging slots the last prefetch() filled
     std::unique_ptr<Gpu> gpu;         ///< null in a CPU-only tier
     std::vector<int64_t> last_use;    ///< arena_adapt: (layer, expert) -> the run() call that last used it
+    std::vector<float> heat;          ///< arena_admit: (layer, expert) -> decayed lookup count as of heat_t
+    std::vector<int64_t> heat_t;
+    /// arena_admit: the heat of entry i decayed to the current tick (one tick = one run() call = 1/n_routed token)
+    float heat_now(size_t i) const {
+        const double age = (double) (tick - heat_t[i]) / (double) std::max<int64_t>(1, g.n_routed());
+        return heat[i] * (float) std::exp2(-age / (double) cfg.arena_admit);
+    }
     int64_t tick = 0;
     std::vector<int64_t> vlast;       ///< vram_lru: (layer, expert) -> the run() call that last used its VRAM copy
+    std::vector<char> vpin;           ///< vram_lru + vram_pin_frac: (layer, expert) never evicted
     std::vector<int64_t> vmiss;       ///< vram_lru: (layer, expert) -> the layer's call count at its last miss
+    std::vector<std::pair<int32_t, int32_t>> seed_ranked;   ///< elastic cache: the seed's ranking, for grow_cache
     std::vector<int64_t> lcalls;      ///< vram_lru: run() calls per layer (= decode tokens)
 };
 
@@ -381,7 +423,10 @@ bool ds4_moe_layer_layout(const Ds4MoeGeom& g, int64_t l, cpu::NativeFmt& f, std
 
 bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string& err) {
     try {
-        GgufFile f(gguf);
+        // every shard (a split GGUF - GLM-5.3-Flash Maya-S-v2 is 3 - keeps blk.24+ out of the first file): metadata from
+        // shard 1, tensors looked up across all of them.  A lone GgufFile here silently saw layers 24-44 as expert-less.
+        const GgufModel model = GgufModel::open(gguf);
+        const GgufFile& f = model.meta();
         // the architecture's own key prefix: deepseek4.*, mimo2.*, ... (the key names are llama.cpp's, shared)
         std::string arch = "deepseek4";
         if (const MetaValue* a = f.get("general.architecture"); a && a->type == MetaType::STRING) arch = a->s;
@@ -400,6 +445,17 @@ bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string&
             }
             *k.second = v;
         }
+        // block_count counts the NextN/MTP draft block(s) when the file carries them (Maya-S-v2: 46 = 45 + blk.45);
+        // they are not decoder layers and their experts must not enter the tier
+        // ... but ONLY when the file carries them (xolotl, bug 13): DeepSeek-V4-Flash-0731 declares
+        // nextn_predict_layers = 1 with its MTP in a separate sidecar - block_count 43 = blocks 0..42, all decoder
+        // layers - and the unconditional subtraction dropped layer 42 (the profile then read "per token 252" for its
+        // 43 x 6 = 258 records).  The NextN block is the one that holds blk.<first>.nextn.eh_proj.
+        if (int64_t nn = 0; meta_i64(f, arch + ".nextn_predict_layers", nn) && nn > 0 && nn < g.n_layers) {
+            char nx[64];
+            std::snprintf(nx, sizeof nx, "blk.%lld.nextn.eh_proj.weight", (long long) (g.n_layers - nn));
+            if (model.find(nx)) g.n_layers -= nn;
+        }
         // every layer's three expert types; a layer with none of the tensors has no routed experts (MiMo's layer 0)
         const char* roles[3] = {"gate", "up", "down"};
         std::vector<int> ty[3];
@@ -409,7 +465,7 @@ bool ds4_moe_geom_from_gguf(const std::string& gguf, Ds4MoeGeom& g, std::string&
             for (int r = 0; r < 3; ++r) {
                 char name[64];
                 std::snprintf(name, sizeof name, "blk.%lld.ffn_%s_exps.weight", (long long) l, roles[r]);
-                const TensorInfo* ti = f.find(name);
+                const TensorInfo* ti = model.find(name);
                 if (!ti) continue;
                 ++have;
                 // ne0 is the input width: gate/up are [n_embd, n_ff, n_experts], down is [n_ff, n_embd, n_experts].
@@ -748,6 +804,36 @@ bool Ds4MoeTier::init(const Ds4MoeGeom& geom, Ds4BlobSource* blobs, const Ds4Moe
     for (int i = 0; i < 4; ++i) ck(cudaEventCreate(&gp.ev[i]), "event");
     ck(cudaMallocHost((void**) &gp.h_x, (size_t) kMaxTok * H4), "h_x");
     ck(cudaMallocHost(&gp.h_parts, (size_t) kMaxEnt * H4), "h_parts");
+    ck(cudaMallocHost((void**) &gp.h_meta, 2 * sizeof(Gpu::Meta)), "h_meta");
+    // Routed-expert LoRA (GLM abliteration): upload each layer's expert deltas once; an all-null host entry stays
+    // null, so the grouped path is bit-identical to the plain one on layers without deltas.  d_ent_exp carries the
+    // per-entry expert ids the correction kernels read; it is refreshed at every grouped call.
+    ck(cudaMalloc(&gp.d_ent_exp, sizeof(int32_t) * kMaxEnt), "d_ent_exp");
+    gp.lora.assign((size_t) geom.n_layers, strata::kernels::NativeExpertLora());
+    if (cfg.lora) {
+        const int64_t ne = geom.n_experts;
+        auto upl = [&](const float* src, int64_t cols) -> const float* {
+            if (!src || ne <= 0 || cols <= 0) return nullptr;
+            float* d = nullptr;
+            ck(cudaMalloc(&d, sizeof(float) * (size_t) (ne * cols)), "lora");
+            ck(cudaMemcpy(d, src, sizeof(float) * (size_t) (ne * cols), cudaMemcpyHostToDevice), "lora up");
+            return d;
+        };
+        int n_layers_lora = 0;
+        for (int64_t l = 0; l < geom.n_layers; ++l) {
+            const Ds4MoeLoraHost& hh = cfg.lora[l];
+            if (!hh.a_g && !hh.a_u && !hh.a_d) continue;
+            strata::kernels::NativeExpertLora& lo = gp.lora[(size_t) l];
+            lo.a_g = upl(hh.a_g, geom.n_embd); lo.b_g = upl(hh.b_g, geom.n_ff);
+            lo.a_u = upl(hh.a_u, geom.n_embd); lo.b_u = upl(hh.b_u, geom.n_ff);
+            lo.a_d = upl(hh.a_d, geom.n_ff);   lo.b_d = upl(hh.b_d, geom.n_embd);
+            lo.n_experts = hh.n_experts > 0 ? hh.n_experts : ne;
+            lo.ent_exp = (const int32_t*) gp.d_ent_exp;
+            ++n_layers_lora;
+        }
+        std::fprintf(stderr, "moe lora: routed-expert deltas on %d layer(s) (n_experts %lld, n_embd %lld, n_ff %lld)\n",
+                     n_layers_lora, (long long) ne, (long long) geom.n_embd, (long long) geom.n_ff);
+    }
     if (cfg.pf_b > 0) {
         ck(cudaStreamCreateWithFlags(&gp.s_pf, cudaStreamNonBlocking), "pf stream");
         ck(cudaMalloc(&gp.d_pf, (size_t) Ds4MoeConfig::kMaxPf * (size_t) im_->blob), "d_pf");
@@ -886,17 +972,37 @@ bool Ds4MoeTier::build_arena(const std::vector<std::pair<int32_t, int32_t>>& ran
     int nt = im_->cfg.threads > 0 ? im_->cfg.threads : 8;
     nt = std::min<int>(nt, 16);
     const double t0 = now_ms();
+    const int64_t n_fill = gp.arena.used;
+    const int64_t n_exp = im_->g.n_experts;
+    std::vector<std::pair<int32_t, int32_t>> fill_list = first;   // by value: a background fill outlives `first`
+    auto fill_ranges = [this, &gp, fill_list, n_fill, n_exp](std::atomic<int64_t>* next, bool publish) {
+        for (;;) {
+            if (gp.arena.fill_stop->load(std::memory_order_relaxed)) return;
+            const int64_t i = next->fetch_add(1);
+            if (i >= n_fill) return;
+            const int64_t l = fill_list[(size_t) i].first, e = fill_list[(size_t) i].second;
+            im_->blobs->read(l, e, (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) i]);
+            if (publish)   // AFTER the bytes: a reader that sees the slot sees complete data
+                gp.arena.slot_of[(size_t) (l * n_exp + e)] = (int32_t) i;
+        }
+    };
+    if (im_->cfg.arena_lazy) {
+        // --arena-lazy: unfill every slot first (so misses go to the file tier), publish blob by blob in the
+        // background.  The caller returns now and serves; a slot becomes a hit only once its bytes are in.
+        for (int64_t i = 0; i < n_fill; ++i)
+            gp.arena.slot_of[(size_t) (fill_list[(size_t) i].first * n_exp + fill_list[(size_t) i].second)] = -1;
+        gp.arena.filler = std::make_unique<std::thread>([&, fill_ranges, nt]() {
+            std::atomic<int64_t> next{0};
+            std::vector<std::thread> th;
+            for (int c = 0; c < nt; ++c) th.emplace_back(fill_ranges, &next, true);
+            for (auto& t : th) t.join();
+        });
+        gp.arena.seconds = 0.0;
+        return true;
+    }
     std::atomic<int64_t> next{0};
     std::vector<std::thread> th;
-    for (int c = 0; c < nt; ++c)
-        th.emplace_back([&]() {
-            for (;;) {
-                const int64_t i = next.fetch_add(1);
-                if (i >= gp.arena.used) break;
-                im_->blobs->read(first[(size_t) i].first, first[(size_t) i].second,
-                                 (uint8_t*) gp.arena.base + (size_t) gp.arena.off[(size_t) i]);
-            }
-        });
+    for (int c = 0; c < nt; ++c) th.emplace_back(fill_ranges, &next, false);
     for (auto& t : th) t.join();
     gp.arena.seconds = (now_ms() - t0) / 1000.0;
     return true;
@@ -943,9 +1049,11 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
     // A per-layer-sized geometry (MiMo) opens its cache now: one slot per ranked expert, each the size of ITS
     // layer's blob, until `slots` experts or `slot_gib` bytes.  The seed below admits in the same order, so slot i
     // is ranked[i]'s and fits it exactly; the cache never evicts, so a slot never meets another layer's blob.
+    const bool elastic = im_->mixed_sizes && im_->cfg.slot_gib > 0 && im_->cfg.slot_gib_max > im_->cfg.slot_gib;
     if (im_->mixed_sizes && im_->gpu && !im_->gpu->cache && !im_->cfg.no_cache && im_->cfg.slots > 0) {
-        const double budget = im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
-                                                     : (double) im_->cfg.slots * (double) im_->blob;
+        const double budget = elastic ? im_->cfg.slot_gib_max * 1073741824.0
+                            : im_->cfg.slot_gib > 0 ? im_->cfg.slot_gib * 1073741824.0
+                                                    : (double) im_->cfg.slots * (double) im_->blob;
         std::vector<int64_t> sizes;
         std::vector<char> seen((size_t) (im_->g.n_layers * im_->g.n_experts), 0);
         double used = 0;
@@ -962,7 +1070,14 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         }
         if (!sizes.empty()) {
             im_->gpu->cache.reset(new strata::core::ExpertCache());
+            if (elastic) im_->gpu->cache->set_segment_bytes((int64_t) 64 << 20);
             if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
+            if (elastic) {   // keep only the first slot_gib mapped: the rest is the prompt chunks' until grow_cache
+                strata::core::ExpertCache& c = *im_->gpu->cache;
+                const int64_t live = c.slots_within((int64_t) (im_->cfg.slot_gib * 1073741824.0));
+                if (!c.shrink(c.bytes_of(live), err)) return false;
+                im_->seed_ranked = ranked;
+            }
         }
     }
     // uniform blobs with defer_cache: the cache opens now (after the prompt chunks gave their VRAM back)
@@ -973,7 +1088,7 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
         if (!im_->gpu->cache->open_sized(sizes, im_->g.n_layers, im_->g.n_experts, err)) return false;
     }
     if (!im_->gpu || !im_->gpu->cache) return true;   // no cache: nothing to seed
-    const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->full_slots());
+    const int64_t want = std::min<int64_t>(im_->cfg.slots, im_->gpu->cache->slots());   // (elastic: the mapped ones)
     int64_t filled = 0;
     // vram_lru: the LRU's starting order = the profile's rank: the coldest seeded expert goes first
     auto lru_seed_order = [&](int64_t n_seeded) {
@@ -987,6 +1102,12 @@ bool Ds4MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>
             int64_t& v = im_->vlast[(size_t) (le.first * NX + le.second)];
             if (v != -1 || im_->gpu->cache->slot_of(le.first, le.second) < 0) continue;
             v = -2 - r++;   // rank 0 -> -2 (most recent of the seeds), the last seeded -> the oldest
+        }
+        if (im_->cfg.vram_pin_frac > 0) {   // the head of the rank is pinned
+            im_->vpin.assign((size_t) (im_->g.n_layers * NX), 0);
+            const int64_t npin = (int64_t) (im_->cfg.vram_pin_frac * (double) r);
+            for (size_t i = 0; i < im_->vlast.size(); ++i)
+                if (im_->vlast[i] <= -2 && -2 - im_->vlast[i] < npin) im_->vpin[i] = 1;
         }
     };
     if (im_->mixed_sizes || !std::getenv("DS4_SERIAL_SEED")) {
@@ -1117,6 +1238,16 @@ void Ds4MoeTier::prefetch(int64_t layer, const int32_t* top16, int n) {
 
 // ---- the CPU path: the whole expert half, and the fallback for every miss the GPU does not take ----------
 
+// The routed-expert LoRA's down factors for a CPU job (null when the layer has none): the pool applies them.
+void set_job_lora(const Ds4MoeImpl& im, cpu::ExpertJobMulti& j, int64_t layer, int32_t expert) {
+    j.lora_a = j.lora_b = nullptr;
+    if (!im.cfg.lora || layer < 0 || layer >= im.g.n_layers) return;
+    const Ds4MoeLoraHost& h = im.cfg.lora[layer];
+    if (!h.a_d || !h.b_d || expert < 0 || expert >= (h.n_experts > 0 ? h.n_experts : im.g.n_experts)) return;
+    j.lora_a = h.a_d + (size_t) expert * (size_t) im.g.n_ff;
+    j.lora_b = h.b_d + (size_t) expert * (size_t) im.g.n_embd;
+}
+
 bool cpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6, const float* x, float* out) {
     const int64_t H = im.g.n_embd;
     const int64_t K = im.g.top_k;
@@ -1135,6 +1266,7 @@ bool cpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         }
         im.jobs[(size_t) k].nact[0] = im.nact.data();
         im.jobs[(size_t) k].out[0] = im.parts.data() + (size_t) k * H;
+        set_job_lora(im, im.jobs[(size_t) k], layer, ids6[k]);
     }
     const double c0 = now_ms();
     im.pool->run_split_multi_native(f, im.jobs.data(), (int) K);
@@ -1176,6 +1308,17 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         if (im.last_use.empty()) im.last_use.assign((size_t) (im.g.n_layers * NX), -1);
         ++im.tick;
         for (int64_t k = 0; k < K; ++k) im.last_use[(size_t) (layer * NX + ids6[k])] = im.tick;
+        if (im.cfg.arena_admit > 0.0f) {
+            if (im.heat.empty()) {
+                im.heat.assign((size_t) (im.g.n_layers * NX), 0.0f);
+                im.heat_t.assign((size_t) (im.g.n_layers * NX), 0);
+            }
+            for (int64_t k = 0; k < K; ++k) {
+                const size_t i = (size_t) (layer * NX + ids6[k]);
+                im.heat[i] = im.heat_now(i) + 1.0f;
+                im.heat_t[i] = im.tick;
+            }
+        }
     }
     const cpu::NativeFmt& f = im.fl[(size_t) layer];
     const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) layer];
@@ -1207,13 +1350,16 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     // skip_miss: a miss with a small gate weight is dropped - its 6.75 MB never moves (wloc = the weights the sum uses)
     float wloc[kMaxParts];
     for (int64_t k = 0; k < K; ++k) wloc[k] = w6[k];
-    if (im.cfg.skip_miss > 0.0f && nc > 0) {
+    if ((im.cfg.skip_miss > 0.0f || im.cfg.skip_file > 0.0f) && nc > 0) {
         double ws = 0;
         for (int64_t k = 0; k < K; ++k) ws += (double) w6[k];
+        const bool arena = gp.arena.base && !gp.arena.slot_of.empty();
         int keep = 0;
         for (int i = 0; i < nc; ++i) {
             const int32_t k = cpu_i[i];
-            if ((double) w6[k] < (double) im.cfg.skip_miss * ws) { wloc[k] = 0.0f; ++st.skipped; }
+            const bool file = arena && gp.arena.slot_of[(size_t) (layer * im.g.n_experts + ids6[k])] < 0;
+            const float thr = std::max(im.cfg.skip_miss, file ? im.cfg.skip_file : 0.0f);
+            if ((double) w6[k] < (double) thr * ws) { wloc[k] = 0.0f; ++st.skipped; st.skipped_file += file; }
             else cpu_i[keep++] = k;
         }
         nc = keep;
@@ -1229,7 +1375,11 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         for (int i = 0; i < nc; ++i)
             if (gp.arena.ptr(layer, ids6[cpu_i[i]])) ++eligible;
         int budget;
-        if (im.cfg.dither) {
+        if (im.cfg.pcie_frac < 0) {   // auto: hit + np*p = (nc - np)*c  ->  np = (nc*c - hit) / (p + c)
+            const double p = im.ema_pcie > 0 ? im.ema_pcie : 0.35, c = im.ema_cpu > 0 ? im.ema_cpu : 0.35;
+            budget = (int) std::lround(((double) nc * c - im.ema_hit) / (p + c));
+            budget = std::max(0, std::min(eligible, budget));
+        } else if (im.cfg.dither) {
             const double want = (double) eligible * im.cfg.pcie_frac + im.pcie_carry;
             budget = (int) std::floor(want);
             im.pcie_carry = want - budget;
@@ -1270,18 +1420,38 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     auto launch_group = [&](int w, int n, const std::vector<unsigned long long>& ptr,
                             const std::vector<int32_t>& start, const std::vector<int32_t>& dst,
                             const std::vector<int32_t>& tok) {
-        const int32_t one = n;
-        ck(cudaMemcpyAsync(gp.d_grp_ptr, ptr.data(), sizeof(unsigned long long) * n, cudaMemcpyHostToDevice, gp.s),
+        // pinned sources (Gpu::h_meta): async for real, so neither launch blocks the host.  Region w is not reused
+        // before the layer sync, and the device buffers are stream-ordered (group 1's copies land after group 0 ran).
+        Gpu::Meta& hm = gp.h_meta[w];
+        std::memcpy(hm.ptr, ptr.data(), sizeof(unsigned long long) * n);
+        std::memcpy(hm.start, start.data(), sizeof(int32_t) * (n + 1));
+        hm.ng = n;
+        std::memcpy(hm.dst, dst.data(), sizeof(int32_t) * n);
+        std::memcpy(hm.tok, tok.data(), sizeof(int32_t) * n);
+        ck(cudaMemcpyAsync(gp.d_grp_ptr, hm.ptr, sizeof(unsigned long long) * n, cudaMemcpyHostToDevice, gp.s),
            "grp_ptr");
-        ck(cudaMemcpyAsync(gp.d_grp_start, start.data(), sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice, gp.s),
+        ck(cudaMemcpyAsync(gp.d_grp_start, hm.start, sizeof(int32_t) * (n + 1), cudaMemcpyHostToDevice, gp.s),
            "grp_start");
-        ck(cudaMemcpyAsync(gp.d_ngroups, &one, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
-        ck(cudaMemcpyAsync(gp.d_ent_dst, dst.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_dst");
-        ck(cudaMemcpyAsync(gp.d_ent_tok, tok.data(), sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_tok");
+        ck(cudaMemcpyAsync(gp.d_ngroups, &hm.ng, sizeof(int32_t), cudaMemcpyHostToDevice, gp.s), "ngroups");
+        ck(cudaMemcpyAsync(gp.d_ent_dst, hm.dst, sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_dst");
+        ck(cudaMemcpyAsync(gp.d_ent_tok, hm.tok, sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_tok");
+        // routed-expert LoRA: the per-entry expert id (dst[i] is a routing index, ids6 its expert) the correction reads
+        strata::kernels::NativeExpertLora lo;
+        const strata::kernels::NativeExpertLora* plo = nullptr;
+        if (layer < (int64_t) gp.lora.size() && gp.lora[(size_t) layer].a_g) {
+            for (int i = 0; i < n; ++i) hm.exp[i] = ids6[dst[(size_t) i]];
+            ck(cudaMemcpyAsync(gp.d_ent_exp, hm.exp, sizeof(int32_t) * n, cudaMemcpyHostToDevice, gp.s), "ent_exp");
+            lo = gp.lora[(size_t) layer];
+            lo.x = (const float*) gp.d_x;
+            lo.x_stride = (int64_t) H;
+            lo.ent_lo = 0;
+            lo.ent_hi = n;
+            plo = &lo;
+        }
         strata::kernels::native_expert_grouped(GL, (const unsigned long long*) gp.d_grp_ptr,
                                               (const int32_t*) gp.d_grp_start, (const int32_t*) gp.d_ngroups,
                                               (const int32_t*) gp.d_ent_dst, (const int32_t*) gp.d_ent_tok,
-                                              kMaxParts, n, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, n);
+                                              kMaxParts, n, gp.d_xq, gp.d_scratch, (float*) gp.d_parts, gp.s, n, plo);
         (void) w;
     };
 
@@ -1321,6 +1491,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
             if (gp.cache->slot_of(layer, e) < 0) continue;
             const int64_t u = im.vlast[(size_t) (layer * NXL + e)];
             if (u >= im.tick) continue;   // used by this call (a hit) or already taken by it
+            if (!im.vpin.empty() && im.vpin[(size_t) (layer * NXL + e)]) continue;   // the pinned census core
             if (u < best) { best = u; v = (int32_t) e; }
         }
         return v;
@@ -1422,6 +1593,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
             }
             j.nact[0] = im.nact.data();
             j.out[0] = im.parts.data() + (size_t) cpu_keep[i] * H;
+            set_job_lora(im, j, layer, ids6[cpu_keep[i]]);
         };
         std::vector<std::thread> rd;
         std::atomic<size_t> nx{0};
@@ -1436,10 +1608,13 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         if (!fi.empty()) {
             if (im.ftmp.size() < (size_t) nk * (size_t) im.blob) im.ftmp.resize((size_t) nk * (size_t) im.blob);
             if (direct && gp.s_pf) ck(cudaStreamSynchronize(gp.s_pf), "pf sync");   // no prefetch DMA reads a victim
+            if (direct && gp.s_cp) ck(cudaStreamSynchronize(gp.s_cp), "cp sync");   // nor a chunk prestage DMA
             for (size_t q = 0; q < fi.size(); ++q) {
                 fdst[q] = im.ftmp.data() + (size_t) fi[q] * (size_t) im.blob;
                 if (!direct) continue;
+                const bool admit = im.cfg.arena_admit > 0.0f && !im.heat.empty();
                 int64_t victim = -1, best = INT64_MAX;
+                float vheat = 0.0f;
                 for (int64_t v = 0; v < NX; ++v) {
                     if (gp.arena.slot_of[(size_t) (layer * NX + v)] < 0) continue;
                     const int64_t u = im.last_use[(size_t) (layer * NX + v)];
@@ -1447,9 +1622,16 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
                     bool taken = false;
                     for (size_t r = 0; r < q && !taken; ++r) taken = fvic[r] == (int32_t) v;
                     if (taken) continue;
-                    if (u < best) { best = u; victim = v; }
+                    if (admit) {   // the coldest arena expert (ties: the least recently used)
+                        const float h = im.heat_now((size_t) (layer * NX + v));
+                        if (victim < 0 || h < vheat || (h == vheat && u < best)) { vheat = h; best = u; victim = v; }
+                    } else if (u < best) { best = u; victim = v; }
                 }
                 if (victim < 0) continue;
+                if (admit) {
+                    const float c = im.heat[(size_t) (layer * NX + ids6[cpu_keep[fi[q]]])];   // updated this call
+                    if (c < 2.0f || c <= vheat) { ++im.st.admit_rejects; continue; }
+                }
                 fvic[q] = (int32_t) victim;
                 fdst[q] = (uint8_t*) gp.arena.base +
                           (size_t) gp.arena.off[(size_t) gp.arena.slot_of[(size_t) (layer * NX + victim)]];
@@ -1506,6 +1688,9 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     }
 
     mark(3);
+    // the card's expert rows come back in the same wait as the layer (s28: was a second D2H + "parts sync")
+    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
+                       cudaMemcpyDeviceToHost, gp.s), "d2h parts");
     ck(cudaStreamSynchronize(gp.s), "layer sync");
     if (lru)   // every lookup that was not a VRAM hit is a miss for the admission filter
         for (int64_t k = 0; k < K; ++k)
@@ -1548,9 +1733,12 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
         ck(cudaEventElapsedTime(&ms, gp.ev[ev_hit > 0 ? ev_hit : 0], gp.ev[ev_pcie]), "pcie elapsed");
         st.pcie_ms = ms;
     }
-    ck(cudaMemcpyAsync(gp.h_parts, gp.d_parts, (size_t) std::max<int64_t>(kMaxParts, K) * (size_t) H * 4,
-                       cudaMemcpyDeviceToHost, gp.s), "d2h parts");
-    ck(cudaStreamSynchronize(gp.s), "parts sync");
+    if (im.cfg.pcie_frac < 0) {   // --pcie auto: learn the per-expert costs (EMA, 0.1)
+        auto upd = [](double& e, double v) { e = e > 0 ? 0.9 * e + 0.1 * v : v; };
+        if (np > 0 && st.pcie_ms > 0) upd(im.ema_pcie, st.pcie_ms / np);
+        if (nk > 0 && st.cpu_ms > 0) upd(im.ema_cpu, st.cpu_ms / nk);
+        upd(im.ema_hit, st.hit_ms);
+    }
     const float* gpu_parts = (const float*) gp.h_parts;
     mark(5);
     // DS4_CHECK_GPU=1: every card-computed expert recomputed on the CPU from the arena's bytes (diagnostic, slow)
@@ -1577,6 +1765,15 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
     // it cannot be told to leave the pool's indices alone - the index's own source selects which buffer to read.
     // Reading `gpu_parts` for a CPU-computed index would sum uninitialized device memory, which is why this is not
     // a detail (the gate's file-tier arm caught it: the replay is speed-only and never sums a layer).
+    // renorm_skip (default off): dropping a low-weight expert removes its term but not the scale, so the sum shrinks
+    // by the dropped weight fraction (s21 lead).  Rescale by Sum(all w) / Sum(kept w) per token; exactly 1.0 when
+    // nothing was dropped, so a no-drop token is unchanged.
+    double skip_scale = 1.0;
+    if (im.cfg.renorm_skip) {
+        double w_all = 0, w_kept = 0;
+        for (int64_t k = 0; k < K; ++k) { w_all += (double) w6[k]; if (wloc[k] != 0.0f) w_kept += (double) wloc[k]; }
+        if (w_kept > 0.0 && w_kept < w_all) skip_scale = w_all / w_kept;
+    }
     for (int64_t i = 0; i < H; ++i) {
         double s = 0;
         for (int64_t k = 0; k < K; ++k) {
@@ -1585,7 +1782,7 @@ bool gpu_run(Ds4MoeImpl& im, int64_t layer, const int32_t* ids6, const float* w6
                                       : gpu_parts + (size_t) k * (size_t) H;
             s += (double) wloc[k] * (double) p[(size_t) i];
         }
-        out[i] = (float) s;
+        out[i] = (float) (s * skip_scale);
     }
 
     mark(6);
@@ -1677,12 +1874,13 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         for (int i = 0; i < nmiss; ++i)
             if (gp.arena.ptr(layer, ue[miss[i]])) ++eligible;
         int budget;
+        const double pf = im.cfg.pcie_frac < 0 ? 0.5 : im.cfg.pcie_frac;   // --pcie auto: half (no per-call EMA here)
         if (im.cfg.dither) {
-            const double want = (double) eligible * im.cfg.pcie_frac + im.pcie_carry;
+            const double want = (double) eligible * pf + im.pcie_carry;
             budget = (int) std::floor(want);
             im.pcie_carry = want - budget;
         } else {
-            budget = (int) std::lround((double) eligible * im.cfg.pcie_frac);
+            budget = (int) std::lround((double) eligible * pf);
         }
         budget = std::min(budget, kMaxParts);
         for (int i = 0; i < nmiss && np < budget; ++i) {
@@ -1744,6 +1942,7 @@ bool gpu_run_n(Ds4MoeImpl& im, int64_t layer, int nt, const int32_t* ids, const 
         jb.blob = acquire(im, layer, ue[u], nj, &from_file);
         jb.nt = 0;
         for (int t = 0; t < cpu::MAXT; ++t) { jb.nact[t] = nullptr; jb.out[t] = nullptr; }
+        set_job_lora(im, jb, layer, ue[u]);
         for (int j = 0; j < NE; ++j)
             if (ent_u[j] == u) {
                 jb.nact[jb.nt] = im.nact_n.data() + (size_t) (j / (int) K) * im.f.act_bytes;
@@ -1841,7 +2040,7 @@ int64_t chunk_stride(Ds4MoeImpl& im, int64_t layer) {
 }
 
 // chunk_prestage: DMA `layer`'s arena experts that are not VRAM-resident, ascending ids, into device half `h` at the
-// run_chunk stride; run_chunk(layer) then only waits for c_copied[h].  The half must hold them all (else: skip).
+// run_chunk stride; run_chunk(layer) then only waits for c_copied[h].  Only the first ones that fit the half.
 void chunk_prestage(Ds4MoeImpl& im, int64_t layer, int h) {
     Gpu& gp = *im.gpu;
     gp.c_pre_layer = -1;
@@ -1852,7 +2051,8 @@ void chunk_prestage(Ds4MoeImpl& im, int64_t layer, int h) {
         if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
         if (gp.arena.ptr(layer, e)) es.push_back((int32_t) e);
     }
-    if (es.empty() || (int64_t) es.size() * SL > gp.c_half) return;
+    if ((int64_t) es.size() * SL > gp.c_half) es.resize((size_t) (gp.c_half / SL));   // the part that fits
+    if (es.empty()) return;
     ck(cudaStreamWaitEvent(gp.s_cp, gp.c_used[h], 0), "prestage wait used");
     for (size_t i = 0; i < es.size(); ++i)
         ck(cudaMemcpyAsync((uint8_t*) gp.c_stage[h] + i * (size_t) SL, gp.arena.ptr(layer, es[i]), (size_t) BL,
@@ -1872,13 +2072,48 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     bool in_resident = true;
     std::vector<char> kev_res;
     const int64_t H = im.g.n_embd, K = im.g.top_k, NE = (int64_t) n * K;
+    // skip_file_chunk: a low-weight entry of an expert that only the file tier holds is redirected to its token's
+    // heaviest expert with weight 0 (contributes nothing); an expert left without entries is never read
+    std::vector<int32_t> ids_s;
+    std::vector<float> w_s;
+    std::vector<float> tok_scale;   // renorm_skip: per-token Sum(all w) / Sum(kept w); empty = no rescale
+    if (im.cfg.skip_file_chunk > 0.0f && gp.arena.base && !gp.arena.slot_of.empty()) {
+        ids_s.assign(ids, ids + NE);
+        w_s.assign(w, w + NE);
+        if (im.cfg.renorm_skip) tok_scale.assign((size_t) n, 1.0f);
+        for (int64_t t = 0; t < n; ++t) {
+            double ws = 0;
+            int64_t top = 0;
+            for (int64_t k = 0; k < K; ++k) {
+                ws += (double) w[t * K + k];
+                if (w[t * K + k] > w[t * K + top]) top = k;
+            }
+            double ws_kept = ws;
+            for (int64_t k = 0; k < K; ++k) {
+                const int64_t jj = t * K + k;
+                const int32_t e = ids[jj];
+                if (k == top || e < 0 || e >= im.g.n_experts) continue;
+                if (gp.arena.ptr(layer, e)) continue;
+                if (gp.cache && !im.cfg.no_cache && gp.cache->slot_of(layer, e) >= 0) continue;
+                if ((double) w[jj] >= (double) im.cfg.skip_file_chunk * ws) continue;
+                ids_s[(size_t) jj] = ids[t * K + top];
+                w_s[(size_t) jj] = 0.0f;
+                ws_kept -= (double) w[jj];
+                ++im.st.skipped_file;
+            }
+            if (!tok_scale.empty() && ws_kept > 0.0 && ws_kept < ws)
+                tok_scale[(size_t) t] = (float) (ws / ws_kept);
+        }
+        ids = ids_s.data();
+        w = w_s.data();
+    }
     const int64_t BL = im.bl[(size_t) layer];
     const strata::kernels::NativeExpertLayout& GL = gp.gll[(size_t) layer];
     const double t0 = now_ms();
     Ds4MoeStats st;
 
     if (n > gp.c_tok) {   // (re)allocate for n tokens
-        for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_w, gp.c_out}) if (p) cudaFree(p);
+        for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_dst, gp.c_tokv, gp.c_exp, gp.c_w, gp.c_out}) if (p) cudaFree(p);
         if (gp.c_hparts) cudaFreeHost(gp.c_hparts);
         gp.c_tok = n;
         const int64_t ne = (int64_t) n * K;
@@ -1888,6 +2123,7 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         ck(cudaMalloc(&gp.c_scratch, strata::kernels::native_expert_scratch_bytes(ne, im.g.n_ff)), "c_scratch");
         ck(cudaMalloc(&gp.c_dst, sizeof(int32_t) * (size_t) ne), "c_dst");
         ck(cudaMalloc(&gp.c_tokv, sizeof(int32_t) * (size_t) ne), "c_tok");
+        ck(cudaMalloc(&gp.c_exp, sizeof(int32_t) * (size_t) ne), "c_exp");   // per-entry expert id (routed LoRA)
         ck(cudaMalloc(&gp.c_w, sizeof(float) * (size_t) ne), "c_w");
         ck(cudaMalloc(&gp.c_out, (size_t) n * (size_t) H * 4), "c_out");
         ck(cudaMallocHost((void**) &gp.c_hparts, (size_t) n * (size_t) H * 4), "c_hparts");   // the summed rows
@@ -1897,9 +2133,14 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         gp.c_half = (int64_t) (mib ? std::atoll(mib) : 1024) * 1048576;
         gp.c_half = std::max<int64_t>(gp.c_half, im.blob);
         gp.c_bhalf = gp.c_half;   // the pinned bounce halves keep this size
-        // prestage: one device half holds a whole layer (every expert at the MMQ stride, <= blob + 1 MiB each)
-        if (im.cfg.chunk_prestage)
-            gp.c_half = std::max<int64_t>(gp.c_half, im.g.n_experts * (im.blob + 1048576));
+        // prestage: a device half holds up to a whole layer (every expert at the MMQ stride, <= blob + 1 MiB each),
+        // capped at STRATA_PRESTAGE_MIB (default 1536): a layer that does not fit is prestaged in part (the rest
+        // streams as without prestage) - a whole GLM layer would be 2 x 4.4 GB of VRAM
+        if (im.cfg.chunk_prestage) {
+            const char* pm = std::getenv("STRATA_PRESTAGE_MIB");
+            const int64_t cap = (int64_t) (pm ? std::atoll(pm) : 1536) * 1048576;
+            gp.c_half = std::max<int64_t>(gp.c_half, std::min<int64_t>(cap, im.g.n_experts * (im.blob + 1048576)));
+        }
         const int64_t ng = im.g.n_experts;
         ck(cudaMalloc(&gp.c_ptr, sizeof(unsigned long long) * (size_t) ng), "c_ptr");
         ck(cudaMalloc(&gp.c_start, sizeof(int32_t) * (size_t) (ng + 1)), "c_start");
@@ -1992,14 +2233,20 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
             }
     }
     std::vector<int32_t> dst((size_t) NE), tok((size_t) NE), fill(first.begin(), first.end() - 1);
+    const bool lora_on = layer < (int64_t) gp.lora.size() && gp.lora[(size_t) layer].a_g != nullptr && gp.c_exp;
+    std::vector<int32_t> exp;
+    if (lora_on) exp.resize((size_t) NE);
     for (int64_t j = 0; j < NE; ++j) {
         const int32_t p = fill[(size_t) ids[j]]++;
         dst[(size_t) p] = (int32_t) j;
         tok[(size_t) p] = (int32_t) (j / K);
+        if (lora_on) exp[(size_t) p] = ids[j];
     }
     // entry arrays sorted by expert: uploaded once; each launch passes its groups' slices via grp_start offsets
     ck(cudaMemcpyAsync(gp.c_dst, dst.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_dst");
     ck(cudaMemcpyAsync(gp.c_tokv, tok.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_tok");
+    if (lora_on)   // routed-expert LoRA: the expert of each (sorted) entry, for the correction kernels
+        ck(cudaMemcpyAsync(gp.c_exp, exp.data(), sizeof(int32_t) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_exp");
 
     // ---- activations ----
     ck(cudaMemcpyAsync(gp.c_x, x_host, (size_t) n * (size_t) H * 4, cudaMemcpyHostToDevice, gp.s), "c_x h2d");
@@ -2055,6 +2302,10 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
         p.w = base + GL.down_off; p.type = dt; p.w_rows = H; p.w_cols = FF; p.xq = gp.m_xd;
         p.ids = (const int32_t*) gp.c_dst + r0; p.dst = (float*) gp.c_parts; p.ld_dst = H;
         gp.m_ctx->run(p, gp.s);
+        if (lora_on)   // the routed-expert LoRA's down delta (gate/up are structural zeros), as the grouped path adds it
+            strata::kernels::native_expert_lora_down(gp.lora[(size_t) layer], (const int32_t*) gp.c_exp + r0,
+                                                     (const int32_t*) gp.c_dst + r0, (const float*) gp.m_h, FF, H,
+                                                     (int32_t) R, (float*) gp.c_parts, gp.s);
     };
 #endif
     auto launch = [&](const std::vector<int32_t>& es, const std::vector<unsigned long long>& ptrs) {
@@ -2106,10 +2357,21 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
             cudaEventCreate(&e1);
             cudaEventRecord(e0, gp.s);
         }
+        strata::kernels::NativeExpertLora lo;
+        const strata::kernels::NativeExpertLora* plo = nullptr;
+        if (lora_on) {
+            lo = gp.lora[(size_t) layer];
+            lo.ent_exp = (const int32_t*) gp.c_exp;   // the chunk's own per-entry expert ids
+            lo.x = (const float*) gp.c_x;
+            lo.x_stride = (int64_t) H;
+            lo.ent_lo = lstart.front();
+            lo.ent_hi = lstart.back();
+            plo = &lo;
+        }
         strata::kernels::native_expert_grouped(GL, (const unsigned long long*) gp.c_ptr, (const int32_t*) gp.c_start,
                                               (const int32_t*) gp.c_ng, (const int32_t*) gp.c_dst,
                                               (const int32_t*) gp.c_tokv, ng, NE, gp.c_xq, gp.c_scratch,
-                                              (float*) gp.c_parts, gp.s, ng);
+                                              (float*) gp.c_parts, gp.s, ng, plo);
         if (prof) {
             cudaEventRecord(e1, gp.s);
             kev.emplace_back(e0, e1);
@@ -2265,7 +2527,8 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
 
     // ---- chunk_prestage: the next routed layer's arena experts stream in while this layer computes and the caller
     // runs the next dense half (the half this call did not use last; its kernels finish before the DMA starts) ----
-    if (im.cfg.chunk_prestage && !im.cfg.arena_adapt && gp.arena.base) {
+    // (arena_adapt is fine here: prompt chunks never swap arena slots; decode's swaps sync s_cp first, see run())
+    if (im.cfg.chunk_prestage && gp.arena.base) {
         int64_t nl = layer;
         for (int64_t k = 0; k < im.g.n_layers; ++k) {
             nl = (nl + 1) % im.g.n_layers;
@@ -2275,7 +2538,13 @@ bool gpu_run_chunk(Ds4MoeImpl& im, int64_t layer, int n, const int32_t* ids, con
     }
 
     // ---- outputs: the top-k mix on the card, n rows back ----
-    ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
+    if (tok_scale.empty()) {
+        ck(cudaMemcpyAsync(gp.c_w, w, sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
+    } else {   // renorm_skip: scale each token's top-k weights by the surviving fraction before the sum
+        std::vector<float> w_up((size_t) NE);
+        for (int64_t j = 0; j < NE; ++j) w_up[(size_t) j] = w[(size_t) j] * tok_scale[(size_t) (j / K)];
+        ck(cudaMemcpyAsync(gp.c_w, w_up.data(), sizeof(float) * (size_t) NE, cudaMemcpyHostToDevice, gp.s), "c_w");
+    }
     strata::kernels::weighted_rows_sum((const float*) gp.c_parts, (const float*) gp.c_w, (int) K, H, n,
                                        (float*) gp.c_out, gp.s);
     if (out_dev)   // straight into the caller's device tensor (no host round trip)
@@ -2397,7 +2666,7 @@ void Ds4MoeTier::release_chunk() {
     if (gp.s) cudaStreamSynchronize(gp.s);
     if (gp.s_cp) cudaStreamSynchronize(gp.s_cp);
     for (void* p : {gp.c_x, gp.c_xq, gp.c_parts, gp.c_scratch, gp.c_ptr, gp.c_start, gp.c_ng, gp.c_dst, gp.c_tokv,
-                    gp.c_stage[0], gp.c_stage[1], gp.c_w, gp.c_out})
+                    gp.c_exp, gp.c_stage[0], gp.c_stage[1], gp.c_w, gp.c_out})
         if (p) cudaFree(p);
     for (uint8_t* p : gp.c_bounce)
         if (p) cudaFreeHost(p);
@@ -2407,7 +2676,7 @@ void Ds4MoeTier::release_chunk() {
         if (gp.c_used[i]) cudaEventDestroy(gp.c_used[i]);
     }
     if (gp.s_cp) cudaStreamDestroy(gp.s_cp);
-    gp.c_x = gp.c_xq = gp.c_parts = gp.c_scratch = gp.c_ptr = gp.c_start = gp.c_ng = gp.c_dst = gp.c_tokv = nullptr;
+    gp.c_x = gp.c_xq = gp.c_parts = gp.c_scratch = gp.c_ptr = gp.c_start = gp.c_ng = gp.c_dst = gp.c_tokv = gp.c_exp = nullptr;
     gp.c_w = gp.c_out = nullptr;
     gp.c_stage[0] = gp.c_stage[1] = nullptr;
     gp.c_bounce[0] = gp.c_bounce[1] = nullptr;
@@ -2418,6 +2687,74 @@ void Ds4MoeTier::release_chunk() {
     gp.c_pre_layer = gp.c_pre_half = -1;
     gp.c_pre_e.clear();
     gp.free_mmq();
+#endif
+}
+
+void Ds4MoeTier::profiler(bool on) {
+#if defined(DS4_MOE_CUDA)
+    if (on) cudaProfilerStart(); else cudaProfilerStop();
+#else
+    (void) on;
+#endif
+}
+
+int64_t Ds4MoeTier::shrink_cache(std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
+    strata::core::ExpertCache& c = *im_->gpu->cache;
+    const int64_t keep = c.slots_within((int64_t) (im_->cfg.slot_gib * 1073741824.0));
+    if (c.slots() <= keep) return 0;
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = "shrink_cache: device failed"; return -1; }
+    const int64_t gone = c.evict_from(keep);
+    if (!c.shrink(c.bytes_of(keep), err)) return -1;
+    im_->admitted = im_->admitted > gone ? im_->admitted - gone : 0;
+    return gone;
+#else
+    (void) err;
+    return 0;
+#endif
+}
+
+int64_t Ds4MoeTier::grow_cache(double keep_free_gib, std::string& err) {
+#if defined(DS4_MOE_CUDA)
+    if (!im_->gpu || !im_->gpu->cache || !im_->gpu->cache->segmented() || im_->seed_ranked.empty()) return 0;
+    strata::core::ExpertCache& c = *im_->gpu->cache;
+    size_t fr = 0, tot = 0;
+    if (cudaMemGetInfo(&fr, &tot) != cudaSuccess) { err = "grow_cache: cudaMemGetInfo failed"; return -1; }
+    const int64_t room = (int64_t) fr - (int64_t) (keep_free_gib * 1073741824.0);
+    if (room <= 0) return 0;
+    const int64_t before = c.slots();
+    std::string e;
+    c.grow(std::min<int64_t>(c.full_bytes(), c.bytes() + room), e);   // a short grow keeps what it mapped
+    const double t0 = now_ms();
+    int64_t added = 0, nfile = 0;
+    for (const auto& le : im_->seed_ranked) {   // the seed's order: slot i is ranked[i]'s size
+        if (c.resident() >= c.slots()) break;
+        if (!im_->g.routed(le.first) || le.second < 0 || le.second >= im_->g.n_experts) continue;
+        if (c.slot_of(le.first, le.second) >= 0) continue;
+        const int32_t s = c.admit(le.first, le.second);
+        if (s < 0) break;
+        const int64_t BL = im_->bl[(size_t) le.first];
+        if (const uint8_t* p = im_->gpu->arena.ptr(le.first, le.second)) {
+            if (!c.fill_slot_queued(s, p, err, BL)) return -1;
+        } else {
+            bool from_file = false;
+            const uint8_t* q = acquire(*im_, le.first, le.second, 0, &from_file);
+            if (!c.fill_slot_blocking(s, q, err, BL)) return -1;
+            ++nfile;
+        }
+        ++added;
+    }
+    if (cudaStreamSynchronize((cudaStream_t) 0) != cudaSuccess) { err = "grow_cache: queued fills failed"; return -1; }
+    im_->admitted += added;
+    std::fprintf(stderr, "grow_cache: %lld -> %lld slots (+%lld, %lld from the file tier) in %.0f ms%s%s\n",
+                 (long long) before, (long long) c.slots(), (long long) added, (long long) nfile, now_ms() - t0,
+                 e.empty() ? "" : "; grow stopped: ", e.c_str());
+    return added;
+#else
+    (void) keep_free_gib;
+    (void) err;
+    return 0;
 #endif
 }
 
@@ -2570,6 +2907,8 @@ void Ds4MoeStats::add(const Ds4MoeStats& o) {
     vram_swaps += o.vram_swaps;
     vram_demotes += o.vram_demotes;
     skipped += o.skipped;
+    skipped_file += o.skipped_file;
+    admit_rejects += o.admit_rejects;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
     pcie_ms += o.pcie_ms;

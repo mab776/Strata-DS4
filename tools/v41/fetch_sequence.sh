@@ -2,7 +2,7 @@
 # fetch_sequence.sh - one file at a time: let the running main fetch finish its current shard, then the two Engram
 # shards to their own SSDs, then resume the main fetch without them.  Log: $MAIN/sequence.log
 set -u
-F=~/AI/Strata-DS4/tools/v41/fetch_v41.sh
+F=~/AI/Xolotl/tools/v41/fetch_v41.sh
 MAIN=/media/Crucial1TB/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8
 E47=/media/mal/Crucible/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8
 E48="/media/mal/Team CX2/models/DeepSeek-V4.1-Flash-UNCENSORED-FP8"

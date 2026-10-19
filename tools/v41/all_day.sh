@@ -7,7 +7,7 @@
 #   (the all-Q2_0 control pass is skipped - Mal 2026-10-10; run it by hand if the GSQ head numbers look doubtful)
 # Stops at the first failure (see $W/allday.log).  Started/stopped via:  v41allday start|status|stop|log
 set -u
-cd /home/mal/AI/Strata-DS4
+cd /home/mal/AI/Xolotl
 W=/media/Crucial1TB/v41-calib
 MAP=$W/alloc_full.json
 GDIR="/media/mal/SSD NVME/AI/V41-GSQ"; GGUF="$GDIR/V41-GSQ.gguf"

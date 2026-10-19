@@ -14,7 +14,8 @@
 # ============================================================================
 set -eE
 WRAPPER_NAME="strata-ds41-quetza"
-DS_DIR="/home/mal/AI/Strata-DS4"
+# 2026-10-16: repointed to the unified Xolotl tree (pre-Xolotl copy: strata-ds41-quetza.bak-prexolotl-20261016)
+DS_DIR="/home/mal/AI/Xolotl"
 PY="/home/mal/AI/Strata/.venv/bin/python"
 SHIM="$DS_DIR/tools/v41/serve/serve_ds41.py"
 CONFIG="$DS_DIR/tools/v41/serve/strata-ds41.json"

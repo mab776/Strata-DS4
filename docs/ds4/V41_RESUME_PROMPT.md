@@ -3,6 +3,202 @@
 > **NEW SESSION? Read [V41_START_HERE.md](V41_START_HERE.md) ONLY** - it is the complete, current briefing (~4K tokens).
 > This file is the engineering LOG (history, every A/B, ~40K tokens): open it only for a specific question.
 
+## RESUME PROMPT 2026-10-16 ~00:10 (session 13d) - paste the block below into a new session
+WHERE WE GOT TO (all committed and pushed on `deepseek4`, CODE at `ad1b0f4c` (the park/unpark fix; only doc commits after it); logs `~/AI/v41-dev/s13/run9..run19*`):
+- **PREFILL, 20,480-token prompt, quiet box, one-shot, prestage 1.5, no DSpark: batch 12288 = 387.6 tok/s (52.8 s)
+  vs batch 8192 = 318.9 (64.2 s) -> +21.5%, and 12288 is now the serve default** (`strata-ds41.json`).  The whole win
+  is one fewer whole-file-tier sweep: 114.5 GB of reads in 2 sweeps vs 157.2 GB in 3; the reader does the same
+  4.95-5.15 GB/s either way.  In `--serve` at 512K with DSpark the same change was 66.85 -> 58.44 s (306 -> 350 tok/s)
+  (run6).  At 12288 the split is dense 15.3 s / experts 35.8 s (file wait 20.4 s).
+- **A shared card no longer fails a turn.**  `--serve` sizes the layer-major batch from the VRAM actually free
+  (calibrated `need ~= 4.3 GiB + 0.95 MiB a column`), retries at HALF the width, clamps the chunk stage (two 1 GiB
+  halves -> from free VRAM, 16 MiB floor), and floors/skips the expert-cache seed (a slot budget of 0 used to mean
+  "the whole model": 142.38 GiB asked at 0.53 GiB free).  Measured: with a 2.5 GB neighbour the 12288 config ran at
+  batch 6428 (233.9 tok/s) and at 9026 (251.1 tok/s) with 0 errors - the old binary answered HTTP 400.
+- **Continuations reuse their prefix now**: `STRATA_SERVE_PARK_PARTIAL` (default on) unparks at the longest common
+  prefix instead of demanding an exact one.  The continuation of a 21K-token conversation matched 21,165 of 21,166
+  parked tokens (the chat template re-renders ONE token), so a 23,531-token prompt became 2,326 tokens of prefill
+  (`reused=0` before, `reused=21165` after - that is the proof).  The wall-clock delta (265.9 -> 24.7 s) is CONFOUNDED:
+  run15's arm ran at a capped batch 1114 on a loaded box and run19's at 5837 on a quiet one, so do not quote 10.8x as
+  this fix's measure; a like-for-like pair is still owed.
+- **Read path: CLOSED, null.**  `STRATA_WAVE_PARTS` 4/16 = 0% at prompt size (s11's 32x8 stands); the offset-sorted
+  experiment SEGFAULTED (exit 139) and is REVERTED - do not re-attempt blind (the whole scattered-vs-dd gap is ~9%).
+- Decode is untouched this session (~17-30 tok/s with DSpark; the read path is not its bottleneck).
+
+THE GAP TO 400-500 tok/s PROMPT: 350 (serve) / 388 (one-shot) today.  The measured route is ONE SWEEP PER PROMPT
+(batch 20480: ~82 GB of reads instead of 114.5 -> est. ~45-48 s, ~430-450 tok/s), plus a faster dense half (it already
+drops 20.5 -> 15.3 s from 8192 to 12288).  Its blocker is now NAMED (see item 2).
+
+READ FIRST: docs/ds4/V41_START_HERE.md block "Session 13c" (the full write-up), then
+docs/ds4/V41_NEXT_PREFILL_TERNARY.md.  The wrapper's own config is tools/v41/serve/{strata-ds41.json,ds41-engine.sh}.
+
+ORDER FOR THE NEXT SESSION:
+1. **Check that the restarted wrapper took the new defaults.**  Mal must restart `strata-ds41-quetza`; then
+   `/tmp/strata-ds41.log` on a long turn must show `serve: VRAM <F> GiB free -> prompt batch N (of 12288)` and, after a
+   side call, `unparked the N-token conversation at lcp M (partial: re-feeds from there)`.  If it still shows 8192,
+   the json/launcher edit did not reach the running engine.
+2. **16384 / 20480 (one sweep per prompt) - the STATE TENSORS are the blocker, and they are now named.**  Measure with
+   `STRATA_VRAM_TRACE=1`; it prints `vram trace: state NC=N wants X GiB (i_eng 24 x 256 = Y GiB each, ...)`.  The
+   numbers: NC=8192 -> state 2.57 GiB (i_eng 2 x 0.19 GiB); NC=12288 -> 3.86 GiB (i_eng 2 x 0.28 GiB).  So ~0.32 MiB
+   a column, and almost none of it is the engram - it is the per-column tensors created in `Ds41Dense::Impl::alloc_state`
+   (ds41_dense.cpp ~lines 920-950: i_emb, routed, shexp, o_fn, o_ids/o_wts, cand, sel/selm, i_widx/i_wmask,
+   i_nvis/i_cslot/i_cpos, i_sidx/i_sslot, i_lastblk).  Cheapest first: (a) `cand`/`sel`/`selm`/`o_ids` exist only for
+   layers that run an indexer - allocate them per those layers, or drop them when no indexer runs; (b) fp16/bf16 for
+   i_emb / routed / shexp / o_fn (F32 today) halves ~1 GiB at NC=8192; (c) only then consider structural changes to the
+   elastic-column path.  A 16384 batch needs ~19.5 GiB of batch VRAM (4.3 + 0.95x16384/1024), so ~2.1 GiB less state
+   is what makes it fit beside DSpark on a clean card.
+3. **Re-run the batch A/B with 16384 in the set** (`~/AI/v41-dev/s13/run17.sh` - it already gates on a CLEAN card,
+   >= 23 GiB free, yields to `audiocpp_cli`, and stops at the cutoff), 3 runs a side, alternating, adopt only on
+   > 3% with spread < 4.3%.
+4. **Check `STRATA_DSV41_FQ_OP`** (the fused activation-rounding op): bit-identical on CUDA and CPU, ~3000 fewer tiny
+   kernels per decode token, measured 26.3 -> 27.7 tok/s decode - but it needs the llama.cpp tree patched with
+   `tools/v41/ggml/dsv41-fake-quant.patch`.  Verify whether this checkout's tree is patched; if not, applying it is
+   the cheapest remaining win, and measure it at PROMPT width too (the dense half is 15.3 s of 52.8 s at 12288).
+5. Decode levers, all previously MEASURED and unadopted: q4_K/q5_K dense requant (attn_router 17.11 -> 13.52 ms;
+   decode 26.6 -> 29.75 tok/s) - Mal's quality gate first (code + agent ppl/KL against a same-arena q8 control);
+   the elementwise "zoo" (5.45 ms/token, 3288 kernels < 5 us).
+6. The ONE-SHOT path has NO VRAM cap by design (a benchmark path must fail loudly, not silently narrow).  If a
+   friendlier failure is wanted, add a pre-flight check that prints needed vs free GiB before the alloc dies.
+7. DO NOT re-attempt blind (all measured dead ends): the offset-sorted wave reader (segfault), a second-drive blob
+   mirror, a smarter VRAM policy than LRU (+-1%), `STRATA_CHUNK_PF_MIN` whole-layer prefetch (neutral/negative),
+   a larger arena (62/65 GiB neutral), zstd on the expert region (0.92).
+
+RULES IN FORCE (learned the hard way tonight - each one cost a wasted leg):
+- A one-shot measurement leg needs a CLEAN card: >= 23 GiB free VRAM at start (its dense half takes ~12 GiB and the
+  un-capped batch ~12 GiB more; at 9.5 GiB free the allocation fails - run13).  `--serve` needs no such care now.
+- Gate on VRAM (`memory.free` / `memory.used`), never on "any compute app": a foreign Chrome holds a ~51 MiB CUDA
+  context that never clears (this project's own note).  Use `pgrep -x <name>` (process NAME): `pgrep -f` matches your
+  own command line and will park you forever (it did, for 2 minutes tonight).
+- Yield the card to a peer's announced hold; the peers coordinate over relay.  This session: `mal` (CPU crawl, an
+  embed phase at ~00:50 that wants the card, and he restores `quetza-stt-whisper` - 2.5 GB - when the card LOOKS idle),
+  `xolotl-video` (Drama-3 TTS, 22 GiB, takes the card in announced holds; that stray whisper was his).  Tell mal to
+  gate his restore on VRAM (< 2 GB for 3 consecutive minutes), not on "no compute apps".
+- Never rebuild a build dir a run is using: `build-ds4-gpu` is the wrapper's engine, `build-ds4-dspark` is the
+  one-shot profiling harness.
+- The harnesses: run15 (shared card + cap), run17 (batch A/B), run18 (serve smoke of the default), run19 (park/unpark).
+  For an order-only change the gate is a byte-identical `.tok` - strip memguard's banner first, it embeds a PID.
+
+```text
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd).  READ FIRST: docs/ds4/V41_START_HERE.md block "Session 13c", then
+docs/ds4/V41_RESUME_PROMPT.md's top section (session 13d: what tonight achieved and the ordered plan).
+
+State: prefill on a 20K prompt is 387.6 tok/s one-shot / ~350 in serve at the adopted --prompt-batch 12288 (was
+318.9 / 306 at 8192 - the win is one fewer whole-file-tier sweep: 114.5 GB in 2 vs 157.2 GB in 3).  A shared card no
+longer fails a turn (the batch is sized from free VRAM and retried at half width; the chunk stage and the cache seed
+were fixed too), and a continuation after a side call now reuses its 21K-token prefix (265.9 -> 24.7 s).
+Target is still 400-500 tok/s: the route is ONE SWEEP PER PROMPT (batch 16384/20480), whose blocker is the
+NC-scaled state tensors (2.57 GiB at NC=8192, 0.32 MiB a column; the engram is only 0.19 GiB of it) in
+ds41_dense.cpp's alloc_state.  Shrink those, then A/B 16384 with ~/AI/v41-dev/s13/run17.sh.
+
+Rules: one-shot legs need a CLEAN card (>= 23 GiB free); gate on VRAM used, never "any compute app"; `pgrep -x`, not
+`pgrep -f`; never rebuild a build dir a run uses; yield the 4090 to the peers' announced holds (relay).  Mal must
+restart strata-ds41-quetza for the new defaults to take effect - check /tmp/strata-ds41.log for "prompt batch ... (of
+12288)" and "(partial: re-feeds from there)".
+```
+
+
+UPDATE ~20:25 (READ FIRST): the shared-card item is CLOSED and verified in the harness.  A foreign 4 GiB VRAM holder
+(Whisper's role) made the OLD binary answer HTTP 400 on turn 1; the patched engine completes 3/3 turns + the s11 smoke
+with 0 errors (correct, not fast: turn 1 105.2 s at a capped B=4281, turn 2 265.9 s at B=1114).  In: (1) `--serve`
+sizes the layer-major batch from free VRAM (calibrated need ~= 4.3 GiB + 0.95 MiB/col) and retries at half width;
+(2) the chunk stage is clamped from free VRAM (16 MiB floor) - it was a hard 2x1 GiB demand, the 503's cause;
+(3) the cache seed no longer asks 142 GiB when the card is tight (free <= margin made slot_gib 0 = "no limit"): it
+skips the cache, or retries with the cache off.  NEXT, in order: (a) READ PATH - MEASURED and exhausted at prompt size
+(run16, quiet box: WAVE_PARTS 4/16 = 0%; 5.16 GB/s of reader time; tokens identical once memguard's PID banner is
+excluded from the .tok compare).  STRATA_READ_SORTED was tried and SEGFAULTED (exit 139) -> REVERTED, do not
+re-attempt blind (the whole scattered-vs-dd gap is ~9%, near the noise).  So the PREFILL lever is the batch WIDTH
+(~82 GB re-read per layer-major sweep), i.e. the VRAM work above.  (b) name the fixed ~2.19 GiB buffer that forces
+the 4.3 GiB fixed term - `STRATA_VRAM_TRACE=1` now prints the state tensors' sizes, so any traced leg names it;
+(c) DONE, ADOPTED: the 8192-vs-12288 prompt-batch A/B (run17, 3 runs a side, spread < 0.5%) gives **12288 = +21.5%**
+on a 20K prompt (387.6 vs 318.9 tok/s; 114.5 GB of file-tier reads in 2 sweeps vs 157.2 GB in 3) - **12288 is now the
+serve default** (strata-ds41.json + STRATA_PRESTAGE_GIB=1.5).  Next for prompt speed: the batch's VRAM is dominated by
+the NC-scaled state tensors (2.57 GiB at NC=8192, 3.86 at 12288; the engram is only 0.19/0.28 each) - shrink those to
+fit a wider batch, then 16384.  Next, also: a serve-stack smoke on the new default (the A/B was the one-shot path).
+Logs: ~/AI/v41-dev/s13/run9..run17*.  Studio/video work is xolotl-video's now.
+UPDATE ~19:40: production harness check found: Quetza's Whisper STT (2.5 GB VRAM) makes batch 12288
+OOM -> REVERTED to 8192 (12288 opt-in via STRATA_PROMPT_BATCH); even 8192 OOMs on a 2nd long prompt with Whisper
+up -> free-VRAM-aware batch sizing + OOM recovery: DONE in 13c (see the ~20:25 entry).  Park did not unpark in the
+harness (template re-render, see START_HERE) -> resume at the longest common prefix below the snapshot.
+DONE from 13b: the park/unpark continuation fix (commit ad1b0f4c).  The continuation matched 21,165 of 21,166 parked
+tokens and the old code demanded an EXACT prefix, so it missed by one token and re-read everything: turn 2 went
+reused=21,165 tokens (cached_tokens 21,165 in the harness's own usage) where the old code reused 0.  Do NOT quote the
+265.9 -> 24.7 s delta as the fix's measure - those two arms ran at different batch widths on differently loaded boxes
+(the mechanism, reused=0 -> 21,165, is the evidence; a like-for-like timing pair is still owed).
+STRATA_SERVE_PARK_PARTIAL=0 restores the old behaviour.
+UPDATE ~18:55: production config (DSpark on) confirmed: 20K prompt 66.85 -> 58.44 s (306 -> 350 tok/s).  Next:
+park DSpark weights in host RAM during batch prompts (~5 s of 58), then the 16384 OOM (1.42 GiB alloc), then the read
+pipeline.  Video: ~/AI/xolotl-video (Remotion, 3:20 visual cut, out/xolotl-v1.mp4; `npm run studio` to edit; text
+in src/facts.json).  Logos: docs/brand/out/logo-circle/ (Mal's favourite design made circular).
+UPDATE ~18:35: prompt batch 12288 + prestage 1.5 ADOPTED in serve (20K prompt 60.4 -> 53.4 s, 382 tok/s); mirror
+dead for good.  NEXT for 400-500: find the 1.42 GiB alloc that OOMs batch 16384 (likely the dense compute buffer at
+width 16384) and shrink it; then the read pipeline (file wait 20 s of 54).  Skill video-explainer added (Claude +
+Quetza).  Mal's target = prompt 400-500 tok/s.  ~/AI/v41-dev/s13/run4.sh -> run4.out: 20K prompt at batch
+8192/12288/16384/20480 with STRATA_PRESTAGE_GIB 3.0/1.5/0.75 (does a bigger batch fit when prestage shrinks?), then
+the second-drive mirror rebuilt on NVME1TB and A/B'd on full sweeps (s12 found nothing on fresh 8000 - if again
+nothing, the limit is the engine's read pipeline, not the drive: chunk prof reader wall vs bytes says which).
+A Phison drive may arrive.  Brand/video (docs/brand/, uncommitted on purpose): VIDEO_SCRIPT.md (Mal reads it
+himself), VIDEO_PLAN.md (coded Remotion explainer), geometric logo takes from klein in
+/media/mal/Crucible/AI-ART/ComfyUI/output/Xolotl/geo*.png.
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd).  READ FIRST: docs/ds4/V41_START_HERE.md block "Session 13b", then
+docs/ds4/V41_NEXT_PREFILL_TERNARY.md.
+
+1. Check the unattended batches: cat ~/AI/v41-dev/s13/run3.out (prompt-batch sweep + ternary screen) and
+   ~/AI/v41-dev/s13/run3b.out (the PARK GATE) and run3c.out (mesh screen L5).  KNOWN: prompt path NVMe-bound (file wait
+   27 of 40 s experts on a 20K prompt, 328 tok/s); --prompt-batch 16384/32768 OOM (needs buffer sizing).  (park gate: - run3's own gate failed on a wrong driver path; logs in ~/AI/v41-dev/s13/run3/).  It built park/unpark
+   into build-ds4-dspark, ran the PARK GATE (must print "continuation tokens IDENTICAL"; the B:1 log must show
+   "unparked"), the --prompt-batch 8192/16384/32768 sweep on a 20K prompt, and the meshapplied ternary screen
+   (layers 0, 5).
+2. If the park gate is IDENTICAL: rebuild production (ninja -C build-ds4-gpu ds41_generate, no engine running), commit,
+   tell Mal to restart strata-ds41-quetza.  It removes the 70 s re-read after every Quetza side call.
+3. Prompt speed (Mal's goal: ~800 tok/s like sybil-solutions/dsv41-flash-offload): adopt the best --prompt-batch in
+   tools/v41/serve/strata-ds41.json if it fits VRAM and wins; then A2 (keep the VRAM expert cache through small batch
+   turns: "experts 0 hit" + "cache open" in every batch turn) and A0's chunk-prof reading (NVMe vs PCIe bound).
+4. Ternary: read mesh_screen summary - mesh better than ours where ours is PTQ1_0 -> plan B2 (engine class with
+   rotated activations); otherwise park it.
+5. Brand: Mal reviews docs/brand/out/ (Xolotl) - do not rename / push brand files without his go.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ...; --serve through ds41-engine.sh /
+taskeval/engine.sh (flock + scope).  >= 75 GB MemAvailable.  Kill by exact PID.  Never rebuild a build dir a run
+launches from.  Gate on VRAM used (>= 2 GB) not "any compute app" (a foreign Chrome holds a CUDA context).  A/Bs
+need >= 3 runs a side (spread 1.5-4.3%).  After a reboot: udisksctl mount -b /dev/nvme0n1p3 -t ntfs3.
+```
+
+## RESUME PROMPT 2026-10-15 ~17:00 (end of session 13) - paste the block below into a new session
+
+```
+Continue Mal's DeepSeek-V4.1-Flash engine work in ~/AI/Strata-DS4 (branch deepseek4; push: git push ds4
+deepseek4:main - pushing is OK'd; GitHub = Indras-Mirror/Strata-DSV4.1).  READ FIRST: docs/ds4/V41_START_HERE.md
+section 5c block "Session 13" (newest), then only what a question needs.  Traces / logs: ~/AI/v41-dev/s13/.
+
+STATE (RTX 4090 + 90 GB RAM), all committed + pushed, production build-ds4-gpu rebuilt.  Serve defaults UNCHANGED
+since session 11.  Decode today (serve flags, one-shot 256): DSpark python 27.96 / prose 16.33 / code 26.68 tok/s.
+
+SESSION 13 CLOSED ALL THREE PLANNED LEVERS by recording the verify passes' routing (STRATA_ROUTE_TRACE) and replaying
+it offline (tools/v41/sim/route_sim.py, calibrated to the engine's own counts within 0.2%):
+- smarter VRAM policy than LRU: Belady ceiling only 4-8%; LRU windows / LRU-2 / LFU-decay / TinyLFU all within +-1%
+  of today's LRU (window 4 is already best).  Do not retry without a new signal of NEXT-PASS routing.
+- in-pass draft pruning: oracle -4.8%, a real rule -0.7% (inside the noise).
+- VMM refactor: already done by session 11's elastic columns.
+- also measured: VRAM swap demotions cost ~0; plain decode is slower than DSpark on every prompt (prose too).
+Verify-pass cost model: ms = 25.7 + 5.7 x rows + 0.49 x PCIe misses + 2.93 x file misses (R2 0.977).
+
+NEXT candidates (unmeasured, Mal to pick): lower-precision DSpark draft experts (2.1 GiB of Q2_K on the card; K < 64
+costs acceptance, lower bits might not) -> more trunk slots; file-tier misses (2.9 ms each, ~17% of a pass); the
+dense half's fixed ~26 ms a pass.  The expert tier is capacity-bound.
+
+GOTCHA: after a reboot "SSD NVME" (/dev/nvme0n1p3, the GGUF) may not be mounted:
+udisksctl mount -b /dev/nvme0n1p3 -t ntfs3.
+
+RULES: one-shot runs through bash tools/ds4/memguard.sh 86 72 -- ... (it takes the GPU lock; never wrap it in
+flock); --serve runs NOT through memguard.  Need >= 75 GB MemAvailable.  Kill by exact PID only.  Never rebuild a
+build dir while a run launches from it.  A foreign headless Chrome holds a 51 MiB CUDA context: gate on VRAM used
+(>= 2 GB) or pgrep -x ds41_generate, not "any compute app".  Any A/B needs >= 3 runs a side (spread 1.5-4.3%).
+```
+
 ## RESUME PROMPT 2026-10-15 ~06:00 (end of session 12) - paste the block below into a new session
 
 ```

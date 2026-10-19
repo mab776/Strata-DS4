@@ -124,6 +124,8 @@ public:
     /// write a layer-major batch's routed sums straight into it (run_chunk_dev) instead of upload_routed's host trip.
     float * routed_dev();
     bool finish_span(int il, int col0, int n);
+    /// STRATA_DENSE_PROF=1: print + reset the batch dense split (build / alloc / compute / Engram / readback) - diagnostic
+    void prof_report(const char * tag);
     /// Give the prompt passes' compute buffer back to the device (rebuilt by the next multi-token pass): the deferred
     /// VRAM expert cache opens into it after the prompt.
     void release_pass();
@@ -179,6 +181,15 @@ public:
     bool park_save(int n, std::vector<uint8_t> & out);
     bool park_load(int n, const uint8_t * in, size_t bytes);
     void park_history(const int * ids, int n);
+    /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
+    /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
+    /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
+    /// memory; unpark() writes them back and re-arms the snapshot, so restore() resumes the parked conversation.  Valid
+    /// only while no request has written past position n since park (the caller checks).
+    bool park(int64_t positions);
+    bool unpark();
+    void drop_park();
+    bool parked() const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

@@ -20,6 +20,16 @@ template<> struct Fmt<143> { static constexpr int qk = 128, ipb = 4, step = 1;
 #endif
 // Fork formats, kept out of upstream's lists above so those stay verbatim (fewer merge conflicts): Q2_K (10,
 // DeepSeek-V4 down), Q3_K (11, MiMo GSQ-RCO / V4.1 tier), MXFP4 (39, MiMo outliers), PTQ1_0 (143, V4.1 ternary tier).  Each use site expands the _FORK list too.
+//
+// UNION (xolotl): GLM's branch had this list INLINE in its own iq_kernels.cu, with three entries the fork's
+// extraction never picked up - Q4_K (12, GLM-5.3-Flash layers 3-5 down_exps; upstream's list has none) and
+// IQ2_S/IQ3_XXS (18/22, the Maya-S-v2 down_exps).  The merge reconciled GLM's inline copy to this header and
+// dropped them, so d_qk(18) == 0 and native_expert_grouped rejected the model at tier init:
+//   "tier init: native_expert_grouped has no kernel for layer 3's types 16/16/18" (16/16 = IQ2_XXS gate/up,
+// 18 = IQ2_S down) - i.e. GLM-5.3 could not load at all, while the DS4/DSV4.1 types were fine.  Measured
+// against the working tree: ~/AI/Strata-GLM/build-glm-gpu/glm_generate passes the same point and prints
+// "moe lora: routed-expert deltas on 26 layer(s) (n_embd 4096, n_ff 2048)".  Fmt<12>/Fmt<18>/Fmt<22> are all
+// defined in this build, so this is the whole fix (see HANDOFF.md §6).
 #define STRATA_GU_FMTS_FORK(X) X(10) X(11) X(143)
-#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(39) X(143)
+#define STRATA_D_FMTS_FORK(X) X(10) X(11) X(12) X(18) X(22) X(39) X(143)
 #define STRATA_MMVQ_FMTS_FORK(X) X(10) X(143)

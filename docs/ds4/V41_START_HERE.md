@@ -15,13 +15,16 @@ Q3_K = 2.25 bpw; dense Q8_0) on **one RTX 4090 24 GB + Ryzen 7 5700X + 90 GB DDR
 ## 2. Numbers today
 | | |
 |---|---|
-| Prefill 8K / 16K / 20K | 244-248 / 288 / 266 tok/s, exact (MMQ default) |
+| Prefill, 20,480-token prompt (adopted default) | **387.6 tok/s one-shot / ~350 in `--serve`** at `--prompt-batch 12288` (52.8 s one-shot; 58.44 s serve at 512K with DSpark).  Was 318.9 / 306 at 8192.  The win is one fewer whole-file-tier sweep: 114.5 GB in 2 vs 157.2 GB in 3 (s13 run17, 2026-10-15, 3 runs a side).  On a shared card the runtime cap narrows the batch: 233.9 tok/s at batch 6428, 251.1 at 9026 |
+| Prefill 8K / 16K (SUPERSEDED, batch 8192 era) | 244-248 / 288 tok/s, exact (MMQ default) - re-measure at the new default before quoting |
+| Decode today (s13, serve flags, one-shot 256 tok) | DSpark **python 27.96 / prose 16.33 / code 26.68 tok/s**; plain decode 18.61 / 14.67 / 19.53 |
 | Decode p256 x 256, forced tokens (identical work) | **26.4-27.5 tok/s = 37.5 ms/token** (28-29.5 on luckier token paths) |
 | Quality | 4096-tok code ppl 2.3790 exact routing; decode biases (defaults) cost code 2.38 -> 2.87 |
 | Head gate vs FP8 teacher (held-out) | ppl 5.645 vs 4.915, top-1 0.674 vs 0.701 |
 | DSpark (offline harness, fixed) | **OUR engine states: 3.27 accepted drafts/pass = 4.27 tokens/pass** (378 steps; 43% full 5-blocks; first draft 88.6%; confidence calibrated 23/61/91/99%); teacher states 3.24 / 4.24 - our 2-bit drift costs nothing. By verify depth 1..5: 1.89 / 2.65 / 3.29 / 3.83 / 4.27 tokens/pass |
 | Our hidden states vs teacher at layers 37-39 (exact routing, 639 tokens) | cosine **0.876-0.879** (large drift) |
-| Vision / DSpark in the engine | **NOT implemented** (weights exported in the sidecar only) |
+| DSpark in the engine | **IMPLEMENTED and the `--serve` default** (`STRATA_SERVE_DSPARK`, sidecar Q2_K, depth 4, KEEP 64, conf 0.6): draft+verify passes with exact speculative sampling.  In live traffic 2.1-3.3 tokens/pass (e.g. "DSpark 88 passes, 2.90 tokens/pass"); the 4.27/pass figure above is the offline harness at depth 4 |
+| Vision in the engine | **NOT implemented** (weights exported in the sidecar only) |
 
 ## 3. Per-token decode budget (37.5 ms; `STRATA_DEC_PROF=1` phase timer + nsys node trace)
 - `attn_router` **17.8 ms** = the dense CUDA graph per layer (15.2) + router graph (1.1) + readback.  Inside: dense
@@ -47,7 +50,10 @@ decode-thread issuing +1.2 ate it) · attention-level levers (KV quant, window, 
 quarter-block ternary dot / `STRATA_EXP_MODE_T*` (~1%) · hard pruning (soft penalties only - Mal) · **striping the
 file tier over a SECOND drive** (`STRATA_BLOB_MIRROR`: an 84 GiB mirror of the coldest experts on NVME1TB, the share
 of a blob's parts read from it - the pattern does +33% in the microbench and NOTHING in the engine at arena 64 AND
-at arena 32; the file tier is not bandwidth-bound. Session 12 block, 2026-10-15).
+at arena 32; the file tier is not bandwidth-bound. Session 12 block, 2026-10-15). · **a smarter VRAM policy than LRU**
+(Belady ceiling 4-8%, every online policy within +-1% of LRU; admission window 4 is already the best) · **in-pass draft
+pruning** (oracle -4.8%, a real rule -0.7%) · VMM for the prompt state (elastic columns already did it) · inclusive
+VRAM/arena tiers (demotions cost ~0) · plain decode for low-acceptance text (DSpark wins on prose too).  Session 13 block.
 
 ## 5. State at shutdown (2026-10-13 ~06:00, session 5) - nothing is running; resume from here
 - **DSpark teacher test: DONE.**  Teacher (FP8) states 0.437 accepted/pass vs ours 0.405 (`~/AI/v41-dev/dspark/
@@ -252,36 +258,250 @@ mirror control), microbench `rb2.cpp` (the wave reader's pattern, no GPU).
   harnesses' `gpu_busy()` ("any compute app") never clears - gate on VRAM used (>= 2 GB = busy) or on
   `pgrep -x ds41_generate`.
 
-### NEXT (session 13, Mal's pick 2026-10-15) - the three levers, with how to measure each
-**Bench discipline first: the 512K turn bench's run-to-run spread with an identical config is 1.5-4.3%** (session 12:
-31.51 -> 31.98 s on the same turn, and the short decodes swing 2.76 -> 3.09 s).  Every claim below needs **>= 3 runs
-a side**, alternating A/B/A/B, and both baselines quoted.  A single pair produced session 12's 64 x 16 false positive.
-1. **In-pass draft pruning (decode, keeps the output distribution exact).**  A DSpark verify pass runs 1+depth rows
-   and its expert bytes scale with the width (s11: verify ms by width 72 / 91 / 118 / 135 for 1 / 2 / 3 / 4 tokens;
-   every verified draft row costs ~20-27 ms of expert bytes).  Drop *trailing* draft rows mid-pass, once the first
-   layers' unique-miss set is known to be expensive: the dropped rows are simply not verified this pass, they stay
-   drafts and are re-fed next pass, so nothing about acceptance or sampling changes - a narrower pass, not a
-   different rule.  Where: `gpu_run_n_ex` (the verify path, `nt = 1 + depth`) - trim the row count before the
-   launches; drafting already allows any width (`STRATA_DSPARK_DEPTH` 0..5).  Measure: **time per token** (not
-   tokens/pass - a narrower pass would "win" that for free) plus accepted drafts/pass at 3 prompts x >= 3 runs;
-   report the trimmed-pass share.  Bitwise gate: `--kv-fp4` + a pinned `STRATA_PRESTAGE_GIB` (and note that the
-   greedy stream already depends on the verify width at ties, s11).
-2. **A VRAM replacement policy smarter than LRU.**  Today: per-layer LRU with a 4-call admission window
-   (`STRATA_LRU_WIN`) and a single same-class victim (`lru_victim`); the serve decode hit rate is already ~93% (222
-   of 239 routed rows a token at 512K, 1509-1946 slots).  Untried, in order of promise: (a) score victims by
-   *predicted next use* - the engine already predicts the next layers' top-k for prefetch (`Ds41Dense::predict`,
-   `--pf-b`, `spec_read`), so the same prediction can rank victims instead of recency; (b) add a frequency term so
-   one-off misses cannot evict a hot expert; (c) a *prediction*-based warm set across a batch turn (session 12's
-   warm_reseed used the released set, which is mostly recent misses, and showed nothing).  Measure: hits /
-   (hits + pcie + file) and verify ms/pass on the 4-turn bench, >= 3 runs a side.
-3. **VMM refactor for the prompt state's ~2.6 GiB.**  The layer-major prompt holds NC-sized state columns (0.31 MiB
-   a column x 8192 ~ 2.6 GiB) that decode does not need; `set_columns()` (elastic columns) resizes and drops every
-   cached graph, which is why the VRAM is not given back.  A VMM pool (cuMemAddressReserve / cuMemMap / cuMemUnmap
-   with STABLE virtual addresses, so cached graphs and tensor views keep their pointers) would let the dense half
-   and the expert cache share that VRAM: +2.6 GiB of slots is worth ~10-20% of a verify pass (measured: 13.44 /
-   12.13 / 10.83 GiB of slots -> python verify 131 / 136 / 145 ms).  Session 11 parked it because 1227 -> 1509 slots
-   showed nothing in decode - so do it only together with a decode-side measurement, and gate on bit-exactness with
-   `STRATA_PRESTAGE_GIB` pinned.
+### Session 13b (2026-10-15 17:00-) - real-harness findings, PARK/UNPARK, prompt + ternary + brand prep
+**Read this block first.**  Mal ran a real Quetza session on the production wrapper; full numbers + the plan in
+[V41_NEXT_PREFILL_TERNARY.md](V41_NEXT_PREFILL_TERNARY.md).  Then:
+- **Side requests destroyed the conversation cache (FIXED in code, gate pending).**  A 454-token Quetza side call
+  between main turns wrote positions 0..453 over the main conversation's position-indexed caches (`comp` compressed KV,
+  `idxk` indexer keys) and its snapshot rings, so the next main turn re-read the whole 20,736-token system prompt:
+  **69.5 s** each time.  `Ds41Dense::park(n) / unpark() / drop_park()` (host copies of the snapshot rings + rows
+  [0, n] and the spare row of every `comp` / `idxk`) + the serve loop: an unrelated request parks a conversation of >=
+  `STRATA_SERVE_PARK_MIN` (2048) tokens if prompt + max tokens <= `STRATA_SERVE_PARK_MAX` (65536 positions, ~1 GB
+  host); a later request that continues the parked tokens unparks it (resumes through restore(), DSpark window reset);
+  a request writing past the saved rows drops the park.  `STRATA_SERVE_PARK=0` = old behaviour.  Logs: `serve: parked
+  the N-token conversation`, `serve: unparked ...`.  **Gate + timing in `~/AI/v41-dev/s13/run3.sh`** (exact routing:
+  main 8K -> continuation, vs main 8K -> unrelated side request -> the same continuation: tokens must be IDENTICAL;
+  and the continuation's prompt time with park on / off).  Production build-ds4-gpu is NOT rebuilt with it yet - do
+  that (and restart the wrapper) only after the gate says IDENTICAL.
+- **Prompt path:** run3 also sweeps `--prompt-batch 8192 / 16384 / 32768` on a 20,480-token one-shot prompt with
+  `MIMO_CHUNK_PROF=1` (2 runs each): 1 sweep instead of 3 is the cheapest step toward sybil's 800 tok/s.  If 16384 /
+  32768 fit and win, set it in `tools/v41/serve/strata-ds41.json` (`--prompt-batch`) - note the serve default batch is
+  the engine's 8192 today.  Next code step after that: keep the VRAM expert cache through small batch turns (A2 in the
+  plan doc - the log says `experts 0 hit` and `cache open` up to 4.3 s on every batch turn).
+- **meshapplied ternary:** run3 downloads layers 0 + 5 (7 GB, /media/mal/NVME1TB/mesh-ternary), runs `mesh_pack.py
+  check` (lossless PTQ1_0 repack + rotation algebra) and `mesh_screen.py layer 5 / 0` + `summary` (ours vs mesh per
+  type).  mesh_screen has never run: if it fails, the likely spots are the hook's use of model.py's Expert (`w1/w3/w2`)
+  and C.K.dequant_fp4_weight - same calls as v41_calib.screen_expert.
+- **RESULTS (run3, 17:09-17:22):** (a) **the prompt path is NVMe-bound** - 20,480-token one-shot at batch 8192: 62.35 s
+  = 328.5 tok/s, experts 40.4 s of which **file wait 27.0 s** (chunk prof: reader wall 35.8 s, GPU grouped kernels
+  0.4 s).  So the road to ~800 tok/s is the file tier (bytes per sweep, read pattern, overlap), not PCIe or kernels.
+  (b) `--prompt-batch 16384` OOMs (a 1.42 GiB alloc) and 32768 OOMs in `c_stage`: bigger batches need the chunk /
+  stage buffers sized down (or the VRAM expert cache kept out), not just the flag.  (c) mesh: `mesh_pack.py check`
+  PASSES on layer 5 (381 of 384 experts ternary; rotation verified; PTQ1_0 repack lossless); layer 0 has a manifest
+  but no layer file (FP4 upstream); the screen is re-queued as `~/AI/v41-dev/s13/run3c.sh` -> run3c.out (layer 5).
+  Park gate rerun: run3b.out.
+- **PARK GATE PASSED (run3b, exact routing): continuation tokens IDENTICAL**; the continuation after an unrelated
+  side request reused 8,000 tokens in 8.15 s vs 28.99 s with STRATA_SERVE_PARK=0.  **Production build-ds4-gpu rebuilt
+  with park (2026-10-15 ~17:50)** - restart strata-ds41-quetza to use it.
+- **meshapplied ternary: CLOSED, ours is better.**  Layer 5 screen (teacher inputs, 268 experts): where ours is PTQ1_0
+  (same 1.75 bpw) mesh's gate+up error is 1.36x ours (mesh wins 19% of experts), down 0.985x (a tie); vs our Q2_0 /
+  Q3_K 1.8x / 11-16x worse.  Our GPTQ ternary already beats their Hadamard GPTQ ternary at equal bits - no swap.
+- **Prompt speed outlook:** NVMe-bound (file wait 27 of 40 s experts, 20K prompt, 328 tok/s).  One sweep per prompt
+  (batch = prompt, needs the chunk / c_stage buffers sized down so 16K-32K fit VRAM) ~ 500-550 tok/s; ~800 also needs
+  the dense half faster (21.9 s of a 20K prompt).
+- **PROMPT SPEED, ADOPTED (run4 + run5, 20,480-token prompt):** batch 8192 / prestage 3.0 = 328 tok/s one-shot,
+  60.4 s serve; **batch 12288 / prestage 1.5 = 382 tok/s one-shot, 53.4 s serve at 512K** (dense 21.9 -> 15.8 s,
+  file wait 26.9 -> 20.1 s: one sweep fewer, and the dense half is faster at width).  Now the serve default
+  (strata-ds41.json --prompt-batch 12288, ds41-engine.sh STRATA_PRESTAGE_GIB 1.5).  16384 / 20480 OOM (a 1.42 GiB
+  cudaMalloc, even at prestage 0.75) - find that buffer next (the dense graph's compute buffer at width 16384 is the
+  likely one) - 16384 would make a 16K prompt one sweep and a 20K one ~420-450 tok/s.  **Second-drive mirror: dead
+  for good** (A/B 2x2 at batch 8192: 62.5 / 62.7 vs 63.5 / 62.6 s; it trims file wait ~3 s but the total does not
+  move) - the read pipeline, not drive bandwidth, is the limit; deleted again.
+- **Production config confirmed (run6, DSpark ON as in ds41-engine.sh, 512K, 20K prompt):** batch 8192 / prestage
+  3.0 = 66.85 s (306 tok/s); **12288 / 1.5 = 58.44 s (350 tok/s, +14%)**; 12288 / 0.75 = 59.20 s (no better).  The
+  same prompt WITHOUT DSpark = 53.4 s: the draft head's 2.91 GB on the card costs ~5 s of prompt.  NEXT levers for
+  400-500: (1) park the DSpark weights in host RAM during a layer-major batch (2.9 GB, ~0.15 s each way) -> DSpark
+  serve at the no-DSpark speed; (2) find the 1.42 GiB cudaMalloc that OOMs batch 16384 (it OOMs WITHOUT DSpark too -
+  likely the dense graph's compute buffer or chunk c_parts at width 16384; ~89 KiB a column); (3) the read pipeline
+  (file wait ~20 s of the 54 s).
+- **PRODUCTION HARNESS CHECK (run8, 19:30, the real HTTP stack) - three findings, batch 12288 REVERTED:**
+  (1) **VRAM: Quetza's Whisper STT server (`quetza-stt-whisper --port 5101`, 2.5 GB VRAM) shares the card.**  With it
+  up, batch 12288 OOMs (the 1.42 GiB graph buffer) -> production is back on 8192 / prestage default; 12288 is opt-in
+  (`STRATA_PROMPT_BATCH=12288 STRATA_PRESTAGE_GIB=1.5 strata-ds41-quetza` when the GPU is otherwise free).  Worse:
+  even at 8192 a SECOND long prompt OOMed (612 MiB) after DSpark + the VRAM cache were seeded while Whisper sat on the
+  card -> the engine must size from free VRAM at prompt time and survive an OOM (release the expert cache / shrink
+  the batch and retry) instead of failing the request (the server answered HTTP 400).  This is the top robustness
+  item: a desktop always has other GPU users.
+  (2) **Park did NOT unpark in this harness:** "parked the 21349-token conversation", then the continuation (23,606
+  tokens) had no exact 21,349-token prefix match, so it re-read everything.  Likely cause: the chat template re-renders
+  the end of turn 1 differently once the assistant turn exists (generation prefix / thinking tags), so a snapshot at
+  the prompt end is not a prefix of the next prompt.  In Mal's live session normal turn-to-turn reuse DID work
+  (lcp >= snap), and run8's assistant content was empty (200 max tokens all spent thinking), so it may be the
+  harness - check a real Quetza session's log for "unparked".  Robust fix: resume at the longest common prefix even
+  when it is BELOW the snapshot (positional caches allow it; re-feed the last window's tokens to rebuild the ring).
+  (3) Timing A/Bs from 19:15 on are invalid: load average 18-23 (other jobs + video renders) - run7's prefetch test
+  is inconclusive (and its 2 x 2.71 GiB pinned slabs got the engine memguard-killed under RAM pressure).
+- **Brand (Xolotl):** `docs/brand/` - XOLOTL_BRAND.md (rationale, taglines, palette, README header, rename advice:
+  rename the GitHub repo IN PLACE, stars/forks/issues stay and old URLs redirect; keep "Strata" in description + topics
+  for search), `gen_openrouter.py` (OpenRouter google/gemini-3-pro-image; `-n` takes, `--model`), 12 images in
+  `docs/brand/out/` (picks: logo.2, wordmark-banner.2, hero.2, tiers.2, axolotl.2, twins.1).  Mal reviews before any
+  rename; the brand files are deliberately NOT pushed yet.
+- Real-harness decode 16-27 tok/s (2.1-3.3 tokens/pass on thinking text); a 66-token tool result 7.3 s; 1.2-2.2K-token
+  results 17-23 s (the per-batch expert sweep floor ~12-15 s); a 10K one 46 s.
+
+### Session 13c (2026-10-15 19:40-22:00) - a SHARED card: VRAM-aware batch width, cache seed, chunk stage, park/unpark
+**Read this block first.**  Mal's brief: keep working on prefill and make sure it works in the harness.  This closes
+the item the 13b block left on top - a desktop always has other GPU users (Whisper STT), and the engine FAILED the
+request instead of degrading.
+- **PARK/UNPARK FIXED (the other open 13b item): `STRATA_SERVE_PARK_PARTIAL` (default on).**  A continuation that
+  matches the parked conversation one token short of its end used to be REJECTED - the code demanded an exact prefix -
+  so an unrelated side call threw the whole cache away (run15 turn 2: 23,531 tokens re-read in **265.9 s**,
+  `reused=0`).  New logging says exactly why: `lp=21165` of a 21,166-token park, i.e. the chat template re-renders
+  ONE token (the 13b block's hypothesis, now measured).  A partial unpark restores the park and re-feeds from `lp`:
+  **run19 turn 2 reused 21,165 tokens (2,326 fed), 0 errors**, on the commonest agent pattern there is (a tool result
+  continuing a long conversation).  `STRATA_SERVE_PARK_PARTIAL=0` = old behaviour.
+  CAVEAT on the timing: run15's 265.9 s for that same turn was measured at a CAPPED batch 1114 on a loaded box, and
+  run19's 24.7 s at batch 5837 on a quiet one - so the wall-clock delta (10.8x) is NOT a clean measure of this fix.
+  The proof is the mechanism: `reused=0` before, `reused=21165` after, i.e. a 23,531-token prompt became 2,326 tokens
+  of prefill.  A like-for-like timing needs both arms on the same box at the same width.
+  The reuse log now prints `park= lp=` too.  Gate: `~/AI/v41-dev/s13/run19*`.
+- **Reproduced first (run10a/run11a: the OLD binary + a foreign process holding 4 GiB of VRAM - Whisper's role):
+  HTTP 400 on the FIRST turn.**  "allocating 2633.44 MiB (12.5 GiB held) / 2193.81 MiB (4 GiB held) on device 0:
+  cudaMalloc failed".  Also reproduced: the seed asking **142.38 GiB** ("ExpertCache: 152881735680 slots x 1 B =
+  142.38 GiB, but only 0.53 GiB of VRAM is free") and "ds4_moe: c_stage: out of memory" (-> HTTP 503).
+- **Three fixes** (tools/v41/engine/ds41_{generate,moe}.{cpp,hpp}, +99/-8; STRATA_VRAM_TRACE=1 is the trace):
+  1. `--serve`: the layer-major batch width is sized from the VRAM actually free (`pb_cap`), and `feed()` retries at
+     HALF the width if a column/graph allocation still does not fit.  The cost model is CALIBRATED on four traced
+     points: `need(B) ~= 4.3 GiB + 0.95 MiB * B` - a free card (>= 13 GiB free) keeps the full `--prompt-batch`, a
+     tight one degrades instead of failing.
+  2. The chunk stage (two `MIMO_CHUNK_STAGE_MIB` halves, 1 GiB each: a hard 2 GiB demand before) is clamped from free
+     VRAM with a 16 MiB floor; `per_half` then gives more, smaller waves.  c_stage can no longer OOM.
+  3. The VRAM cache seed: a slot budget of 0 is the tier's "NO LIMIT", and the AUTO path passed it whenever free <=
+     `--vram-margin` (i.e. on any busy card) - so the seed asked for the whole model's experts.  It now floors/skips
+     the cache (arena + file tier serve the decode) and retries ONCE with the cache off if the seed still fails:
+     never a failed request.  New `Ds41MoeTier::set_cache_enabled()` (`no_cache` had no writer before).
+- **GATE (the real HTTP stack: 3 Quetza-like turns + the s11 smoke, a foreign 4 GiB holder resident throughout):
+  3/3 turns complete, 0 engine errors** (run15, logs ~/AI/v41-dev/s13/run15*) - against HTTP 400 on turn 1 for the
+  same traffic on the old binary.  Turn 1 21,204 tok at the capped B=4281: 105.2 s (201.6 tok/s); turn 2 23,531 tok
+  at B=1114: 265.9 s (88.5 tok/s).  Free card (run9, same binary): 3/3 turns, 0 errors, turn 1 86.8 s at the full
+  B=8192.  The timings are inflated by a load-17..38 box (foreign nvcc + odin + a render): the run establishes
+  correctness, not speed.
+- **Why a narrow batch is expensive (the read-path link):** one layer-major sweep streams the WHOLE file tier of every
+  layer the batch routes through - ~82 GB per 40-layer sweep - so a 20K prompt at 8192 = **157.3 GB in 2 sweeps**
+  (measured, run4's profiler).  A narrower batch = MORE sweeps = more bytes (B=1114 -> 22 sweeps, hence 88 tok/s).
+  The lever is therefore VRAM (batch width), not the SSD.
+- **Residual (UNCONFIRMED identity):** a FIXED **~2.19 GiB** graph allocation appears at batch layer ~2, byte-identical
+  at B=2411 and B=8192 (so it is NOT the piece buffers, which scale with B).  It is why `need()` carries a 4.3 GiB
+  fixed term.  Name it (nsys / a gallocr log) and clamp it -> a wider batch on a busy card.
+- **Below ~5 GiB free a layer-major batch cannot run at all** (4.3 GiB fixed + the columns): that request fails fast
+  at c_stage.  The card's own dense half + KV is ~10.8 GiB, so a 12.5 GiB foreign holder leaves nothing - a sizing
+  limit, not a bug to fix.
+- **Read path: MEASURED at prompt size, and it is exhausted (Mal's ask: NVMe reads for decode AND prefill).**
+  run16 (20:52-21:08, one-shot 20,480-token prompt, build-ds4-dspark, load ~2, sides alternating):
+  base 320.9 tok/s / **5.16 GB/s** of reader time; `STRATA_WAVE_PARTS=4` 316.5 / 4.96; `=16` 320.9 / 5.15.
+  So parts 4/16 = **0%** - inside the 1.5-4.3% run-to-run noise - and s11's 32-thread x 8-part tuning stands.
+  The parts runs ARE token-identical (`10699 2105 6321 11`) once the memguard banner (it embeds a PID) is excluded:
+  my first identity gate compared banners, which is why it printed DIFFERS - fix in `~/AI/v41-dev/s13/run16.sh`.
+  **`STRATA_READ_SORTED` (issue a wave's parts in FILE-OFFSET order) was TRIED and SEGFAULTED** (exit 139, inside
+  the batch, 21:00) - the code is REVERTED, `blob_offset()` with it.  Not re-attempted blind: the source's own note
+  puts the whole scattered-vs-dd gap at ~9% (4.65 vs 5.1 GB/s), i.e. near that noise floor, and no GPU window was
+  left to debug it.  **Conclusion: at prompt size the read path has no knob left** - the reader does 5.08-5.16 GB/s
+  against the microbench's 6.22, and the PREFILL lever is the batch WIDTH (each layer-major sweep re-reads the whole
+  file tier: ~82 GB), which is the VRAM work above.  Still untested at prompt size: `STRATA_WAVE_THREADS` 48/64.
+- **`STRATA_VRAM_TRACE=1` prints the state tensors' sizes** (run17, run20): the state buffer is **2.57 GiB at
+  NC=8192**, **3.86 at 12288**, **5.14 at 16384** - linear in NC at **~0.321 MiB a column**.
+- **CORRECTION (2026-10-16, run20): the fixed ~2.19 GiB residual at :383 is NOT this per-column state.**  The earlier
+  note here read 2.57 - 0.19 - 0.19 = 2.19 GiB (the non-engram part of the state at NC=8192) as the answer to the
+  fixed allocation - but that is the one thing the fixed term cannot be: the state SCALES with the batch, the fixed
+  allocation does not (they only coincide in value at NC=8192).  Measured tonight on a clean card, full width
+  reached (`first batch B=16384`): the 16384 batch OOM'd asking for exactly **1424.31 MiB** -
+  `ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1424.31 MiB ... cudaMalloc failed` with 0.36 GiB free - and
+  1424 MiB is the value the `ds41_generate.cpp` comment records for **8192**.  So the pass-graph buffer is
+  **B-independent** and the cap formula's "graph 0.17 MiB a column" term is a mis-derivation (1424 / 8192).  The same
+  four calibrated points fit just as well as `need(B) ~= 5.7 GiB + 0.78 MiB * B` - the aggregate free-VRAM fit cannot
+  tell the two decompositions apart, but the OOM's allocation size can.
+- **B=16384 fails by ~1.03 GiB** (run20/b16384): the per-column state at 16384 (5.14 GiB, +1.28 over 12288) is what
+  eats the reserve the fixed 1424 MiB graph buffer needs.  12288 still passes (line, run20/b12288).
+- **`i_emb`/`selm` are bit-exact as F16 and `i_eng` is near-loss-free - and together they are NOT enough.**  `i_emb`
+  is written from F16 rows (`ds41_dense.cpp`: `fp16_to_fp32`) and its only consumer cpy-casts back to F32, so F16
+  round-trips exactly; `selm` is 0/-inf and is already cast to F16 for the flash-attn mask (`ggml_cast(... F16)`),
+  so F16 storage is exactly what it becomes anyway; `i_eng` comes from an e4m3 engram (F16 has more mantissa).  Per
+  column: `i_emb` -10,240 B, `i_eng` -24,576, `selm` -8,192 = **0.041 MiB a column = 0.66 GiB at 16384** - under
+  the 1.03 GiB deficit, so these alone do not get 16384.  This is the FALLBACK if the 1 GiB speed knob above costs too
+  much reader throughput; the cheapest sufficient F16 change is `x_state` + `hap` (0.078 MiB a column = 1.28 GiB at
+  16384), which is also 48% of the state.
+- **NAMED (run21, `nsys --trace=cuda --cuda-memory-usage=true`, one b8192 leg): the batch's VRAM is plain
+  `cudaMalloc`, and the 1424 MiB buffer that OOM'd at 16384 is a GRAPH buffer - transient, allocated at t=61.91 s and
+  freed 40 ms later, B-independent because the graph is built per 512-column sub-batch.**  The full >1 GiB picture:
+  8332 MiB dense weights + **2633 MiB state at NC=8192, allocated at INIT and held** (so the one-shot path reserves
+  the state at NC=NCmax=B before the batch - it is NOT elastic like `--serve`), 65532 MiB = **`cudaHostRegister` of
+  the 64 GiB HOST arena, not VRAM**, 1536 MiB prestage, and graph buffers of 1424.3 / 2193.8 / 2194.8 / 2196.8 /
+  2276.3 MiB (the 1424.3 and the first two ~2.19 are freed within 20-60 ms; the 2196.8 and 2276.3 are held).  Held
+  through the batch: 1417.5 + 1025 + 1025 + 1015.7 + 960.0 + 1536 (prestage) + ~2196 = **~8.0 GiB**, which is the
+  drop the VRAM trace shows, and none of it is the engram or the per-column state.
+- **So 16384's ~1.05 GiB deficit is a SPEED-knob problem, not a precision problem.**  `STRATA_PRESTAGE_GIB` (1.5,
+  allocated at t=59.4, hundreds of ms before the graph at t=61.9) and `MIMO_CHUNK_STAGE_MIB` (1024, the 2 x 1 GiB
+  halves at t=57-59) are both pure throughput knobs sized from free VRAM.  Dropping either by ~1 GiB frees it before
+  the graph alloc needs it.  The cost is reader speed (prestage 1.5 is what made 12288 a 2-sweep batch), so this is a
+  real trade - but it needs NO KL/ppl gate, unlike the F16 state change below, which is the fallback if the speed
+  knob costs too much.
+- **The state's per-column cost (0.321 MiB, 0.95 with the batch's other buffers):** `x_state` [5120,4] 24.3%,
+  `hap` 24.3%, `i_eng` x2 14.6%, `sel`/`selm` x8 idx layers 9.7%, `shexp`/`o_fn`/`routed`/`i_emb` 6.1% each,
+  `cand` [2048] 2.4%.  Shrinking the WIDER batch means shrinking those - starting with the two 24.3% residuals.
+- **A/B DONE AND ADOPTED (run17, 21:13-21:39, quiet box: load ~2, 3 runs a side, spread < 0.5%):
+  `--prompt-batch 12288` beats 8192 by +21.5% on a 20,480-token prompt.**  8192: 64.39 / 63.99 / 64.28 s =
+  318.0 / 320.1 / 318.6 tok/s, **157.2 GB** of file-tier reads in 3 sweeps (dense 20.5 s, file wait 26.9 s, 14917
+  file).  12288: 52.72 / 52.91 / 52.88 s = **388.5 / 387.1 / 387.3 tok/s**, **114.5 GB** in 2 sweeps (dense 15.3 s,
+  file wait 20.4 s, 10942 file).  The reader does the same 4.95-5.15 GB/s either way - the whole win is one fewer
+  whole-file-tier sweep.  **12288 is now the serve default** (`strata-ds41.json` `--prompt-batch 12288` +
+  `STRATA_PRESTAGE_GIB=1.5` in `ds41-engine.sh`) - safe to default because the runtime cap narrows the batch on a
+  busy card instead of OOMing (run15's gate).  **SERVE-STACK SMOKE (run18, 21:41-21:43, the adopted default through
+  serve_ds41.py): PASSED** - with another process holding 2.5 GB the engine logged
+  `serve: VRAM 11.26 GiB free -> prompt batch 6428 (of 12288)` (the cap working live), ran 21,138 tokens in 90.35 s
+  = 233.9 tok/s, the side call in 8.4 s, and reported **0 engine errors, 0 server errors, 0 HTTP 400s**.  That is the
+  quantified cost of a 2.5 GB neighbour: 233.9 vs 387 tok/s at full width.
+  The A/B itself needed >= 23 GiB free VRAM because the ONE-SHOT path has no runtime cap (that is `--serve` only):
+  its dense half takes ~12 GiB and the un-capped batch ~12 GiB more (at 9.5 GiB free that allocation fails, run13).
+  What cleared the card was xolotl-video's stray `quetza-stt-whisper` (2.5 GB) - the same consumer that tipped
+  run8 over at the start of this session.
+
+### Session 13 (2026-10-15 15:00-17:00) - the three levers CLOSED by trace replay (no engine change pays)
+**Read this block first.**  Mal's pick (session 12): in-pass draft pruning, a smarter VRAM policy than LRU, the VMM
+refactor.  Method: instead of building each one, record the verify passes' routing once and replay it offline -
+`STRATA_ROUTE_TRACE=<file>` (measurement only, inert when unset: `Ds41MoeTier::trace_open` / `trace_mark`) +
+`tools/v41/sim/route_sim.py` (`--policy`, `--prune`).  Logs / traces / scripts: `~/AI/v41-dev/s13/` (run1 = the 3
+traces, run2 = plain decode, sim1.txt / sim2.txt, swapreg.py).  Serve flags (x0.5 + file 0.3 + arena-adapt + arena 64
++ kv-fp4, DSpark depth 4 + KEEP 64 + conf 0.6), one-shot, 256 tokens: python 27.96 / prose 16.33 / code 26.68 tok/s.
+- **Verify-pass cost model** (345 passes, R2 0.977): **verify ms = 25.7 + 5.7 x rows + 0.49 x PCIe misses + 2.93 x file
+  misses**.  A python pass (4.5 rows, 125 PCIe, 8 file) = 26 + 26 + 61 + 23 ms: PCIe is ~45%, the file tier ~17%.
+- **The replay is calibrated**: the simulator's per-(layer, class) LRU with the 4-call admission window, arena_adapt and
+  the D3 prefetch slots (a miss the engine served from a prefetch slot counts as a hit and is LRU-admitted, as in
+  gpu_run_n_ex) reproduces the engine: python PCIe 31.89 vs 31.85 observed per token, hit 77.9 vs 78.0%; prose 49.64 /
+  49.57; code 25.96 / 26.07.
+- **(2) VRAM replacement policy: CLOSED.**  Belady's MIN with bypass (reads the trace ahead = the ceiling of ANY
+  policy) cuts PCIe misses/token 31.9 -> 26.5 (python), 49.6 -> 45.4 (prose), 26.0 -> 19.8 (code) = **-2.1 to -3.0 ms
+  of a 35-59 ms verify-ms/token, i.e. a 4-8% ceiling**.  Online policies get none of it: admission window 1 / 2 / 8 /
+  inf all worse than 4 (the current default is the best LRU); LRU-2 +0.1-0.2 ms; LFU-decay -0.4 / -0.2 / +0.1 ms (decay
+  0.9-0.995 identical); TinyLFU admission -0.2 / +0.6 / +0.5 ms (it refuses useful admissions).  DeepSeek's routing is
+  too flat for recency or frequency to predict a layer's next use, and a victim's next use is a whole pass away - the
+  prefetch predictor (same pass, next layers) cannot rank victims.  **Do not retry without a NEW signal of next-pass
+  routing.**
+- **(1) In-pass draft pruning: CLOSED.**  Dropping a pass's last draft row costs its unique misses (experts no earlier
+  row routes) + 5.7 ms/row; it loses a token only when every verified draft is accepted.  Oracle (knows each row's full
+  cost AND its acceptance): **-4.8% verify-ms/token** over all 3 prompts.  A real rule (drop at layer Lc if the row's
+  observed unique-miss cost x (40/Lc - 1) > theta x p_cum x ms/token; Lc 2/4/8/12, theta 0.5-3, best picked per prompt
+  in hindsight): best -0.7% overall (python -2.0%, prose -0.3%, code -0.4%) - inside the bench's 1.5-4.3% spread.  The
+  row's early-layer cost predicts its later cost poorly (corr 0.21 at Lc 2, 0.50 at Lc 8), and the confidence trim
+  (conf 0.6) already removed the cheap wins.
+- **(3) VMM refactor for the prompt state: ALREADY DONE (by session 11's elastic columns).**  `set_columns()` drops the
+  cached graphs and reallocates; serve decodes with S = 512 columns (~160 MiB) - the 11.59 -> 14.00 GiB / 1227 -> 1509
+  slots of session 11 IS the 2.6 GiB coming back.  The "needs VMM" note predated elastic columns.  VMM would only save
+  the graph rebuild per resize.
+- **VRAM swap demotions are free**: adding the replayed LRU swaps per pass (15 a pass) to the cost model gives -0.13
+  ms/swap (R2 0.9771 -> 0.9779) - the D2H demotions overlap fully; inclusive tiers (arena copies of VRAM experts) would
+  buy nothing.
+- **Plain decode is now SLOWER than DSpark on every prompt** (same flags, `STRATA_DEC_PROF=1`): prose 14.67 vs 16.33,
+  python 18.61 vs 27.96, code 19.53 vs 26.68 tok/s; a plain step = attn_router ~18.3 + tier 29-45 ms.  So a width-1
+  verify pass (~72 ms incl. draft-row work) is no worse than plain steps, and "k = 0 -> plain step + taps" has nothing
+  to gain.  Section 2's "37.5 ms/token" was forced tokens at an older config.
+- **DSpark's 2.91 GB on the card**: the sidecar holds **128** draft experts per MTP block (not 384): KEEP 64 = 3 x 64
+  Q2_K experts x ~11 MiB = 2.1 GiB + attention / main_proj / markov head ~0.6 GiB (the head is the trunk's,
+  shared).  Vision is not loaded.  K < 64 costs ~15% acceptance (s10), so the only VRAM left there is lower-precision
+  draft experts (untested: ~0.8 GB = ~+6% slots vs some acceptance).
+- **What is left for decode** (none measured): lower-precision DSpark draft experts (above); file-tier misses (2.9 ms
+  each, ~17% of a python pass - speculative reads were net-negative three times because of the issuing cost); the
+  dense half's fixed ~26 ms a pass (elementwise "zoo" kernels, section 3).  The expert tier is capacity-bound and
+  policy cannot fix that.
 
 ### Session 10b (2026-10-14 19:40-21:10) - DSpark IN --serve (speculative SAMPLING), crash fix UNTESTED; research
 **Read this block first.**  Mal's go 2026-10-14: (1) default x0.5 + arena-adapt + draft K=64 + arena 64 GiB, (2) DSpark
