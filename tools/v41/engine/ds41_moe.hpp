@@ -367,7 +367,6 @@ struct Ds41MoeStats {
     int64_t vram_demotes = 0;       ///< ...of which the victim went back to the arena (it had no arena copy)
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
     int64_t gpu1 = 0;               ///< mab776 STRATA_GPU1: computed on GPU 1's static tier
-    int64_t g1_fills = 0;           ///< ... STRATA_GPU1_DYN: GPU 0's evictions sent down to GPU 1
     double g1_wait_ms = 0;          ///< ... time the call waited for GPU 1's rows
 
     void add(const Ds41MoeStats& o);
