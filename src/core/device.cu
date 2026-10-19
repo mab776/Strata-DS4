@@ -19,10 +19,12 @@ void check(cudaError_t e, const char* what) {
 // A NaN pattern, not zero.  Zeros read from uninitialised memory are indistinguishable from real zeros in a
 // dequantized weight or a masked attention score, which is exactly the kind of wrong-but-plausible value the
 // Phase 1 harnesses kept catching.
+#if !defined(STRATA_GPU_METAL)
 __global__ void poison_kernel(float* p, uint64_t n_floats) {
     const uint64_t i = (uint64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n_floats) p[i] = __int_as_float(0x7fc00000);
 }
+#endif
 
 #if defined(STRATA_USE_HIP)
 #if !defined(STRATA_HIP_ARCHS)
@@ -160,8 +162,28 @@ IDXGIAdapter3* budget_adapter(int device) {
 }
 }  // namespace
 
+// #873 / #654: on some Windows setups the first hipMemGetInfo of a process fails with hipErrorInvalidValue because the ROCm
+// runtime has not finished initialising against the Adrenalin WDDM driver, and the first kernel launch after that
+// crashes (0xC0000005 in amdhip64_7.dll).  A hipFree(0) before the first query initialises the context, and one
+// failed query gets one retry after 250 ms.  Both happen once per process, before the DXGI budget below; any other
+// error, and a failure of the retry, are returned as they are (a real failure is never retried).
+static hipError_t first_mem_get_info(size_t* free_bytes, size_t* total_bytes) {
+    static std::atomic<bool> warmed{false}, retried{false};
+    if (!warmed.exchange(true)) (void) hipFree(nullptr);
+    hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
+    if (e == hipErrorInvalidValue && !retried.exchange(true)) {
+        (void) hipGetLastError();
+        std::fprintf(stderr, "strata: hipMemGetInfo failed (%s); retrying once after 250 ms\n", hipGetErrorString(e));
+        Sleep(250);
+        e = hipMemGetInfo(free_bytes, total_bytes);
+        std::fprintf(stderr, "strata: hipMemGetInfo retry: %s\n", e == hipSuccess ? "ok" : hipGetErrorString(e));
+    }
+    return e;
+}
+
 hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes) {
-    const hipError_t e = hipMemGetInfo(free_bytes, total_bytes);
+    if (free_bytes == nullptr || total_bytes == nullptr) return hipMemGetInfo(free_bytes, total_bytes);
+    const hipError_t e = first_mem_get_info(free_bytes, total_bytes);
     static const bool off = [] {
         const char* v = std::getenv("STRATA_WDDM_BUDGET");
         return v != nullptr && std::atoi(v) == 0;
@@ -212,7 +234,7 @@ std::string gpu_arch_problem(int ordinal) {
 }
 
 std::string device_code_error() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
     return "";   // gpu_arch_problem() checks the HIP architectures against STRATA_HIP_ARCHS, before this point
 #else
     // every .cu of the engine is compiled for the same CMAKE_CUDA_ARCHITECTURES, so this kernel stands for all
@@ -302,6 +324,12 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
     // One allocation for the whole region.  cudaMalloc of a large block is the thing that can fail late, so it
     // happens once, here, before anything depends on it.
     check(cudaMalloc(&base_, (size_t) bytes), "cudaMalloc");
+#if defined(STRATA_GPU_METAL)   // unified memory: the CPU writes the pattern through the allocation's CPU view
+    if (poison_) {
+        uint32_t* h = (uint32_t*) strata::gpu::host_view(base_);
+        for (uint64_t i = 0; i < bytes / sizeof(float); ++i) h[i] = 0x7fc00000u;
+    }
+#else
     if (poison_) {
         const int threads = 256;
         const uint64_t n = bytes / sizeof(float);
@@ -316,6 +344,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
         }
         check(cudaDeviceSynchronize(), "poison sync");
     }
+#endif
 }
 
 DeviceArena::~DeviceArena() {

@@ -1,5 +1,6 @@
 // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
 #include "strata/kernels/fused_gdn.hpp"
+#include "strata/core/geometry.hpp"
 
 #include <cuda_runtime.h>
 
@@ -10,9 +11,13 @@ namespace strata::kernels {
 namespace {
 
 constexpr int S = 128;          // state size (rows = cols = 128)
+static_assert(S == strata::core::kCompiledGeometry.ssm_state_size, "fused_gdn is compiled for core/geometry.hpp");
 constexpr int RG = 4;           // row groups
 constexpr int RPG = S / RG;     // 32 rows per thread
 
+// SILU: the output gate is SiLU(z) (Qwen3.6, qwen35moe) instead of sigmoid(z) (Flash-Next); a compile-time flag, so
+// the sigmoid instantiation is the kernel it was.
+template <bool SILU>
 __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
                                                                const float* __restrict__ k, const float* __restrict__ v,
                                                                const float* __restrict__ gate,
@@ -21,7 +26,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
                                                                const float* __restrict__ gamma, float eps,
                                                                float* __restrict__ y, int h_k, int h_v) {
     __shared__ float sk[S], sq[S];
-    __shared__ float red[RG][S];
+    __shared__ float red_kv[RG][S];
+    __shared__ float red_o[RG][S];
     __shared__ float wsum[S * RG / 32];
     const int head = blockIdx.x;
     const int col = threadIdx.x;          // 0..127
@@ -39,9 +45,9 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
     float kv = 0.0f;
 #pragma unroll
     for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-    red[rg][col] = kv;
+    red_kv[rg][col] = kv;
     __syncthreads();
-    const float kv_col = red[0][col] + red[1][col] + red[2][col] + red[3][col];
+    const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
     const float delta = (v[head * S + col] - g * kv_col) * beta[head];
     float o = 0.0f;
 #pragma unroll
@@ -50,12 +56,11 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         o = fmaf(s[r], sq[rg * RPG + r], o);
         base[r * row_stride] = s[r];
     }
-    __syncthreads();                      // every thread has read red[] for kv_col
-    red[rg][col] = o;
+    red_o[rg][col] = o;
     __syncthreads();
     float oc = 0.0f, sq_part = 0.0f;
     if (rg == 0) {
-        oc = (red[0][col] + red[1][col] + red[2][col] + red[3][col]) * rsqrtf((float) S);
+        oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
         sq_part = oc * oc;
     }
     // RMS over the head's 128 outputs: warps of row group 0 are threads 0..127.
@@ -66,7 +71,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
         const float scale = rsqrtf(ss / (float) S + eps);
         const float zz = z[head * S + col];
-        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
+        if constexpr (SILU) y[head * S + col] = oc * scale * gamma[col] * (zz / (1.0f + __expf(-zz)));
+        else y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
     }
 }
 
@@ -147,20 +153,34 @@ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_ab: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }
 
-void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
-                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
-                         void* stream) {
+namespace {
+template <bool SILU>
+void step_norm(float* state, const float* q, const float* k, const float* v, const float* gate, const float* beta,
+               const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, void* stream) {
     if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
         std::exit(1);
     }
-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
-                                                                                   gamma, eps, y, h_k, h_v);
+    gdn_step_norm_kernel<SILU><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta,
+                                                                                         z, gamma, eps, y, h_k, h_v);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+}
+}  // namespace
+
+void fused_gdn_step_norm(float* state, const float* q, const float* k, const float* v, const float* gate,
+                         const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                         void* stream) {
+    step_norm<false>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
+}
+
+void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
+                              const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k,
+                              int h_v, void* stream) {
+    step_norm<true>(state, q, k, v, gate, beta, z, gamma, eps, y, h_k, h_v, stream);
 }
 
 }  // namespace strata::kernels

@@ -1,208 +1,124 @@
-<h1 align="center">Strata-DS4 · mab776 fork</h1>
+<p align="center"><img src="docs/brand/assets/readme-header-1200.png" alt="Xolotl - frontier MoE models on one gaming PC" width="100%"></p>
 
-<p align="center"><b>DeepSeek-V4-Flash (284B MoE) served from one workstation — an OpenAI-compatible server that out-runs
-llama.cpp on the same box at every context length</b><br>
-Fork of <a href="https://github.com/Indras-Mirror/Strata-DS4">Indras-Mirror/Strata-DS4</a> (a DeepSeek-V4 engine built on
-<a href="https://github.com/Niko1221/Strata">Strata</a>) · Linux · NVIDIA · MIT</p>
+<h1 align="center">Xolotl</h1>
 
-> **Status: research code that runs a real daily-use server on one machine.** Everything here was built and measured
-> on the PC below, with unsloth's 2-bit GGUF. It serves one request at a time. Other GPUs or quants are untested.
-> The engineering log (every measurement, every decision, what was tried and dropped) is in
-> [README.mab776.md](README.mab776.md).
+<p align="center"><b>DeepSeek-V4.1-Flash - all 552 billion parameters - on one gaming PC, at 27 tok/s.</b><br>
+Plus GLM-5.3-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B: one engine, one OpenAI / Anthropic-compatible server.<br>
+Built on <a href="https://github.com/Niko1221/Strata">Strata</a> and heavily extended · Linux · NVIDIA · MIT</p>
 
-## What this fork adds
+> **A Strata fork.** Xolotl keeps [Strata](https://github.com/Niko1221/Strata)'s engine, server and kernels at its
+> core (merged at 0.1.44.1) and adds ~71,000 lines on top: the DeepSeek-V4.1 and V4-Flash engines, the GLM-5.3-Flash
+> engine and the Qwen3.8-27B dense port, each with its own quantisation and expert-tiering work.
+>
+> **Starred this as Strata-DSV4.1?** You are in the right place. Strata-DSV4.1 grew into **Xolotl**: the same
+> DeepSeek-V4.1 engine (faster now), plus GLM-5.3-Flash and the Qwen3.8 models, in one tree. Old links and clones
+> redirect here; nothing DeepSeek-V4.1 was removed.
 
-Upstream Strata-DS4 brought Strata's idea to DeepSeek-V4-Flash: hot experts in a VRAM cache, the rest in pinned RAM,
-misses split between the CPU and PCIe. This fork turns that into a server you can point clients at, and makes it fast
-at long context:
+## What one PC can do
 
-- **A resident server** (`tools/ds4/ds4_serve.cpp` behind Strata's `serve/server.py`). OpenAI and Anthropic APIs,
-  streamed tool calls (DeepSeek's DSML turned into OpenAI `tool_calls`), thinking in `reasoning_content`, and the full
-  262,144-token context.
-- **Prompt reuse.** Ring checkpoints at turn boundaries, so an agent turn reads only what it appended. A conversation
-  you switch away from is parked in RAM (~0.3 GB at 127k) and comes back in ~1.3 s instead of a 90 s re-read.
-- **Expert tiers across two GPUs.** GPU 0 has an elastic VRAM cache: it shrinks to make room while a prompt's chunks
-  run, then regrows for decoding. GPU 1 holds a static tier. The rest lives in a pinned RAM arena, served by the CPU
-  pool and PCIe. Disk reads during decode: none.
-- **Speculative decoding** with DeepSeek's own MTP head, using exact speculative sampling (the output distribution is
-  unchanged). The head can draft **chained tokens** (K per verify pass; K=2 is the fastest), and its experts run on
-  GPU 1.
-- **Decode with fewer host round trips.** The dense half's graphs and hand-offs are queued on the GPU stream without a
-  host wait per graph. The expert tier hands its result to the next graph through a CUDA event instead of a host
-  sync, and the prefetch hint is read back while the attention graph is already running. Each hyper-connection's
-  gates run as one fused op instead of eight tiny kernels. A verify pass mixes its experts' outputs on the GPU, in the
-  same double-precision order as the host loop it replaces, so the bits are unchanged. Small F16 weights keep ggml's
-  vector kernel in verify passes of 2-8 tokens (env `GGML_MMVF_F16_MAX=8`,
-  `tools/ds4/patches/ggml-zz-mmvf-f16-batch.patch`). Together these make a two-draft verify pass ~13 % faster
-  (31.3-32.8 ms -> 27.1-28.6 ms from 8k to 250k).
-- **Expert routing on the GPU** (env `DS4_DEV_ROUTE=1`). While the host still waits for a verify layer's routing, the
-  GPU already builds the groups of experts its VRAM cache holds and runs them, so the host's classification overlaps
-  the expert kernels. It is exact (the same kernel on the same rows) and takes another 2-3 % off a verify pass.
-  The hash-routed layers now get a correct prefetch hint, and the decode graphs' F16-weight matmuls accumulate in
-  fp32 (llama.cpp computes these in F32) at no cost (25.8 / 26.7 / 28.0 ms a pass at 8k / 127k / 250k).
-- **Prompt-lookup drafts** beside the MTP head. When the output starts copying its context (a code edit, a file
-  rewrite, a quoted tool result), the copied tokens become up to 7 drafts per pass. That makes file and config edits
-  40-45 % faster to decode; fresh text is unchanged. A copy is drafted only when its first token matches the MTP head's
-  own guess.
-- **Prefill kernels for long prompts:**
-  - chunked prefill (2,048 tokens) on MMQ, with FP4 MMQ for the MXFP4 layers;
-  - a tensor-core lightning indexer (`tools/ds4/patches/ggml-lightning-indexer-mma.patch`). With env `GGML_LI_I8=1`
-    it runs on int8 tensor cores, which adds 3-5 % to prefill at 127k-250k. Over 128k tokens of real text, its
-    teacher-forced NLL matched the fp16 kernel (0.02 % lower);
-  - a radix-select top-k (`tools/ds4/patches/ggml-topk-radix-select.patch`). The radix select is 10× faster than
-    sorting every row, and it also made verify passes almost flat in depth;
-  - lean masks for the compressed layers: the indexer takes per-query visible counts
-    (`tools/ds4/patches/ggml-lightning-indexer-count-mask.patch`) instead of a dense 65k × 2k visibility mask;
-  - compressors that build only the compressed rows a chunk keeps. They used to make one candidate per token and
-    throw away 99 % of them in the 128-token HCA layers. This change is exact and gives +9 % at 250k;
-  - the HCA layers' 32 query blocks run as one batched flash-attention call. It gives +6 %, and the long-context NLL
-    stays inside the noise.
+**One RTX 4090 (24 GB) · Ryzen 7 5700X · 90 GB DDR4 · one NVMe drive.** Every number is measured on that machine,
+through the real server, while it solved real tasks (21 HumanEval problems, 10 tool-call tasks, 3 agentic bug-fix
+loops), greedy, thinking on with a 32K-token thinking budget.
 
-## How fast is it?
+| Model | Size | Prefill | Decode | HumanEval | Tool calls | Agentic | Context |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **[DeepSeek-V4.1-Flash](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)** | 552B MoE | **180-320 tok/s** | **26.8 tok/s** | 21/21 | 10/10 | 3/3 | 512K |
+| **GLM-5.3-Flash** | 320B MoE | **290-375 tok/s** | **25.3 tok/s** | 19/21 | 10/10 | 3/3 | 512K |
+| **Qwen3.8-Flash-Next** | 125B MoE | **3,000-3,430 tok/s** | **127.8 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
+| **Qwen3.8-27B** (dense) | 27B | **1,240-1,390 tok/s** | **98.5 tok/s** | 21/21 | 10/10 | 3/3 | 200K |
 
-**Machine:** RTX Pro 5000 48 GB (GPU 0) + RTX 5070 Ti 16 GB (GPU 1) · Ryzen 9 7950X · 64 GB DDR5 · NVMe.
-**Model:** unsloth `DeepSeek-V4-Flash-0731` **UD-IQ2_M** (84.7 GiB).
+<sub>Decode = generation speed during those tasks. Prefill = a fresh 6K-17K-token prompt through the server
+(`tools/throughput.py`; Qwen3.8-Flash-Next: 3,430 / 3,005 tok/s at 6.5K / 16.7K, Qwen3.8-27B: 1,385 / 1,244 tok/s,
+DeepSeek-V4.1: 178 / 268 tok/s at 6.1K / 16.5K - its prompt batch is sized from free VRAM, ~6-9K tokens per sweep
+on a 24 GB card with the speculative-decode draft loaded).
+DeepSeek-V4.1 with the speculative-decode draft off the card during long prompts (the default since 2026-10-17):
+187 / 317 tok/s at 6.4K / 16.7K. GLM-5.3-Flash: soft prune + `--route-bias 0.25`
+(`tools/glm/serve/strata-glm-maya-abl-512k-bias.json`), prefill 301 / 374 tok/s at 6.1K / 15.6K and 368-376 on fresh
+30K / 44K prompts. How close the DeepSeek quant gets to DeepSeek's own API on the same tasks:
+[docs/xolotl/BENCHMARKS.md](docs/xolotl/BENCHMARKS.md#deepseek-v41-quant-vs-the-deepseek-api).</sub>
 
-The baseline is llama.cpp (`full-cuda`) on the same machine with the same GGUF and both GPUs, tuned with
-llama-fit-params, plus the DSpark Q2_K drafter (experts in RAM, n = 3).
+**What that means in practice:**
 
-All numbers are tok/s, measured through the HTTP API: code generation, 512 tokens, greedy.
+- **A 552B frontier model as a local coding agent.** Point Claude Code, Codex, opencode or Open WebUI at it - tool
+  calls, streaming, prefix reuse across agent turns, a thinking budget.
+- **No server farm.** The weights (152 GiB for DeepSeek-V4.1) live across VRAM, pinned RAM and NVMe; the engine
+  carries up the experts each token needs.
+- **Fast where it counts.** The Qwen models run at 100-130 tok/s; an agent's small follow-up turn on DeepSeek-V4.1
+  costs ~8 s on a 6K-16K context, and the engine learns the conversation's experts between turns.
 
-| context | prefill, Strata-DS4 | prefill, llama.cpp | decode, Strata-DS4 (K=2 / K=1) | decode, llama.cpp |
-|---|---:|---:|---:|---:|
-| 8k   | 1,100-1,320 | 1,011 | 79 / 74 | 40.8 |
-| 127k | **1,520**   | 843   | **75.5** / 73 | 39.0 |
-| 250k | **1,433**   | 693   | **75** / 70 | ~36 |
+## Quick start
 
-- **The table is the current one** (2026-10-12, after M13): K=2 averages four runs a depth, K=1 two, prefill two
-  reads. A K=2 verify pass now takes 24.9 / 25.9 / 26.7 ms at 8k / 127k / 250k (M12: 25.8 / 26.7 / 28.0) and yields
-  2.1-2.3 tokens on average, so tok/s moves a little with draft acceptance from run to run.
-  Logs: `bench/mab776-m2/work/m13/final.log` (M12's: `bench/mab776-m2/out/M12-final-before-after.log`).
-- **Without drafts**, decode was 47 / 45 / 43 tok/s at 8k / 127k / 250k, measured on 10-10 before M11 and M12
-  made a verify pass ~15 % shorter. It has not been re-measured since, so it is probably a little higher now.
-- **K=2 for sampled requests, K=1 for greedy ones.** Clients normally sample. In sampled needle runs at 240k (T=1.0
-  and T=0.6, 60 per K) neither K ever looped. In greedy (temperature 0) runs, K=2 fell into repetition loops a little
-  more often (11/106 vs 3/95). Teacher-forced checks show K=2's logits are as close to plain decoding as plain decoding
-  is to itself, with or without rejected drafts. Greedy requests therefore fall back to one draft (`--mtp-k-greedy`).
-- **Needle in a haystack:** 3/3 at 240k tokens (depths 10 / 50 / 90 %). One caveat: greedy decoding occasionally
-  talks itself into a repetition loop ("But wait… let me check…") after finding the word. The default sampling
-  (temperature 1.0, min_p 0.05) avoids it.
-- **Draft depth sweep** (K = drafts per pass, before the top-k kernel):
-
-  | context | plain | K=1 | K=2 | K=3 | K=4 | K=5 |
-  |---|---:|---:|---:|---:|---:|---:|
-  | 127k | 44.3 | 53.1 | 56.3 | 53.9 | 47.0 | 44.8 |
-
-  Every extra verify token costs ~15 % of a decode step (six more experts per layer, partly on the slower tiers), so
-  two drafts is the optimum here.
-- **Not bit-deterministic.** Which tier computes an expert depends on the cache state, and the CPU's Q8_K and the
-  GPU's q8_1 activations round differently. Two runs of the same greedy request can therefore diverge at a near-tie.
-
-## How well does it code?
-
-M9, 2026-10-11. Same GGUF and sampling on both engines: temperature 1.0, top_p 1.0, no top_k, the template's default
-reasoning, 32k-token cap.
-
-**LiveCodeBench** (39 problems: 24 medium, 15 hard):
-
-| | Strata-DS4 | llama.cpp |
-|---|---:|---:|
-| pass@1 (first sample) | 30/39 | **34/39** |
-| medium / hard | 19/24 · 11/15 | 22/24 · 12/15 |
-| mean tokens per answer (hit the 32k cap) | 15,134 (5) | 15,602 (3) |
-| wall time for the 39 | **2 h 28** | ~6 h 12 |
-
-The gap is mostly sampling noise. The engines disagree on 6 problems, and each engine sampled those 6 twice more.
-Strata then passes 10 of 18 samples and llama.cpp passes 12 of 18. That puts the expected scores at about 32.3 vs
-33.0 of 39. abc400_g is the one problem both find hard (Strata 0/3, llama.cpp 1/3). Per-problem table:
-`bench/m9/lcb-resample-table.txt`.
-
-**SWE-bench Verified-mini** (50 issues, mini-swe-agent, offline sandbox, 250-step / 45-min caps). Strata ran all 50.
-llama.cpp ran only the first 10 as a paired block, because at its decode speed all 50 would take 10-12 h.
-
-| first 10 issues (paired) | Strata-DS4 | llama.cpp |
-|---|---:|---:|
-| solved | 8/10 | 8/10 (the same 8) |
-| agent wall time, all 10 | **60 min** | 77 min |
-| minutes per solved issue | **7.4** | 9.7 |
-| output tokens per solved issue | 26.3k | **17.4k** |
-| mean steps (solved / failed) | 38.5 / 136.5 | 32.1 / 93.0 |
-
-On all 50, Strata solved **35/50**: 281 min of agent time, 8.0 min and 29.5k output tokens per solved issue. For
-comparison, Qwen3.8-Flash-Next IQ3_S on Strata (the live coder, medium effort, T 0.85) solved 37/50 in 130 min.
-The two failures the engines share are sphinx-8638 and sphinx-9229.
-
-All 50 runs submitted a patch. None hit the step or time cap, and none produced a malformed tool call or a repeated
-action loop. One reply ran out of its 32k tokens before calling a tool (sphinx-7748); the agent recovered and
-submitted a patch, but the issue stayed unresolved. Six runs took more than 100 steps. Summary: `bench/m9/swe-summary-m9-1011.md`.
-
-## Running it
-
-Requirements: Linux, Docker with the NVIDIA runtime, and an NVIDIA GPU with sm_120 (the build targets `sm_120a`;
-other archs need `CMAKE_CUDA_ARCHITECTURES` changed and are untested). You also need ~50 GB of RAM for the server
-container, and the GGUF.
+Linux, an NVIDIA GPU with 24 GB, CUDA 12.x/13.x, and RAM for the arena (90 GB was used above).
 
 ```bash
-git clone -b mab776-main https://github.com/mab776/Strata-DS4 && cd Strata-DS4
-# build ds4_serve in a throwaway CUDA 13 container (no GPU needed); applies tools/ds4/patches/*.patch to ggml
-BUILD_DIR=build-ds4-cu13 CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu24.04 BUILD_TARGETS="ds4_serve ds4_generate" \
-    ./mab776-build.sh
-# then run serve/server.py with an engine config: tools/ds4/ds4-server.json.example = the deployed one
-python serve/server.py --engine strata --config ds4-server.json --port 8080
+git clone https://github.com/Indras-Mirror/Xolotl.git xolotl && cd xolotl
+bash tools/xolotl/fetch-llama.sh   # llama.cpp at the pinned commit + tools/xolotl/ggml/xolotl-ggml.patch -> third_party/llama.cpp
+cmake -S . -B build-xolotl -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON \
+  -DSTRATA_MMQ_KQUANTS=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_GGML_DIR=$PWD/third_party/llama.cpp -DSTRATA_DSV41_FQ_OP=ON \
+  -DSTRATA_DSV41_HC_MIX=ON
+ninja -C build-xolotl      # strata, strata-dense, glm_generate, ds41_generate, ds4_generate
 ```
 
-The engine flags that matter are all in [tools/ds4/ds4-server.json.example](tools/ds4/ds4-server.json.example):
+Get a model: DeepSeek-V4.1-Flash is **[IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored](https://huggingface.co/IndrasMirror/DeepSeek-V4.1-Flash-GSQ-Uncensored)**
+(152 GiB, our GSQ mixed ternary / 2-bit / 3-bit quant - the card has the download and Engram steps). Then serve it
+(edit the model paths in its config first):
 
-| flags | what they do |
-|---|---|
-| `--gpu1 1` | GPU 1 expert tier |
-| `--vram-margin 9 --vram-grow 2` | GPU 0's elastic cache |
-| `--prefill-chunk 2048 --chunk-mmq --chunk-prestage`, env `STRATA_MMQ_FP4=1 GGML_LI_I8=1` | prefill (FP4 MMQ for the MXFP4 layers, int8 indexer) |
-| `--mtp DeepSeek-V4-Flash-MTP-bf16.gguf --mtp-device 1 --mtp-k 2` | speculative decoding (K drafts per pass; greedy requests: `--mtp-k-greedy`, default 1) |
-| `--lookup 7` | prompt-lookup drafts for sampled requests (greedy ones: `--lookup-greedy`, default 0) |
-| `--park-mib 4096` | conversation parking |
-| `--comp-type iq4_nl --icomp-q8` | compressed KV cache |
-| `--arena-gib 41` | pinned RAM arena |
+```bash
+python3 tools/v41/serve/serve_ds41.py --engine strata --config tools/v41/serve/strata-ds41.json --port 8150           # DeepSeek-V4.1-Flash
+python3 tools/glm/serve/serve_glm.py  --engine strata --config tools/glm/serve/strata-glm-maya-abl-512k.json --port 8144  # GLM-5.3-Flash
+python3 -m serve.server --engine strata --config <your-qwen-flash.json> --port 8130                                    # Qwen3.8-Flash-Next
+python3 -m serve.server --engine strata --config <your-27b.json> --port 8090                                          # Qwen3.8-27B (exe: build-xolotl/strata-dense)
+```
 
-A request can change the draft depth for itself with `"strata_tune": {"mtp_k": K}`, where 0 means plain decoding, and
-its lookup drafts with `"strata_tune": {"lookup": L}`, where 0 turns them off.
+Then point any OpenAI- or Anthropic-compatible client at `http://127.0.0.1:<port>/v1`.
 
-The Portainer stack this runs in (Dockerfile, compose file, snapshot/deploy scripts) is described in the log.
+### Will it run on my machine? (DeepSeek-V4.1)
 
-## Verifying it
+What I've measured is one setup: **RTX 4090 (24 GB), 90 GB DDR4, Linux, NVMe**. Beyond that:
 
-- **CPU gate** (`tools/ds4/run_serve_gate.sh test`, 44 tests on small synthetic models) covers:
-  - reuse, checkpoints and parking;
-  - STOP at any moment;
-  - the sampler;
-  - verify passes with 1-7 chained drafts, accepted or rejected at every position.
+- **OS:** Linux only for the DeepSeek engine for now (the launcher and the expert/Engram disk reads are Linux-specific).
+  The Strata core runs on Windows, but the DeepSeek side doesn't yet. WSL2 might work but is untested; keep the model
+  files inside WSL's own filesystem, not on a Windows drive.
+- **GPU:** NVIDIA, compute capability 7.5 or newer (RTX 20/30/40/50). Build with your card's architecture:
+  `-DCMAKE_CUDA_ARCHITECTURES=86` for RTX 30, `89` for RTX 40, `120` for RTX 50 (use CUDA 13.x for RTX 50; 12.8 builds
+  had prompt-path crashes).
+- **VRAM:** 24 GB is what I run. 16 GB should load but is untested, and prompts get processed in smaller batches, so
+  prefill will be slower. Below 16 GB won't work.
+- **RAM:** 90 GB here, with a 64 GB expert cache in RAM. Less RAM means a smaller cache, so more experts come off the
+  NVMe each token and decode is slower. More RAM helps: around 256 GB holds every expert.
+- **Disks:** about 152 GiB for the quant plus ~200 GB for the Engram tables. Both want a fast NVMe on ext4 or NTFS.
+  **Not exFAT** (Linux's exFAT driver serialises parallel reads; expert reads were 5x slower here) and not a hard
+  drive (the Engram lookups are ~48 small random reads per token).
 
-  On the CPU backend every one of these is bit-identical to plain one-token decoding. New tests are mutation-checked
-  (break the code on purpose; the gate must fail).
-- **Server suite:** `tools/ds4/run_serve_gate.sh serve-suite` (645 tests for `serve/`).
-- **Kernels:** each patch was checked standalone against a reference before it went in. The indexer kernel was
-  compared with the stock kernel. The top-k kernel was checked for exact sets against a stable sort, including ties,
-  `-inf` tails and all-equal rows.
-- **Upstream's gates** (dense half vs `ds4_ref`, expert tier vs an F32 reference) are described in
-  [README.upstream.md](README.upstream.md).
+## How it works, in one paragraph
 
-## More reading
+A mixture-of-experts model only uses a few experts per token. Xolotl keeps every expert somewhere - the hottest in
+VRAM, tens of GiB in a pinned RAM arena the GPU reads by DMA, the rest on NVMe read at the drive's ceiling - and
+moves the ones each token's router asks for, a layer ahead. Each model adds its own tricks: DeepSeek-V4.1 gets a
+calibrated mixed-precision quantisation, speculative decoding with exact sampling, a bit-exact 4-bit KV cache for 512K
+context and an arena that adapts to the conversation; GLM-5.3-Flash gets its abliteration LoRA on every path and soft
+pruning; the Qwen models get MTP speculative decoding. **[Read the full write-up](docs/xolotl/HOW_IT_WORKS.md).**
 
-- [README.mab776.md](README.mab776.md): the fork's engineering log (milestones M1-M10, every benchmark, rejected
-  ideas, how to update and roll back the live server).
-- [README.upstream.md](README.upstream.md): upstream Strata-DS4's README (architecture, its RTX 4090 numbers, flag
-  reference).
-- [README.strata.md](README.strata.md): upstream Strata (the Qwen3.8-Flash-Next engine).
-- [docs/ds4/](docs/ds4/): upstream's design notes and findings.
+## Read more
+
+| | |
+| --- | --- |
+| [How Xolotl works](docs/xolotl/HOW_IT_WORKS.md) | the three memory tiers, per-model engines, the server, the agent-loop work |
+| [Benchmarks](docs/xolotl/BENCHMARKS.md) | every measured number, exactness checks, how to measure your own PC |
+| [DeepSeek-V4.1-Flash engine](docs/DEEPSEEK_V41.md) | GSQ quantisation, DSpark, the fp4 KV cache, Engram |
+| [GLM-5.3-Flash engine](docs/glm) | KDA + MLA attention, the LoRA on routed experts, soft pruning |
+| [Qwen3.8 / upstream Strata](README.strata.md) | the Strata engine this grew from |
+| [Brand kit](docs/brand/XOLOTL_BRAND.md) | logo, banner, palette |
 
 ## Credits
 
-- [Indras-Mirror/Strata-DS4](https://github.com/Indras-Mirror/Strata-DS4): the DeepSeek-V4 engine this fork builds on.
-- [Strata](https://github.com/Niko1221/Strata) by Niko1221 and contributors.
-- [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp), including its DeepSeek-V4 kernels.
-- [unsloth](https://huggingface.co/unsloth): the GGUF.
-- philpax: the bf16 MTP-head GGUF.
-- avlp12: the 0731-aligned MTP sidecar (tested, a wash on speed).
-- DeepSeek: DeepSeek-V4-Flash.
+<img src="docs/brand/assets/logo-circle-400.png" alt="Xolotl" width="110" align="right">
 
-License: MIT (see [LICENSE](LICENSE)).
+Built on **[Strata](https://github.com/Niko1221/Strata)** by Niko1221 (its engine, server and kernels, merged at
+0.1.44.1) and [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp); the Qwen3.8-27B dense port is
+[perronemirko](https://github.com/perronemirko/Strata)'s. The DeepSeek-V4.1 and GLM-5.3-Flash engines, the GSQ quant
+and the unification are Indras Mirror's. Model weights: DeepSeek, Zhipu AI, Qwen, with quants and fine-tunes by
+peasantsmith, ukisai, d0xin and gcsa-abliterix.
+
+*Xolotl* is Quetzalcoatl's dark twin, who carries the dead up from the underworld - as the engine carries experts up
+from RAM and NVMe. Research code from one developer, measured on one PC; reports from other hardware welcome. MIT.

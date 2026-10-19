@@ -13,6 +13,7 @@
 // skipped with a printed reason (so a CI box without the 80 GB file still builds and runs the unit part); the
 // Phase-1 gate is the run WITH the path, whose command is in the report.
 #include "strata/artifact/ds4_geometry.hpp"
+#include "strata/artifact/ds4_guard.hpp"
 
 #include <cstdio>
 #include <cstdlib>

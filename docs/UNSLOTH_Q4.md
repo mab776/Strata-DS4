@@ -1,8 +1,9 @@
-# Unsloth UD-Q4_K_XL (experimental)
+# Unsloth UD-Q4_K_XL
 
-**Experimental.** Setup offers it from engine 0.1.32 ([below](#setup)); the manual workflow after that section works
-with engine 0.1.31 or newer. Validated on one PC: Windows 10, an RTX 5070 (12 GB), 64 GB of RAM and an AVX-512 CPU,
-on 2026-10-01.
+A regular size since MODEL-UPDATE Phase 2 (it was experimental): setup offers it from engine 0.1.32
+([below](#setup)); the manual workflow after that section works with engine 0.1.31 or newer. First validated on
+Windows 10, an RTX 5070 (12 GB), 64 GB of RAM and an AVX-512 CPU (2026-10-01); since then on an R9700 (AMD, every
+expert in RAM) and an RTX A4000 (62 GB, the RAM budget) - quality, speed and images in [QUANTS.md](QUANTS.md).
 
 The target is Unsloth's 4-bit quantization of the same model the other packs use:
 [unsloth/Qwen3.8-Flash-Next-GGUF, `UD-Q4_K_XL`, revision `38bb39e`](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL).
@@ -13,8 +14,7 @@ the 3-bit models'.
 
 ## Setup
 
-`START-HERE.bat --setup` (Linux: `./setup.sh --setup`) and choose **Qwen3.8-Flash-Next (Unsloth)**, marked
-`[experimental]`; or directly:
+`START-HERE.bat --setup` (Linux: `./setup.sh --setup`) and choose **Qwen3.8-Flash-Next (Unsloth)**; or directly:
 
 ```sh
 START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
@@ -22,13 +22,21 @@ START-HERE.bat --setup --family unsloth --model UD-Q4_K_XL
 
 What setup does differently for this model:
 
-- It needs 48 GB of RAM or more (with less it asks, default no; `--model UD-Q4_K_XL --yes` installs it anyway) and
-  engine 0.1.32 or newer (checked before anything is downloaded), and an NVIDIA
-  GPU: it has not been run on AMD cards (its prompt kernels for the Q4_K / Q5_K experts are NVIDIA-only), so with
-  `--backend hip` setup says so and asks before the download (#429; `--model UD-Q4_K_XL --yes` tries it). One GPU
-  by default: the RAM budget below has no layer split (the engine refuses `--resident-budget-gib` with one). No
-  images (the vision encoder is not wired to this file yet) and no experimental speed projection (not tested with it).
-- Several GPUs (#498): when the RAM holds the GGUF files and 24 GB more (~135 GB of RAM) and two or more cards can
+- Every expert in RAM where its 72 GiB of experts and 16 GiB more fit the RAM (~88 GB: no `--resident-budget-gib`;
+  the rule is sergqwer's fork's, MIT), else the RAM budget below. It needs 48 GB of RAM or more (with less it asks,
+  default no; `--model UD-Q4_K_XL --yes` installs it anyway) and engine 0.1.32 or newer (checked before anything is
+  downloaded). NVIDIA or AMD: it ran on an R9700 too (#429's question is gone). One GPU by default in the budget mode
+  (the tested setup); on several, see the next point. No experimental speed projection (not tested with it). Images
+  (#967) are on by default on an NVIDIA card of 16 GB or more and on AMD (CPU encoder) where every expert fits in RAM;
+  run end to end on CUDA and HIP (QUANTS.md).
+- Several GPUs, with an engine that keeps the resident RAM copy on a layer split (0.1.40 and newer, #642): the RAM
+  budget is kept on the split. Each card caches the experts of its own layers, and the budget holds the hottest of
+  the rest by the whole expert profile (the experts no card holds), so any RAM works as on one card. Setup asks (one
+  GPU stays the default; `--gpus 0,1`, "2" at setup or "y" when a start offers both cards takes the split), and a
+  start on several GPUs keeps `--resident-budget-gib`. Measured on an RTX 3090 (x16) + RTX 3080 Ti (x4), 91 GB of RAM,
+  budget 64 GiB, engine 0.1.41: decode 45 tok/s against 38 on the 3090 alone (the auto split gives the x4 card two
+  layers); 57.6 GiB of experts in RAM, no file reads per request.
+- Several GPUs with an older engine (#498): when the RAM holds the GGUF files and 24 GB more (~135 GB of RAM) and two or more cards can
   share it, setup asks (one GPU stays the default; `--gpus 0,1` takes the split). The split runs **without** the RAM budget: all 77 GB of experts are loaded into RAM from the GGUFs at
   start, the files pass through the OS file cache while they load, and the config gets `"gpu": [0, 1]` and
   `"layer_split": "auto"`. Measured on 2x RTX 3090 with 165 GiB (#498): decode 31 tok/s on one card with the budget,
@@ -39,8 +47,8 @@ What setup does differently for this model:
   checks each one's size and SHA-256 against the table below; the check takes a few minutes once and is remembered
   in the file's finish mark. A file with the wrong hash is deleted, so the next run downloads it again.
 - It packs with `--compat-bf16` and never writes `experts.bin` (`--low-ram` does not apply).
-- The RAM budget is the PC's RAM less 24 GB: `--resident-budget-gib 40` on 64 GB, at most all 71 GiB of experts on
-  96 GB or more. From a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. Setup's
+- The RAM budget (below ~88 GB of RAM) is the PC's RAM less 24 GB: `--resident-budget-gib 40` on 64 GB, at most all 71 GiB of experts on
+  a PC that asks for a budget. From a 64K context up, where the KV cache moves to RAM, its size comes out of the budget. Setup's
   `--resident-budget-gib N` sets another one (a bigger one is kept, with a note on what it risks).
 - It recommends an 8K context on a GPU under 14 GB (every GB of KV cache is a GB less of cached experts).
 
@@ -140,11 +148,17 @@ model's (`data/expert-profile.bin`); it ranks the same 48 x 512 experts and deci
 budget take first.
 
 **Choosing the RAM budget N:** your RAM minus 20-24 GB (the OS, the engine itself, the 126 MB router copy, and room for
-the OS file cache that serves the rest). On 64 GB, 40. The engine clamps a budget larger than the RAM it finds free
-(minus 4 GB and a 256 MiB margin) and says so; before #403's fix such a clamped budget could then fail the start. Everything above N comes from the SSD for every token, so N is the setting that matters
+the OS file cache that serves the rest). On 64 GB, 40. The engine checks available RAM and, on Windows, available
+commit capacity. If N exceeds the smaller value minus 4 GiB headroom, it reduces N to that amount minus a 256 MiB
+margin and reports which limit applies. Before #403's fix a clamped budget could then fail the safety check.
+Everything above N comes from the SSD for every token, so N is the setting that matters
 most; a bigger budget was faster in every measurement (24 / 32 / 40 GiB). When the driver page-locks the whole budget
 (24 GiB did on this PC, 32 and 40 did not), the GPU also computes a share of the misses over PCIe, as in the resident
-low-RAM mode; `STRATA_RESIDENT_PIN=0` keeps the budget locked only (the CPU then computes every miss).
+low-RAM mode; `STRATA_RESIDENT_PIN=0` uses ordinary pageable memory (the CPU then computes every miss).
+
+On Windows, the allocation log reports available physical RAM and commit capacity before allocation and after a
+failure. Free RAM alone does not guarantee that Windows can commit the requested memory. If the pageable fallback
+also fails, the warning preserves both the GPU allocation or mapping error and the `malloc` error.
 
 **Context:** measured at 4K. The KV cache takes VRAM from the expert cache, so a longer context makes decoding slower;
 8K is a reasonable start on 12 GB. `--kv int8` halves the KV cache's VRAM.
@@ -164,11 +178,12 @@ low-RAM mode; `STRATA_RESIDENT_PIN=0` keeps the budget locked only (the CPU then
   flight when the experts are read from the GGUF in place (`STRATA_STAGER_THREADS` / `STRATA_STAGER_RING` override
   it; 4 and 16 before, still the default for every other model). Between the chunks, the 28.8 GB PLE table's rows
   take ~5 s per chunk.
-- An engine compiled with `-DSTRATA_MMQ_KQUANTS=ON` multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with
-  llama.cpp's MMQ kernels (as the other models' formats always are) instead of dequantizing them to FP16: 4x less GPU
-  time for those products, but on this PC the prompt waits for the SSD either way (29 s per 4K chunk with or
-  without). Off in the released engine: it loads every kernel at start, and these took 1-3 expert slots of VRAM from
-  every model.
+- With `STRATA_MMQ_KQ=1` the engine multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with llama.cpp's MMQ
+  kernels (as the other models' formats always are) instead of dequantizing them to FP16: 4x less GPU time for those
+  products, but on this PC the prompt waits for the SSD either way (29 s per 4K chunk with or without). Opt-in: it
+  rounds differently from the FP16 path. On CUDA these kernels are a library next to the engine (`libstrata_kq.so` /
+  `strata_kq.dll`), opened only then, so they take no VRAM from other models ([QUANTS.md](QUANTS.md)); before, they were
+  the build option `-DSTRATA_MMQ_KQUANTS=ON` and took 1-3 expert slots from every model.
 - The speed varies from run to run (6.7-8.6 tok/s at 40 GiB for the same prompt), with what the OS file cache holds.
 - For comparison, IQ3_S (all its experts in RAM) writes ~53 tok/s on the same PC ([the speed tables](DETAILS.md#speed-measured)).
 - Where the time goes (`--stats` on the command line): at 40 GiB about 550-750 ms of each verify round (3.5 tokens) is
@@ -237,7 +252,7 @@ PLE table, a Q6_K head) is UD-Q4_K_XL's. Three shards, 93.7 GB:
 
 Setup treats it like UD-Q4_K_XL (the list above): the same RAM budget (your RAM less 24 GB; at most all 55 GiB of its
 experts, so a PC with ~80 GB of RAM or more holds all of them), the pack with `--compat-bf16`, no `experts.bin`, one
-GPU by default. It does not ask on AMD: its experts' formats have prompt kernels there too. Images are an option (asked,
+GPU by default (several keep the budget, as above). It does not ask on AMD: its experts' formats have prompt kernels there too. Images are an option (asked,
 off by default; NVIDIA): the image path has no restriction for this pack, which uses the original model's image
 encoder; not yet run with images.
 
@@ -248,13 +263,44 @@ the pack rounds the file's Q8_0 hyper-connection projections to BF16, and on the
 perplexity 6-9% above llama.cpp's on the same file (teacher-forced, short context). Reading the Q8_0 values instead
 closes most of that gap; it is measured on AMD only and not in this release.
 
+## Q4_0 files
+
+A plain `llama-quantize` Q4_0 file of this model runs the same way: pack shard 1 with `--compat-bf16` as above and
+point `--native` at it. Tested:
+[bartowski/Qwen3.8-Flash-Next-GGUF, `Qwen3.8-Flash-Next-Q4_0`, revision `928589f`](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF/tree/928589fdb66c6ff07f22ac561e3fbce76553548f/Qwen3.8-Flash-Next-Q4_0)
+(3 shards, 100.6 GB). Its routed experts are Q4_0 for gate/up and for down, except down in layers 0-5, which is Q4_1;
+the PLE table and the token embedding are Q4_0. The pack serves 302 tensors from the GGUF as stored and converts 362
+(168 exact, 194 rounded to BF16, largest absolute error 0.0156; 1.23 GiB).
+
+The Q4_0 expert kernels centre the codes (q - 8) before the integer dot product, as ggml-cpu's Q4_0 x Q8_0 dot does,
+instead of llama.cpp's CUDA form (uncentred codes, minus 8 x the Q8_1 block sum in float); Q4_1 follows the Q5_1
+kernel without the fifth bit. `native_expert_parity` on this file (layers 0 and 5: Q4_0/Q4_1, layers 20 and 47:
+Q4_0/Q4_0): relative error against the float product 1.1-1.3e-2 on the CPU and the GPU alike, CPU vs GPU 1.1e-7 for
+Q4_0/Q4_0 and 5e-4 to 1.1e-3 with Q4_1 down.
+
+Measured on one RTX 3060 12 GB (PCIe 3.0 x16), Xeon E5-2696 v4, 121 GiB DDR4-2400, Linux, CUDA 12.4; every expert in
+RAM, `--max-context 131072 --kv int8 --kv-resident 20480`, expert cache `auto` (1,960 slots, 5.06 GiB), prompt chunk
+`auto` (6,144 tokens); greedy, `reasoning_effort` medium, one request at a time:
+
+| Prompt | Prompt read | Output |
+| --- | --- | --- |
+| 63 tokens (prose) | - | 25.4 tok/s |
+| 111 tokens (code) | - | 28.0 tok/s |
+| 24,461 tokens | 787 tok/s | 24.0 tok/s |
+| 67,934 tokens (a fact hidden in the middle: found) | 737 tok/s | 26.4 tok/s |
+
+A coding prompt was answered correctly. Not measured: agreement with llama.cpp on this file (as
+[above](#quality-against-llamacpp-on-the-same-file) for UD-Q4_K_XL), AMD, Windows, and bartowski's Swift-1.5 Q4_0,
+whose header shows the same formats.
+
 ## Scope and validation
 
-- UD-Q4_K_XL and UD-IQ4_XS at revision `38bb39e` are targeted. Other Unsloth quantizations use formats this engine may
-  not have kernels for; the engine checks every layer's formats at start and refuses an unsupported one by name.
+- UD-Q4_K_XL and UD-IQ4_XS at revision `38bb39e` are targeted, and plain Q4_0 files ([above](#q4_0-files)). Other
+  quantizations use formats this engine may not have kernels for; the engine checks every layer's formats at start
+  and refuses an unsupported one by name.
 - Tests: the packer's synthetic 4-shard and conversion tests (`.venv/bin/python -m unittest discover -s tools -p
   test_iq_pack.py`); CTests `gguf_split_test`, `expert_layout_test`, `native_expert_parity_*` (the three real expert
-  format pairs against ggml-cpu, the Q5_1 min term, Q8_0 rows), `prefill_mmq_kquant_test` (with `-DSTRATA_MMQ_KQUANTS=ON`: the
+  format pairs against ggml-cpu, the Q5_1 min term, Q8_0 rows, Q4_0/Q4_0 and Q4_0/Q4_1), `prefill_mmq_kquant_test` (with `-DSTRATA_MMQ_KQUANTS=ON`: the
   prompt path's MMQ products for Q4_K / Q5_K / Q5_1 / Q8_0 against ggml's dequantized weights); the in-place mode against `experts.bin` on the Coder
   (identical tokens and logits).
 - Real runs: greedy answers to a coding prompt (correct) at every budget and setting above, identical across them;

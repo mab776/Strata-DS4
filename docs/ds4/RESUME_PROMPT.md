@@ -1,3 +1,38 @@
+> **This is the OLD DeepSeek-V4-Flash (0731) handoff. For the current V4.1 work read [V41_START_HERE.md](V41_START_HERE.md) only.**
+
+## RESUME HERE (2026-10-09 ~18:40) - the active work is DeepSeek-V4.1: read docs/ds4/V41_RESUME_PROMPT.md
+(handoff + paste-able prompt).  DS4 V4 open items are listed at its end.
+
+## RESUME HERE (2026-10-09 ~17:15) - box shut down 06:09, NONE of the s37 plan ran yet
+Read `docs/ds4/RESEARCH_2026-10-09.md` (Infernix + Strata 0.1.41 ideas ranked for DS4).  Top picks before the GPU
+probes: rank-gated `--arena-adapt` admission (fixes topic-switch thrash), saving the adapted expert set as a warm-start
+profile, upstream-style elastic K/V / 32K VRAM KV window for 512K, adaptive MTP draft length.  Upstream v0.1.41 sync:
+worktree `~/AI/Strata-DS4-0141` (branch `ds4-on-0141`), 8 files / 14 conflict hunks, recipe in the research doc -
+Mal undecided between full merge and cherry-picking (q8_1 clamp fixes #606/#1448 are the must-haves).
+
+## RESUME HERE (2026-10-09 ~06:10, after s36-s37) - read FINDINGS **s37** then s36, s35
+**Adaptive expert pruning works (s37).**  REAP saliency (ported from strata-glm) + **soft** pruning: 25% of experts
+(en+zh+code calibration) are kept out of VRAM and the RAM arena, stay routable with `--prune-penalty 0.5`, are read
+from NVMe when the router wants one, and `--arena-adapt` promotes a read expert into the RAM arena (LRU) so a text's
+needed experts migrate in.  Held-out 9.6K eval: **ppl +0.3% overall, every language within 4%** (hard prune: German
++72%, Japanese +115%), **decode +10%** (15.71 -> 17.25 tok/s at ~9.6K context), prefill +4%, NVMe 6.6 ms/token.
+Random 25% control: +17-29% on code/English - REAP's choice is what makes it lossless.  Penalty 0.05/0.2 barely
+deters (router scores differ by more); 1.5 is near-hard (languages +5-23%).  Recipe:
+`--prune bench/ds4-2026-10-09/reap/prune-enzh25.txt --prune-penalty 0.5 --arena-adapt` (calibrate:
+`--prefill-chunk 4096 --chunk-mmq --saliency F` on `make_reap_prompts.py` output, then `reap_prune.py`).
+Also s36: dense-half op cuts (CSA layer 121 -> 107 kernels/token, attention+router 15.51 -> 14.74 ms) and the nsys
+answer (the dense half is ~14 ms of kernel time: ~7 ms matvec floor + ~5.5 ms of ~4,300 tiny kernels; gaps 2-3 ms).
+Pushed to ds4/main through 924516a; s37 commits (5cc3192..caf6f23+) are local.
+**Mal's goal now: > 20 tok/s decode, or hold good decode at 250K-500K context, with the adaptive prune.**  Plan:
+(1) `--pos-offset` probes at 256K / 512K: unpruned vs soft-pruned (fast, attention real, hit rate optimistic);
+(2) give the pruned arena back: the 25% prune frees ~15 GiB of arena -> lower `--arena-gib` and/or more VRAM slots
+via `--vram-margin`, and long-context KV (`--comp-type iq4_nl --icomp-q8`) gets the VRAM; (3) one real long document
+(64K-256K) end to end with the prune, when GLM agrees to a longer block; (4) penalty sweep 0.3/0.7/1.0; (5) en -> de
+-> en conversation-switch test (adaptation time); (6) audit the shared decode gallocr (923a293) for GLM's bug: a
+gallocr reused across graphs treats tensors with ->data set as external, so after its buffer grows earlier graphs
+keep stale pointers (fix: null data/buffer of COMPUTE-usage tensors before re-planning).
+GPU is shared with strata-glm over relay (this session = `strata-ds4-gpu`): <=10-12 min blocks, alternate, announce.
+
 ## RESUME HERE (2026-10-08 ~22:00, after s35) - read FINDINGS **s35** first, then s23-s34
 **Long-context decode is fixed on the attention side**: the fused lightning indexer (`DS4_FUSED_IDX`, default
 off-CPU) + O(ntk) sparse select took attention+router at 128K from 38.2 to 18.7 ms (`--pos-offset` probe: 13.7 ->

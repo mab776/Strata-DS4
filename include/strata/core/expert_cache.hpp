@@ -24,8 +24,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+#include "strata/core/vmm.hpp"
 
 namespace strata::core {
 
@@ -68,6 +71,12 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 /// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+
+/// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
+/// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those
+/// files' clean pages and gives way to a device allocation.  There the figure is MemAvailable less 6 GiB for the OS
+/// and the engine's host side (STRATA_UMA_HEADROOM_GIB).  Elsewhere it is cudaMemGetInfo's.
+size_t device_free_bytes();
 
 class ExpertCache {
 public:
@@ -122,6 +131,10 @@ public:
     /// segment only when `want_bytes` covers the arena).  Stops at the first segment the driver cannot back (false,
     /// `err`: what was mapped by then stays).  The new slots are empty until the caller fills them.
     bool grow(int64_t want_bytes, std::string& err);
+    /// Forgets every expert whose slot is >= `first_slot` (they become misses) and rewinds the sequential admission
+    /// to it - what a caller does before `shrink`ing to `first_slot` slots (the per-request elastic cache: the
+    /// prompt borrows the tail's VRAM, `grow` + re-admission give it back for decode).  Returns how many it forgot.
+    int64_t evict_from(int64_t first_slot);
     /// The number of leading slots that fit wholly inside the first `bytes` bytes.
     int64_t slots_within(int64_t bytes) const;
     /// mab776 (DS4 M6): forgets every expert held in a slot >= `first` and hands those slots out again from `first`
@@ -139,6 +152,11 @@ public:
     /// full - **it never evicts**, because eviction policy is a measured question (`R4.1`'s LFU-decay vs LRU
     /// sweep) and a placeholder policy would set the hit rate that everything downstream is then sized against.
     int32_t admit(int64_t layer, int64_t expert);
+    /// Xolotl s6: put `expert` into a SPECIFIC free slot (one `evict_from` emptied) - how a shrunk cache gets the
+    /// experts it evicted back into exactly the slots they had (a sized cache's slot fits only its own blob class).
+    /// Not on the per-layer path.  Returns the slot, or kNotResident when the slot is out of range / taken / the
+    /// expert is already resident elsewhere.
+    int32_t admit_at(int64_t layer, int64_t expert, int32_t slot);
 
     /// Publish a same-layer replacement after its slot copy has completed.
     void replace(int64_t layer, int32_t old_expert, int32_t new_expert) {
@@ -197,6 +215,14 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// The elastic K/V (--kv-grow): the arena in a VMM range (vmm.hpp) instead of one cudaMalloc, so the K/V can take
+    /// single chunks of it and give them back. Applies to the next `open`; ignored where VMM is not available.
+    static void set_vmm(bool enabled);
+    /// The arena's range (null: one cudaMalloc).
+    VmmRange* vmm_range() { return vmm_.get(); }
+    /// Byte offset of slot `s` in the arena (s == slots(): the end).
+    uint64_t slot_offset(int64_t s) const { return off_.empty() ? (uint64_t) s * (uint64_t) blob_ : off_[(size_t) s]; }
+
 private:
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
@@ -214,6 +240,7 @@ private:
     std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
     std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
     int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
+    std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
     int64_t n_layers_ = 0;

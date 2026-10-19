@@ -25,6 +25,8 @@
 // per weight block is the natural-looking mistake.
 #pragma once
 
+#include "strata/core/geometry.hpp"
+
 #include <cstdint>
 #include <cstddef>
 
@@ -34,10 +36,15 @@ namespace strata::kernels::cpu {
 inline constexpr int H = 2560;      // n_embd
 inline constexpr int FF = 640;      // expert intermediate width
 inline constexpr int NE = 512;      // routed experts per layer
+static_assert(H == strata::core::kCompiledGeometry.n_embd && FF == strata::core::kCompiledGeometry.n_ff,
+              "the CPU expert path is compiled for core/geometry.hpp");
 inline constexpr int QK = 64;       // QK2_0: weights per fp16 scale
 inline constexpr int QKA = 32;      // QK8_1/QK8_0: ACTIVATION elements per scale
 inline constexpr int BB = 18;       // bytes per 64-weight Q2_0 block: 2 fp16-scale + 16 codes
-inline constexpr int MAXC = H / QKA;             // 80 activation chunks across the widest reduction
+// Strata-DS4 fork: the widest activation an ActQ holds - DeepSeek-V4.1's n_embd 5120 through the native Q2_0
+// kernels (q2_rows_any); H stays Qwen's 2560 for the pack layouts below
+inline constexpr int kActMax = 5120;
+inline constexpr int MAXC = kActMax / QKA;       // activation chunks across the widest reduction
 inline constexpr int ROW_GU = H * 2 / 8;         // 640 B of codes per gate/up row
 inline constexpr int ROW_D = FF * 2 / 8;         // 160 B of codes per down row
 inline constexpr int SC_GU = H / QK;             // 40 weight blocks per gate/up row
@@ -62,11 +69,19 @@ inline constexpr size_t O_D_SCALES = O_GU_SCALES + 2ull * FF * SC_GU * 2;
 /// (`sum (c-1) d_w xhat d_x = d_w (d_x*sum(c*xhat) - d_x*sum(xhat))`), precomputed once per layer rather than
 /// once per row: 640 rows would otherwise recompute it 640 times.
 struct ActQ {
-    alignas(64) int8_t q[H];
+    alignas(64) int8_t q[kActMax];
     float scale[MAXC];
     int32_t sum[MAXC];
     float hx[MAXC];
     int nchunks;
+    /// The AVX-2 "bit-plane" image of `q` (src/kernels/cpu/q2_avx2.cpp explains it), filled only by
+    /// `act_quant_q8_1_avx2` with STRATA_Q2_BITPLANE=1 and read only by `q2_0_gguf_rows_multi_avx2`.  Per pair p of 64-value blocks:
+    /// `qp[128p + 32k + 16h + i] = q[128p + 64h + 4i + k]`, `psum[8p + 4h + m]` = the sum of q[128p + 64h + 16m ..
+    /// + 16), `pscale[8p + 2c + e] = scale[4p + c]`.  `bp_pairs` is 0 when the image is absent (n % 128 != 0).
+    alignas(32) int8_t qp[kActMax];
+    alignas(32) int32_t psum[kActMax / 16];
+    alignas(32) float pscale[kActMax / 16];
+    int bp_pairs = 0;
 };
 
 /// Per-worker scratch.  Owned by the caller and passed in, so the token path performs NO allocations
@@ -172,7 +187,23 @@ void q2_0_gguf_rows_multi(const uint8_t* w, size_t row_bytes, int nblocks, const
 /// The same two for CPUs without AVX-512 (src/kernels/cpu/q2_avx2.cpp, compiled for AVX2 only).
 void q2_0_gguf_rows_multi_avx2(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
                                float* const* out, int r0, int r1);
+/// STRATA_Q2_BITPLANE=1 (read once): the AVX-2 Q2_0 kernel reads the bit-plane image instead of the legacy one.
+bool q2_bitplane_enabled();
+/// The pre-bit-plane AVX-2 kernel (the default), kept for A/B and parity.
+void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                      float* const* out, int r0, int r1);
+/// The same rows with AVX-VNNI on or off, not as cpu_avxvnni_ok() says (tests and benches; on only where it holds).
+void q2_0_gguf_rows_multi_avx2_v(bool vnni, const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
+                                 int nt, float* const* out, int r0, int r1);
 void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
+/// The same for CPUs with AVX but no AVX2 (src/kernels/cpu/q2_avx1.cpp, the third rung of q2_rows_any /
+/// act_quant_any, issue #1699): same arithmetic, 128-bit integer lanes, mul+add instead of FMA (last bits),
+/// software fp16 conversion.  Called only behind cpu_avx1_ok() && !cpu_avx2_ok().
+void q2_0_gguf_rows_multi_avx1(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                               float* const* out, int r0, int r1);
+void q2_0_gguf_rows_multi_avx1_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+                                      float* const* out, int r0, int r1);
+void act_quant_q8_1_avx1(const float* x, int n, ActQ& a);
 
 void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
 

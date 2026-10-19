@@ -1,15 +1,21 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
+#if defined(_MSC_VER)
+#include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
+#endif
 
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -24,12 +30,71 @@
 namespace strata::kernels::cpu {
 
 namespace {
+// STRATA_POOL_UMWAIT=<TSC cycles> (experimental, x86 WAITPKG only): a parked worker waits with UMONITOR/UMWAIT on the
+// epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
+// after the cycles, in the light C0.1 state; on a laptop the CPU then gives back the power the spin took, which the
+// GPU's share of the budget gets.  0 or unset (or no WAITPKG): the spin, unchanged.  STRATA_POOL_UMWAIT_C02=1: the
+// deeper C0.2 state (slower wake).  MSVC x64 only for now (the intrinsics need no target flag there); other builds spin.
+uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        if (e == nullptr || std::atoll(e) <= 0) return (uint64_t) 0;
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+        int r[4] = {0, 0, 0, 0};
+        __cpuidex(r, 7, 0);
+        if (((r[2] >> 5) & 1) == 0) {
+            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::atoll(e));
+        return (uint64_t) std::atoll(e);
+#else
+        return (uint64_t) 0;
+#endif
+    }();
+    return c;
+}
+unsigned umwait_state() {
+    static const unsigned s = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
+    return s;   // 1 = C0.1 (light), 0 = C0.2
+}
+// STRATA_POOL_UMWAIT_ESC=<TSC cycles> (experimental): an escalating wait - C0.1 for the first cycles of a park, C0.2 after
+// (a wait that has lasted that long is a GPU phase, a draft or a prompt read, where a slower wake costs little).
+uint64_t umwait_escalate() {
+    static const uint64_t c = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC"); return e ? (uint64_t) (std::max)(0LL, std::atoll(e)) : (uint64_t) 0; }();
+    return c;
+}
+
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
 }  // namespace
 
+namespace {
+std::atomic<int> g_host_core{(int) HostCore::First};
+}  // namespace
+
+void set_host_core(HostCore where) { g_host_core.store((int) where); }
+HostCore host_core_setting() { return (HostCore) g_host_core.load(); }
+
+static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity);
+
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
+    CpuTopology topo = detect_cpu_topology_impl(skip_first, affinity);
+    // --host-core last: the host takes the last core, the workers the others (the first included)
+    if (skip_first && host_core_setting() == HostCore::Last && !topo.is_hybrid && topo.host_core >= 0 &&
+        !topo.worker_cores.empty()) {
+        const int last = topo.worker_cores.back();
+        topo.worker_cores.pop_back();
+        topo.worker_cores.insert(topo.worker_cores.begin(), topo.host_core);
+        topo.host_core = last;
+    }
+    return topo;
+}
+
+int planned_host_core(PoolAffinity affinity) { return detect_cpu_topology(true, affinity).host_core; }
+
+static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
 #if defined(_WIN32)
     // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on
@@ -177,6 +242,30 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         return v;
     };
 
+    // #798: a cpulist ("0-7,16") of one of the hybrid PMU's CPU sets: /sys/devices/cpu_core/cpus and cpu_atom/cpus
+    auto cpulist_read = [](const char* path, std::vector<int>& out) -> bool {
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) return false;
+        char text[1024] = {0};
+        const size_t n = std::fread(text, 1, sizeof text - 1, f);
+        std::fclose(f);
+        text[n] = '\0';
+        for (const char* p = text; *p;) {
+            char* end = nullptr;
+            const long lo = std::strtol(p, &end, 10);
+            if (end == p) break;
+            long hi = lo;
+            if (*end == '-') {
+                p = end + 1;
+                hi = std::strtol(p, &end, 10);
+            }
+            for (long c = lo; c <= hi && c < 4096; ++c) out.push_back((int) c);
+            p = end;
+            while (*p == ',' || *p == ' ' || *p == '\n')  ++p;
+        }
+        return !out.empty();
+    };
+
     std::vector<int> allowed;
     std::vector<unsigned long> allowed_mask;
     if (detail::get_thread_affinity(allowed_mask, &allowed) != 0) {
@@ -215,10 +304,23 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
         all_cpus.push_back(cl);
     }
 
-    topo.is_hybrid = (max_cap > 0 && max_cap > min_cap);
+    // #798: which CPUs are E-cores.  Intel's hybrid PMU lists them (cpu_atom/cpus beside cpu_core/cpus); without it a
+    // CPU is an E-core when its capacity is under 90% of the largest.  Turbo Boost Max 3.0 gives the "favored"
+    // P-cores a slightly higher capacity (1024 against 1012 on a Core Ultra 7 270K Plus): "capacity == the maximum"
+    // counted 2 of its 8 P-cores and started 1 pool worker.
+    std::vector<int> pmu_core, pmu_atom;
+    const bool pmu = cpulist_read("/sys/devices/cpu_core/cpus", pmu_core) &&
+                     cpulist_read("/sys/devices/cpu_atom/cpus", pmu_atom);
+    auto is_e = [&](const CoreLinux& cl) {
+        if (pmu) return std::find(pmu_atom.begin(), pmu_atom.end(), cl.cpu) != pmu_atom.end();
+        return max_cap > 0 && cl.cap > 0 && cl.cap * 10 < max_cap * 9;
+    };
+    bool any_e = false, any_p = false;
+    for (const auto& cl : all_cpus) (is_e(cl) ? any_e : any_p) = true;
+    topo.is_hybrid = any_e && any_p;
     if (topo.is_hybrid) {
         for (const auto& cl : all_cpus) {
-            if (cl.cap == max_cap) {
+            if (!is_e(cl)) {
                 if (!cl.is_sibling) topo.p_cores++;
                 topo.p_threads++;
             } else {
@@ -233,7 +335,9 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     if (affinity == PoolAffinity::All || !topo.is_hybrid) {
         if (topo.is_hybrid)   // #642: the P-cores first (see the Windows branch)
             std::stable_sort(all_cpus.begin(), all_cpus.end(),
-                             [](const CoreLinux& x, const CoreLinux& y) { return x.cap > y.cap; });
+                             [&](const CoreLinux& x, const CoreLinux& y) {
+                                 return is_e(x) != is_e(y) ? !is_e(x) : x.cap > y.cap;
+                             });
         for (const auto& cl : all_cpus) {
             if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
         }
@@ -250,7 +354,7 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
     std::vector<int> e_cores;
 
     for (const auto& cl : all_cpus) {
-        if (cl.cap == max_cap) {
+        if (!is_e(cl)) {
             if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
             else p_siblings.push_back(cl.cpu);
         } else {
@@ -368,8 +472,9 @@ void ExpertPool::diag(std::FILE* f) const {
     std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity)
-    : host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
+    : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
+    if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     if (n_workers > 0) {
@@ -392,6 +497,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
+            strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             pin_this_thread(core, i);
             worker(i);
         });
@@ -441,10 +547,27 @@ void ExpertPool::worker(int id) {
         // every 1024 pauses, so the spin itself is unchanged.
         const auto parked_at = std::chrono::steady_clock::now();
         uint32_t spins = 0;
+        const uint64_t um = umwait_cycles();
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+        const uint64_t um_esc = umwait_escalate();
+        const uint64_t um_t0 = um != 0 && um_esc != 0 ? __rdtsc() : 0;
+#endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
+#if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
+            if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
+                _umonitor((void*) &epoch_);
+                if (epoch_.load(std::memory_order_acquire) != seen) break;
+                const uint64_t now = __rdtsc();
+                const unsigned st = um_esc != 0 ? (now - um_t0 < um_esc ? 1u : 0u) : umwait_state();
+                _umwait(st, now + um);
+                if ((++spins & 15u) != 0) continue;   // each wait is ~um cycles: look at the clock more often
+            } else
+#endif
+            {
+                _mm_pause();
+                if ((++spins & 1023u) != 0) continue;
+            }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
@@ -559,39 +682,43 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
         } else if (mode_ >= 5) {
-            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
+            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows.
+            // Fork (DS4.1 mixed tiers): the job's own `fmt`, when set, selects its kernels and activation layout -
+            // per expert, so one batch covers every format class.  The row partition stays the batch's (uniform
+            // n_embd/n_ff across a model's classes); only the format the rows are computed with changes per expert.
             const int per = (int) mper_;
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
+                const NativeFmt& nf = mjobs_[e].fmt ? *mjobs_[e].fmt : *nfmt_;
+                if (mode_ == 5 && q2_native_kernels(nf.gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][kNativeFFMax], ubuf[MAXT][kNativeFFMax];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+                    const int nbk = (int) (nf.n_embd / 64);
+                    q2_rows_any(mjobs_[e].blob, nf.gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+                    q2_rows_any(mjobs_[e].blob + nf.up_off, nf.gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt_->d_type)) {
+                    native_gu_rows(nf, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                } else if (q2_native_kernels(nf.d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    q2_rows_any(mjobs_[e].blob + nf.down_off, nf.d_row, (int) (nf.n_ff / 64), a2,
                                 mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    native_down_rows(nf, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -647,6 +774,10 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+int ExpertPool::phase_tasks(int64_t rows) const {
+    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
+}
+
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
     if (n > kMaxSplitMulti || expert_oracle_q8_0_enabled()) {
@@ -666,10 +797,9 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
-    mtasks_ = 3 * threads;
     mper_ = FF;
     mrows_ = (int64_t) n * FF;
+    mtasks_ = phase_tasks(mrows_);
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
@@ -678,6 +808,7 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     const auto t2 = std::chrono::steady_clock::now();
     mper_ = H;
     mrows_ = (int64_t) n * H;
+    mtasks_ = phase_tasks(mrows_);
     run_phase(4, mtasks_);
     const auto t3 = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -690,27 +821,56 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    // Fork (DS4.1 mixed tiers): one batch may carry several format classes as long as they share the model's
+    // geometry (n_embd/n_ff) - the row partition below is per batch, the kernels are per job.  A batch that does
+    // not share it is run one expert at a time, so the partition never spans two widths.
+    for (int e = 1; e < n; ++e)
+        if (jobs[e].fmt && (jobs[e].fmt->n_embd != f.n_embd || jobs[e].fmt->n_ff != f.n_ff)) {
+            for (int j = 0; j < n; ++j) run_split_multi_native(jobs[j].fmt ? *jobs[j].fmt : f, jobs + j, 1);
+            mode_ = 0;
+            return;
+        }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
-        const int threads = n_ + (host_works_ ? 1 : 0);
-        mtasks_ = 3 * threads;
         mper_ = f.n_ff;
         mrows_ = (int64_t) nb * f.n_ff;
+        mtasks_ = phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) f.n_ff, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        // UNION (xolotl): the fork's per-expert `fmt` (DS4.1 mixed tiers) AND GLM's LoRA a.h accumulation, which
+        // must run on the float SwiGLU row BEFORE it is quantized.  fd is the per-expert format when set, else the batch's.
+        for (int e = 0; e < nb; ++e) {
+            const NativeFmt& fd = mjobs_[e].fmt ? *mjobs_[e].fmt : f;
+            for (int t = 0; t < mjobs_[e].nt; ++t) {
+                if (mjobs_[e].lora_a) {   // the LoRA's a . h on the float SwiGLU row, before it is quantized
+                    const float* hh = split_multi_[(size_t) e].ff[t];
+                    const float* la = mjobs_[e].lora_a;
+                    float s = 0.f;
+                    for (int64_t i = 0; i < fd.n_ff; ++i) s += la[i] * hh[i];
+                    mjobs_[e].lora_s[t] = s;
+                }
+                if (q2_native_kernels(fd.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], (int) fd.n_ff, split_multi_[(size_t) e].a2[t]);
+                else native_quant_h(fd, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+            }
+        }
         const auto c = std::chrono::steady_clock::now();
         mper_ = f.n_embd;
         mrows_ = (int64_t) nb * f.n_embd;
+        mtasks_ = phase_tasks(mrows_);
         run_phase(6, mtasks_);
+        for (int e = 0; e < nb; ++e)   // the LoRA's down delta, after the down product wrote `out`
+            if (mjobs_[e].lora_a && mjobs_[e].lora_b)
+                for (int t = 0; t < mjobs_[e].nt; ++t) {
+                    float* o = mjobs_[e].out[t];
+                    const float s = mjobs_[e].lora_s[t];
+                    const float* lb = mjobs_[e].lora_b;
+                    if (o) for (int64_t j = 0; j < f.n_embd; ++j) o[j] += s * lb[j];
+                }
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
         ms_multi_q += std::chrono::duration<double, std::milli>(c - b).count();

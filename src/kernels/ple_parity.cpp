@@ -113,13 +113,6 @@ std::vector<uint8_t> read_at(const char* path, long long off, size_t n) {
     return v;
 }
 
-/// Only used for the pack, which is 5.4 GB rather than 28.8 GB - and even then the caller says which region.
-std::vector<uint8_t> read_path(const char* path) {
-    const long long n = file_size(path);
-    if (n <= 0) return {};
-    return read_at(path, 0, (size_t) n);
-}
-
 /// Dequantize one IQ4_NL row with an INTERLEAVED nibble order, to show the correct split-half order is
 /// observable.  Deliberately shares nothing with the kernel's decoder.
 void deq_interleaved(const uint8_t* row, float* out160) {
@@ -199,6 +192,8 @@ int history_advance_regression() {
     float* history = history_storage + guard;
     float* norm = norm_storage + guard;
     ck(cudaMemcpy(history, expected.data(), count * sizeof(float), cudaMemcpyHostToDevice), "history initial values");
+    // the guard memsets and this upload run on the legacy stream, which the non-blocking `stream` does not wait for
+    ck(cudaDeviceSynchronize(), "history setup");
     cudaStream_t stream;
     cudaGraph_t graph;
     cudaGraphExec_t executable;
@@ -880,6 +875,9 @@ int main(int argc, char** argv) {
             ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "native PLE key stream");
             const size_t workspace_bytes = (size_t) k::ple_block_scratch_bytes();
             ck(cudaMemset(ple_ws, 0xa5, workspace_bytes), "native PLE no-launch sentinel");
+            // the guards, the weight upload and the sentinel run on the legacy stream, which the non-blocking
+            // `stream` does not wait for
+            ck(cudaDeviceSynchronize(), "native PLE key setup");
             int refused = 0;
             for (int c = 0; c < 9; ++c) {
                 auto invalid = nw;
@@ -905,6 +903,7 @@ int main(int argc, char** argv) {
             std::vector<float> projected(hcd), normalized(hcd), actual_key(hcd), actual_result(hcd), replay(hcd);
             for (int p = 0; p < std::min(cap.nt, 2); ++p) {
                 ck(cudaMemcpy(d_emb, cap.emb.data() + (size_t) p * nd, nd * 4, cudaMemcpyHostToDevice), "native PLE key input");
+                ck(cudaDeviceSynchronize(), "native PLE key input sync");
                 k::native_q2_0_f32(native_data, d_emb, native_q, raw_projection, k::NG_N_EMBD, k::NG_HC_DIM, 1, stream);
                 ck(cudaStreamSynchronize(stream), "native PLE raw key sync");
                 ck(cudaMemcpy(projected.data(), raw_projection, hcd * 4, cudaMemcpyDeviceToHost), "native PLE raw key read");

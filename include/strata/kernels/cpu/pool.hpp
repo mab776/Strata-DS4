@@ -61,6 +61,17 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    /// Fork (DS4.1 mixed tiers): this expert's own format on the MULTI-FORMAT native path, so one
+    /// `run_split_multi_native` batch can cover every format class present in a layer.  `nullptr` (every other
+    /// caller) means "the batch's `fmt` argument", i.e. exactly the pre-fork behaviour.
+    const NativeFmt* fmt = nullptr;
+    /// GLM routed-expert LoRA (optional, run_split_multi_native): this expert's down factors, a [n_ff] and b
+    /// [n_embd].  The pool adds (a . h) * b to each token's `out` after the down product - the same correction the
+    /// GPU's lora_down_kernel makes, so a CPU-computed expert is ablated like a GPU one.  null = off.
+    /// UNION (xolotl): the fork's `fmt` and GLM's LoRA factors are independent fields on the same struct - both kept.
+    const float* lora_a = nullptr;
+    const float* lora_b = nullptr;
+    float lora_s[MAXT] = {};
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
@@ -80,7 +91,20 @@ struct CpuTopology {
     int host_core = -1;             ///< Logical core reserved for host thread
 };
 
+/// Which core the host thread - the layer loop that spins on the GPU's flags - takes when `skip_first` reserves one
+/// (--host-core first|last, STRATA_HOST_CORE).  `First` is the layout the pool has always used.  `Last` (eddoursul's
+/// fork, F12) puts the host on the last physical core and lets the workers have the first: Windows sends a GPU's
+/// interrupts to one logical processor, usually the first, and every copy that lands raises one (~13 us in the ISR
+/// and a DPC), which delays a spinning host there.  The placement changes no result, only where threads run.  A hybrid
+/// CPU keeps `First` (its first core is the best P-core).
+enum class HostCore { First, Last };
+void set_host_core(HostCore where);
+HostCore host_core_setting();
+
 CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity = PoolAffinity::All);
+
+/// The logical processor the host thread is pinned to under the current setting (-1: no topology).
+int planned_host_core(PoolAffinity affinity = PoolAffinity::All);
 
 /// One logical processor per PHYSICAL core, so a worker is never scheduled onto an SMT sibling of another
 /// worker.  On the 6-core/12-thread machine this project measures on, `hardware_concurrency()/2` workers on
@@ -135,7 +159,9 @@ public:
     /// threads on six cores. `false` is the A/B arm and exists so the change is measurable rather than
     /// asserted - the counter it moves is `pool phases ... drain`, which is host-side and needs no profiler.
     explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true,
-                        PoolAffinity affinity = PoolAffinity::All);
+                        PoolAffinity affinity = PoolAffinity::All, int tasks = 0);
+    /// Batched row phases: 0 keeps three tasks per participating thread; explicit counts are capped by rows.
+    static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
     ~ExpertPool();
@@ -167,6 +193,12 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    ///
+    /// Fork (DS4.1 mixed tiers): a job whose `ExpertJobMulti::fmt` is set uses THAT format for its own gate/up
+    /// and down kernels (and for the intermediate activation's quantization), so one batch covers several format
+    /// classes at once - the whole point of the one-dispatch-per-layer path.  Jobs with `fmt == nullptr` all use
+    /// `f`, byte-identically to the pre-fork code.  Every job in `f`'s batch must share `n_embd`/`n_ff` (a model's
+    /// geometry is uniform across its format classes; a mixed-geometry batch falls back to one call per job).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
@@ -204,6 +236,8 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    int phase_tasks(int64_t rows) const;
+    int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);

@@ -187,6 +187,20 @@ private:
 /// pcie 0.25 dithered, pf-b 1.43 experts/layer, and a host arena budgeted for every expert of the real model
 /// (72.6 GiB).  `arena_gib` is a budget, not a promise: the arena fills in profile order up to it and everything
 /// past it is read from the blob source on demand (the file tier).
+/// Per-layer routed-expert rank-1 deltas (the GLM abliteration adapter): each host array is [n_experts][k] float,
+/// k = n_embd for a_g / a_u / b_d and n_ff for b_g / b_u / a_d.  All null = the layer carries no expert deltas.
+/// The tier uploads them once and the grouped CUDA path applies them (strata::kernels::NativeExpertLora); nothing is
+/// merged into the quantized blobs.  DS4 and MiMo pass nothing.
+struct Ds4MoeLoraHost {
+    const float* a_g = nullptr;   ///< [n_experts][n_embd]
+    const float* b_g = nullptr;   ///< [n_experts][n_ff]
+    const float* a_u = nullptr;
+    const float* b_u = nullptr;
+    const float* a_d = nullptr;   ///< [n_experts][n_ff]
+    const float* b_d = nullptr;   ///< [n_experts][n_embd]
+    int64_t n_experts = 0;
+};
+
 struct Ds4MoeConfig {
     int64_t slots = 2150;         ///< VRAM expert slots (6.75 MiB each); 0 or `no_cache` = none
     double pcie_frac = 0.25;      ///< share of the (non-prefetched) misses computed on the GPU
@@ -206,6 +220,10 @@ struct Ds4MoeConfig {
     /// takes the ranked profile's head until `slots` experts OR this many bytes, sizing each slot to its expert.
     /// 0 = `slots` x the largest blob.  Ignored for uniform geometries (DS4: `slots` alone, as before).
     double slot_gib = 0.0;
+    /// Elastic VRAM cache (per-layer-sized geometries): when > slot_gib, the cache is OPENED this big (CUDA VMM
+    /// segments) in the ranked order, seeded and kept mapped only up to `slot_gib` (the prompt chunks' VRAM stays
+    /// free), and `grow_cache` maps + fills the rest after the prompt.  0 = off.
+    double slot_gib_max = 0.0;
     /// Leave the experts the VRAM seed takes OUT of the host arena: a cache that never evicts never reads their arena
     /// copies again, so the bytes go to the next-ranked experts (fewer file-tier reads); with `vram_lru` an evicted
     /// expert is demoted into the arena slot its replacement vacates.  Off = the arena holds the ranking's head.
@@ -213,17 +231,46 @@ struct Ds4MoeConfig {
     /// Decode: a file-tier expert that `run` had to read replaces the least-recently-used arena expert of its layer
     /// (same blob size), so the experts a conversation uses stay in RAM after their first use.  Off = static arena.
     bool arena_adapt = false;
+    /// arena_adapt admission gate (TinyLFU / Infernix style): every lookup adds 1 to a per-(layer, expert) heat that
+    /// halves every `arena_admit` tokens; a file-tier read is promoted only if its heat is >= 2 (seen twice in the
+    /// window) AND beats the coldest arena expert of its layer, which is then the victim (instead of the LRU one).
+    /// Rejected reads go through the scratch buffer as without arena_adapt.  0 = promote on first read (as before).
+    float arena_admit = 0.0f;
     /// Prompt chunks (`run_chunk`): the streamed experts' products through llama.cpp's MMQ (int8 tensor cores; the
     /// activations rounded to MMQ's q8_1) instead of the grouped MMVQ kernel, on the layers whose gate/up/down types
     /// MMQ covers and that have no SwiGLU clamp.  Needs a build with the prompt MMQ path (`strata_mmq`, with
     /// STRATA_MMQ_KQUANTS for K-quants / MXFP4); otherwise, and for VRAM-resident experts, the MMVQ kernel runs.
     bool chunk_mmq = false;
     /// Prompt chunks: while layer l's experts compute (and the caller runs layer l+1's dense half), DMA layer l+1's
-    /// arena experts into the other device half, which is then sized to a whole layer.  Off with arena_adapt.
+    /// arena experts into the other device half, which is then sized to a whole layer.
     bool chunk_prestage = false;
+    /// REAP saliency (calibration only): every prompt chunk reads its experts' outputs back and accumulates, per
+    /// (layer, expert), sum of routing weight x ||expert output||_2 and the token count (saliency_sum / saliency_count).
+    bool saliency = false;
+    /// REAP pruning: [n_layers * n_experts], nonzero = the expert is never routed (the dense side's selection bias
+    /// masks it), so it takes no VRAM slot and no arena space - every ranking the tier seeds from skips it.  Empty = none.
+    std::vector<char> exclude;
     /// Decode (run): a routed expert that is a VRAM miss and weighs less than `skip_miss` x the token's weight sum is
     /// dropped (not fetched, contributes 0).  Hits are never dropped.  0 = off.  A quality trade: measure ppl.
     float skip_miss = 0.0f;
+    /// Decode (run): like skip_miss, but only for experts the arena does not hold (the NVMe file tier, e.g. soft-pruned
+    /// experts): dropped if they weigh < `skip_file` x the token's weight sum.  The larger of the two applies.  0 = off.
+    float skip_file = 0.0f;
+    /// Prompt chunks (run_chunk): the same rule for prefill - a file-tier entry below `skip_file_chunk` x its token's
+    /// weight sum is computed by the token's heaviest expert with weight 0 instead (never read).  0 = off.
+    float skip_file_chunk = 0.0f;
+    /// Skip renormalization (s21 lead; default off = byte-identical to before).  Dropping a low-weight expert zeros its
+    /// term but the sum is NOT rescaled, so the layer output shrinks by the dropped weight fraction - a systematic
+    /// magnitude error that grows with the drop rate and shadows the ppl curve (and, with a routed-expert LoRA, breaks
+    /// the ablation's all-or-nothing property -> the s20 repetition loop).  When on, the contributing weights are
+    /// scaled by Sum(all w) / Sum(kept w) per token (exactly 1.0 when nothing is dropped, so no-drop runs are
+    /// unchanged).  Decode: a scalar on the host sum; chunks: c_w pre-scaled before weighted_rows_sum.
+    bool renorm_skip = false;
+    /// --arena-lazy (default off): build the arena's slot map and allocate it, but fill it in a BACKGROUND thread,
+    /// publishing each slot only after its bytes land.  The decode path reads a miss (the file tier) until then, so
+    /// the engine answers seconds after start instead of after the whole ~70 GiB fill.  Dev flag: the fill and the
+    /// decode run concurrently, and the hit-rate/seed accounting counts the planned arena from the start.
+    bool arena_lazy = false;
     /// Decode (MiMo and DS4): a PCIe-share miss (and a prefetched expert the routing used) takes
     /// the least-recently-used VRAM slot of its layer instead of a staging buffer, so the cache follows the
     /// conversation (route_probe sim, 1800 slots: static 40.5% held-out hit, LRU 61.6%; FINDINGS s16).  Same math per
@@ -242,6 +289,12 @@ struct Ds4MoeConfig {
     /// order, seeded and mapped only up to `slot_gib` (the prompt chunks' VRAM stays free), and `grow_cache` maps +
     /// fills the rest after the prompt from the arena, which keeps that grow set.  0 = off.  Mixed blob sizes only.
     double slot_gib_max = 0.0;
+    /// vram_lru: the first `vram_pin_frac` of the seeded slots (the ranked order's head - the census-hot core) are
+    /// never LRU victims; the rest of the cache follows the conversation (helios pins the census top 60%).
+    double vram_pin_frac = 0.0;
+    /// GLM abliteration LoRA (routed experts): per-layer rank-1 deltas, an array of `n_layers` entries or null (the
+    /// default: off).  The grouped CUDA path applies them; the CPU pool and the MMQ chunk path do not (yet).
+    const Ds4MoeLoraHost* lora = nullptr;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -266,6 +319,8 @@ struct Ds4MoeStats {
     int64_t skipped = 0;            ///< skip_miss: low-weight misses dropped
     int64_t hits1 = 0;              ///< mab776 M7a: served from GPU 1's tier (counted apart from `hits`)
     double g1_wait_ms = 0;          ///< time the host waited for GPU 1's rows after its own work was done
+    int64_t skipped_file = 0;       ///< ...of which file-tier experts (skip_file or skip_miss)
+    int64_t admit_rejects = 0;      ///< arena_admit: file-tier reads not promoted (too cold)
 
     void add(const Ds4MoeStats& o);
     int64_t lookups() const { return hits + hits1 + cpu + pcie + skipped; }
@@ -336,6 +391,7 @@ public:
     int64_t arena_experts() const;     ///< blobs the host arena holds
     int64_t file_tier() const;         ///< blobs the arena could not take
     double arena_gib() const;
+    int64_t blob_bytes(int64_t layer) const;   ///< one expert's gate+up+down bytes in `layer` (0 if not routed)
     /// Whether `expert` of `layer` is resident in a VRAM slot right now (false in CPU-only mode).
     bool resident(int64_t layer, int64_t expert) const;
     /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
@@ -395,6 +451,11 @@ public:
     int gpu1_device() const;
     bool in_gpu1(int64_t layer, int64_t expert) const;
     double gpu1_seed_s() const;        ///< seconds GPU 1's fill took (file reads; its experts have no arena copy)
+    /// cudaProfilerStart/Stop (nsys --capture-range=cudaProfilerApi): the caller brackets what it wants profiled.
+    static void profiler(bool on);
+    /// REAP accumulators (Ds4MoeConfig::saliency), [layer * n_experts + expert]; empty when off.
+    const std::vector<double>& saliency_sum() const;
+    const std::vector<int64_t>& saliency_count() const;
     cpu::ExpertPool& pool();           ///< the CPU tier's worker pool (the gate's single-expert check uses it)
 
 private:

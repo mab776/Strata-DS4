@@ -1227,3 +1227,48 @@ per decode token (the window holds 2 flash-attn per layer per token - the counts
 
 Reading: the remaining dense-side headroom is ~3-5 ms (small kernels + gaps) on top of a ~7 ms floor; the bigger
 lever is the expert half (20-22 ms: PCIe ~11-12, CPU pool ~10 at an ~82% hit rate).
+
+## 37. REAP expert pruning, and soft pruning with NVMe fetch + arena promotion (2026-10-09)
+
+Ported from strata-glm (saliency accumulator + `reap_prune.py`, 5cc3192): `--saliency F` (chunked-prefill calibration,
+per (layer, expert) sum of routing weight x ||expert output||), `--prune F` (selection bias -1e30, experts kept out of
+the VRAM seed and arena), `--prune-penalty X` (soft: bias -X; 77f6803: soft-pruned experts also stay out of
+VRAM/arena and are read from the file tier on demand).  Hash layers 0-2 are never pruned.  Calibration 8.4K tokens
+(`tools/ds4/make_reap_prompts.py`): all-domain (cpp, py, en prose, json, de, zh, es) or en+zh+code.  Eval: held-out
+9.6K tokens, per-domain ppl from `DS4_PPL_DUMP` (`tools/ds4/reap_eval.py`); fr/ja/pt are in no calibration set.
+All runs chunked prefill 4096 + `--chunk-mmq --chunk-prestage --vram-lru --pf-b 0.7 --f16-q8 --comp-type iq4_nl
+--icomp-q8`, `--slots auto --arena-gib 70`, 64 decode tokens at ~9.6K context (b30-b32, `bench/ds4-2026-10-09/`).
+
+| config | cpp | py | en | zh | de | fr* | ja* | pt* | ALL | decode | prefill |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| unpruned (ppl) | 5.789 | 4.915 | 6.164 | 2.512 | 5.536 | 1.276 | 1.602 | 1.233 | 2.975 | 15.71 | 270 |
+| hard en+zh 15% | -0.2% | +1.1% | +0.6% | +1.0% | +22% | +6.6% | +22% | +1.2% | +6.4% | 19.21 | 297 |
+| hard en+zh 25% | -1.0% | +0.4% | +0.6% | +1.2% | +72% | +55% | +115% | +6.7% | +25.6% | 19.30 | 306 |
+| hard all-domain 25% | -0.7% | +1.2% | +0.8% | 0.0% | -0.3% | +5.4% | +60% | +0.2% | +6.9% | 19.46 | 309 |
+| hard random 25% (control) | +17% | +29% | +26% | +6.6% | +40% | +11% | +35% | +5.9% | +20.7% | 18.87 | 304 |
+| soft 25%, penalty 0.05 | -0.9% | +0.1% | -0.9% | +0.2% | -0.1% | +0.4% | +0.5% | -0.2% | -0.1% | 6.88 | 220 |
+| soft 25%, penalty 0.2 | -0.8% | -0.6% | -0.6% | -0.1% | +1.0% | +0.1% | -0.2% | -0.5% | -0.2% | 10.52 | 241 |
+| soft 40%, penalty 0.2 | -0.3% | -0.4% | +0.8% | -0.7% | 0.0% | -0.4% | -0.1% | -0.7% | -0.2% | 6.85 | 204 |
+| **soft 25%, 0.5 + `--arena-adapt`** | -1.4% | +0.9% | -0.6% | -0.7% | +3.9% | -0.3% | +0.8% | -0.3% | **+0.3%** | **17.25** | 281 |
+| soft 25%, 1.5 + `--arena-adapt` | -0.9% | -0.2% | +0.6% | +1.5% | +23% | +7.2% | +12% | +5.3% | +5.8% | 18.76 | 298 |
+| soft 40%, 1.5 + `--arena-adapt` | -0.9% | +2.7% | +1.6% | +3.6% | +40% | +14% | +23% | +16% | +11.8% | 19.12 | 307 |
+
+Readings:
+- **REAP's choice is what makes pruning lossless**: hard 25% keeps en/code/zh within +-1.2%; the same count at random
+  costs +17-29% on code and English.
+- **Some experts are language experts**: the en+zh list destroys German/Japanese (+72% / +115%); calibrating on
+  German keeps German (-0.3%).  The two 25% lists still overlap 87%: most of what is prunable is low-value everywhere.
+- **The speed of hard pruning is mostly the NVMe tier, not the hit rate**: 72.6 GiB of experts do not fit the
+  70 GiB arena, so the unpruned run read ~256 experts from the file; any prune >= 15% removes that (hit +3 points).
+- **Soft pruning recovers every language** (within +-1% even at 40%), but small penalties barely deter: at 0.05/0.2,
+  8-17% of routes still pick a pruned expert -> 19-40 NVMe reads/token, 48-97 ms/token.  The router's selection
+  scores (sqrt(softplus) + bias) differ by more than 0.2 routinely.
+- **Penalty 0.5 + `--arena-adapt` is the best point**: an NVMe-read expert replaces its layer's LRU arena expert, so
+  the experts a text actually needs migrate into RAM and the file cost falls to 6.6 ms/token (144 arena swaps over
+  the run).  Quality +0.3% overall (German +3.9%, the rest within +-1.4%), decode +10% over unpruned, prefill +4%.
+- Penalty 1.5 is close to a hard prune again (languages +5-23%): the useful range is ~0.3-1.0.
+
+Next: penalty sweep 0.3/0.7/1.0 with adapt; the arena freed by pruning (55 vs 70 GiB) is unused here - give it back
+as VRAM slots / KV at long context; long-context (64K+) decode with soft prune, where the hit rate is 53-63%; a
+conversation-switch test (en -> de -> en) to time the adaptation; GLM gets the same recipe.  Note: b32 ran while
+strata-glm compiled (CPU load), so its decode numbers may read slightly low.
