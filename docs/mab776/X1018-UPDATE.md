@@ -1,3 +1,36 @@
+# Dedup 10-19 (Marc's rule: our diff vs upstream only shrinks) - PAUSED 2026-10-19 ~18:00, resume tonight
+**State**: WIP branch `dedup-1019` (local, also pushed as `wip/dedup-1019` on mab776/Strata-DS4; NOT in mab776-main,
+nothing deployed - stacks 74/78 untouched, mode page OFF, GPUs empty). Code diff vs xolotl/main (without bench/docs):
+mab776-main 133 files +19,107 / -901 -> dedup-1019 128 files +18,132 / -827 so far.
+
+**Done (A/B on the throwaway kit `ds41-pf`, served config at arena 80, two baseline runs = the noise band):**
+| pair | verdict | evidence |
+|---|---|---|
+| lookup: our STRATA_LOOKUP vs upstream STRATA_SERVE_LOOKUP | **adopted upstream** (commit 3eba3514; + one knob STRATA_SERVE_LOOKUP_GREEDY so greedy keeps it off) | same design (n-gram 3, agree, back-off, cap 14); serve A/B of the build was interrupted (see below) |
+| D3 PCIe-site copies: our STRATA_D3_OVERLAP vs upstream STRATA_D3_DMA_STREAM (+ STRATA_DMA_OVERLAP) | **adopted upstream** (eade8212) | turns +300 4.02 / 4.08 s vs ours 3.94-4.18, +1,500 6.40 / 6.44 vs 6.35-6.55; bench + edits within the band. One-shot md5: upstream's stream gives another text (deb5da21073c, deterministic, the same at DSpark depth 1 and 5 = still draft-independent; it shifts residency like an arena change); our overlap and no stream both = 4bcc9c9e77b1 |
+| parking: our STRATA_PARK vs upstream STRATA_SERVE_PARK | **kept ours** (why: upstream keeps ONE parked conversation in RAM; 3 conversations A/B/C: B2 + C2 re-read 20k tokens = 14.0 / 14.6 s vs ours 4.4 / 4.0 s; ours also persists to disk across restarts) | A2 3.76 vs 3.66 s (one park: equal) |
+| keep-cache: our STRATA_KEEP_CACHE vs upstream STRATA_SERVE_KEEP_CACHE | **kept ours** (why: upstream's refuses with the VRAM LRU on - needs --no-vram-lru, and then the copy edit f3 decoded 61 vs 120 tok/s, 8.7k prefill -5 %; turns equal) | |
+| unused experiments | **removed**: STRATA_PASS_MULTI, STRATA_CHUNK_PRED (93dec2fe); STRATA_GPU1_DYN + the unapplied rows16 patch (d07fbe45, **WIP: not built yet**) | the one-shot md5 of the build with 3eba3514..eade8212 = 4bcc9c9e77b1 without the stream |
+| V4 ggml patches | **4 duplicate files removed** (d600efde): V4's tree now applies rank-argsort / upstream-fixes (byte copies of upstream's) and top-k / mmvf (copies of ours) from tools/v41/ggml; a fresh tree = the old one but a comment + the top-k default -> `GGML_TOPK_RADIX=1` added to deepseek-strata/ds4-server.json (backup .bak-20261019-dedup) | V4 not rebuilt / probed yet |
+
+**Interrupted**: the serve A/B of the dedup build (arms `dd-dedup`, `dd-dedup2`: upstream lookup + DMA stream) - killed
+during dd-dedup's 8.7k bench; results so far in the scratch kit only (base / base2 / park / keep / d3).
+
+**Left**: (1) finish GPU1_DYN: drop the `g1_fills` stat (moe.hpp, its sum in moe.cpp, the print in ds41_generate), build,
+one-shot md5 (expect 4bcc9c9e77b1 without the stream); (2) the dedup build's serve A/B (edits for lookup!) vs the base
+band; (3) V4: rebuild the V4 ggml tree fresh from the new patch list + ds4_serve, probe (speed) + tools; (4) the rest of
+the list - DSPARK_SNAP vs upstream's DSpark carry-over, SERVE_ROLLBACK1, prompt cache, PB_CAP (keep: tiny knob), any of
+our patches upstream fixes its own way; (5) the diff-size report (before -> after, per feature) and the usual gates
+before any deploy. **Parked by Marc: option A (bf16 encoder fix) - don't start.**
+
+**Next command** (rebuild the WIP, then the md5 gate):
+```
+cd ~/Documents/portainer/strata-ds4 && git checkout dedup-1019 && ENGINE=ds41 BUILD_DIR=build-dd BUILD_TARGETS=ds41_generate ./mab776-build.sh && \
+mkdir -p ../strata-ds41/build-dd && cp build-dd/ds41_generate ../strata-ds41/build-dd/ && cd ../strata-ds41 && \
+bash mab776/pf/verify_ab.sh build-dd "dd_md5:GGML_BATCH_INVARIANT=4,STRATA_TIER_ROWS=8,STRATA_GPU1_RESERVE_GIB=0.745,STRATA_D3_OVERLAP=0"
+```
+(kit: the throwaway arm runner + configs live in the session scratchpad and models/strata-ds41/test-dd/run/cfg-*.json)
+
 # Sync 10-19: Xolotl 87157b2e -> per-request routing + image input on V4.1 (stack 78)
 Marc's request (relayed, 2026-10-19 morning). Branch layout since this morning: `mab776-main` = upstream + ours (GitHub
 default, the stacks build from it), `main` = an untouched mirror of Xolotl `main`.
