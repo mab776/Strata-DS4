@@ -2272,8 +2272,7 @@ int main(int argc, char ** argv) {
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier,
                          st.gpu1 ? (", " + std::to_string(st.gpu1) + " gpu1 (wait " + std::to_string((int) st.g1_wait_ms) +
-                                    " ms" + (st.g1_fills ? ", " + std::to_string(st.g1_fills) + " fills" : std::string()) +
-                                    ")").c_str() : "");   // mab776 STRATA_GPU1
+                                    " ms)").c_str() : "");   // mab776 STRATA_GPU1
             if (const Ds41Dense::RouteMeter rm = dense.route_meter(false); rm.on && rm.slots > 0)
                 std::fprintf(stderr, "serve: routing vs exact: %.2f%% of expert picks swapped, %.2f%% of router weight kept (%lld slots)\n",
                              100.0 * (double) rm.swaps / (double) rm.slots, 100.0 * rm.weight_kept, rm.slots);

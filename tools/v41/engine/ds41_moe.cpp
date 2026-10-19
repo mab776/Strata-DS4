@@ -6773,7 +6773,6 @@ void Ds41MoeStats::add(const Ds41MoeStats& o) {
     vram_demotes += o.vram_demotes;
     skipped += o.skipped;
     gpu1 += o.gpu1;
-    g1_fills += o.g1_fills;
     g1_wait_ms += o.g1_wait_ms;
     gap_ms += o.gap_ms;
     hit_ms += o.hit_ms;
