@@ -305,7 +305,7 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   sidecars in `models/deepseek-v4-draft/sidecar-0731/`).  Chained acceptance up (d2 57-58 vs 48-55 %, d3 41-45 vs 36 %),
   d1 a bit down (74-76 vs 77-78 %); net decode a wash: 127k K=2 56.1 vs 56.3, K=1 52.1 vs 53.1; 8k K=2 61.2 vs 60.0.
   Kept the original; re-test after the RAM upgrade.
-- **M10 radix-select top-k (70f22b3c)**, tools/ds4/patches/ggml-topk-radix-select.patch: ggml-cuda's TOP_K for rows
+- **M10 radix-select top-k (70f22b3c)**, tools/ds4/patches/ggml-topk-radix-select.patch (since 10-19 the shared tools/v41/ggml/mab776-topk-radix-select.patch, opt-in: V4 sets GGML_TOPK_RADIX=1): ggml-cuda's TOP_K for rows
   >= 2048 columns = one launch, one block per row (12 + 10 + 10-bit histogram passes find the k-th key, early exit,
   one gather pass; ties across the boundary take the lowest indices = a stable sort's set; `GGML_TOPK_RADIX=0` = stock).
   The stock path CUB-sorted every whole row: 0.34-0.36 ms per layer for a verify pass's 2-8 rows at 65,536 compressed
@@ -493,7 +493,7 @@ Revisit only if DS4 moves base, an upstream kernel is needed for our types, or D
   other's runs through the shared container name - gpuwin now holds a flock; and SIGTERM did not stop a window
   script - windows stop through a STOP file checked between runs.
 
-- **F16 matvec for verify passes (a360f164, env `GGML_MMVF_F16_MAX=8`, ggml patch ggml-zz-mmvf-f16-batch.patch,
+- **F16 matvec for verify passes (a360f164, env `GGML_MMVF_F16_MAX=8`, ggml patch ggml-zz-mmvf-f16-batch.patch - since 10-19 tools/v41/ggml/mab776-mmvf-f16-batch.patch,
   deployed 10-11)**: ggml-cuda multiplies an F16 weight by 2-8 columns with mul_mat_f (tensor-core tiles).  A verify
   pass's F16 weights are the small ones the loader makes of our F32/BF16 tensors (the geometry wants F16): the
   hyper-connection mixes (16,384 x 24), the compressors', the indexer's - where the verify trace had
