@@ -42,8 +42,9 @@ _Tok = ST.Tokenizer
 
 
 class Ds41Tokenizer(_Tok):
-    def __init__(self, tokens, merges, token_types=None, pre="joyai-llm", **k):
-        super().__init__(tokens, merges, token_types, pre="joyai-llm", **k)
+    def __init__(self, tokens, merges, token_types=None, pre="joyai-llm", special_ids=None, **k):
+        # mab776 (main): the tree's server builds it with Tokenizer.from_dir (5 positional args); V4.1's split either way
+        super().__init__(tokens, merges, token_types, pre="joyai-llm", special_ids=special_ids, **k)
         self._literal = {i: t.encode("utf-8") for t, i in self.special_tokens.items()}
 
     def token_bytes(self, i: int) -> bytes:
