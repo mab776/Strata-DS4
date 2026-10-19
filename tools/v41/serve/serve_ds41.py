@@ -351,6 +351,14 @@ def _strip_wrappers(self, delta: str, final: bool) -> str:
 
 
 def _op_feed_ds41(self, delta: str):
+    # mab776: the server feeds one token's text at a time, and `</think>` is ONE special token (id 128822): a delta that
+    # is exactly the tag is the model's own end of thinking.  The frontend's #537 rule reads a tag right after a quote
+    # and not followed by a line break as quoted text - right for a spelled-out tag (several tokens), wrong for this
+    # one: DeepSeek writes the answer straight after it (`...Remember it."</think>falcon-quartz-940`, the answer then
+    # stayed in the reasoning and the content was empty).  The line break added here makes #537 see the end; the
+    # content's leading newlines are dropped as after any `</think>`.
+    if delta == E.thinking_end_token and getattr(self, "state", None) == "reasoning":
+        delta += "\n"
     return _op_feed(self, _strip_wrappers(self, delta, False))
 
 
