@@ -7,21 +7,24 @@ DeepSeek engines we serve, tuned for one box: Ryzen 9 7950X, 124 GiB DDR5-4400, 
 (both sm_120), models on NVMe. Branches: **`mab776-main`** = upstream + our changes (the default branch; the stacks build from it) and **`main`** =
 an untouched mirror of upstream `Indras-Mirror/Xolotl` `main`, kept only to sync from.
 
-## STATUS (2026-10-19, after the Xolotl 87157b2e sync)
+## STATUS (2026-10-19 evening: the Xolotl 87157b2e sync + the dedup pass)
 | | V4 — Portainer stack 74 `deepseek-strata` | V4.1 — Portainer stack 78 `deepseek-v41` |
 |---|---|---|
 | model | DeepSeek-V4-Flash-0731 unsloth UD-Q3_K_M | DeepSeek-V4.1-Flash GSQ (163 GB) + Engram (203 GB) |
 | engine | `ds4_serve` (tools/ds4) | `ds41_generate --serve` (tools/v41/engine) |
-| live snapshot | tree 3f8c6cfb (tag `mab776-main-x1018-final`), ds4_serve md5 8becae81e296 (the sync brought V4 nothing: not redeployed) | tree 84cd7fec + shim d7a276c0, ds41_generate md5 783d89c170fe; run.prev = 026c42f7 |
-| new on 10-19 | - | **images** (`--vision`, DeepSeek's reference ViT on the CPU, resident, ~2.2 GiB) and **exact routing per request** (model ids ending in `-exact`; the plain ids stay 0.5 / 0.3) |
+| live snapshot | tree 3f8c6cfb (tag `mab776-main-x1018-final`), ds4_serve md5 8becae81e296 (the sync brought V4 nothing: not redeployed) | tree fd536a89 (tag `mab776-main-d1019`), ds41_generate md5 3c1373edb6c8 (build-dd); run.prev = 84cd7fec + shim d7a276c0 (tag `mab776-main-s1019`) |
+| new on 10-19 | - | **images** (`--vision`, DeepSeek's reference ViT on the CPU, resident, ~2.2 GiB) and **exact routing per request** (model ids ending in `-exact`; the plain ids stay 0.5 / 0.3); evening: **dedup** - prompt lookup and the D3 PCIe-site copies are upstream's code now (diff vs upstream -969 lines) |
 | port / alias / model id | :8330 / `ds4-lcpp` / `deepseek-v4-flash` (one of the two runs at a time: mode page DeepSeek tile V4 \| V4.1) | the same |
-| prefill 8.7k / 123k | ~940 / ~1,100 tok/s | ~710 / ~1,995 tok/s |
+| prefill 8.7k / 123k | ~940 / ~1,100 tok/s | ~700-715 / ~1,960-2,000 tok/s |
 | decode (sampled, 256 tok) | ~50-58 tok/s (MTP K=2, lookup 7) | ~50-60 tok/s (DSpark depth 5); copy-heavy edits 117-144 tok/s (lookup 14); `-exact` 26-31 tok/s |
 | RAM | ~77-79 GiB (cap 96) | ~99.5 GiB incl. the image encoder (cap 104, arena 80.0, margin >= 4 GiB at 480k / 246k) |
 
 Exactness: the merged V4.1 engine with `STRATA_TIER_ROWS=8` + `STRATA_GPU1_RESERVE_GIB=0.745` gives the pre-sync one-shot
 greedy md5 (4bcc9c9e77b1 at arena 82.5); upstream's 16-row tier calls change the text here. The deployed arena is 80.0
 (the encoder's RAM under the 4 GiB rule), so its own md5 differs by residency, not by code. Details: X1018-UPDATE.md "Sync 10-19".
+The dedup build gives 4bcc9c9e77b1 too; with upstream's D3 DMA stream on (served) the fast-routing text is deb5da21073c
+(deterministic, draft-independent: the stream shifts residency like an arena change); exact routing = the previous 389fbc4c967a.
+X1018-UPDATE.md "Dedup 10-19" = what was adopted from upstream, what stays ours and why.
 
 ## What this fork adds to upstream
 - **V4 (tools/ds4)**: unsloth split GGUFs (`--expert-slots auto`, mixed per-class blobs, `DS4_FORCE_MIXED`), the
@@ -34,8 +37,9 @@ greedy md5 (4bcc9c9e77b1 at arena 82.5); upstream's 16-row tier calls change the
 - **V4.1 (tools/v41)**: batch-invariant verify passes (`GGML_BATCH_INVARIANT=4`: the greedy output does not depend on the
   draft) + lone tokens decoded through a one-row verify pass; Q3_K split exact kernels (`STRATA_SPLIT_FORK`); kept verify
   graphs, async finish, 128 decode read parts, the layer-wide file reader (`STRATA_WAVE_LAYER`), conversation parking
-  (`STRATA_PARK`, RAM + disk store), keep-cache through short batches (`STRATA_KEEP_CACHE`), prompt-lookup drafts up to 14
-  (`STRATA_LOOKUP`), `STRATA_PB_CAP=0` (Xolotl's 24 GB-card prompt-batch cap off), `STRATA_TIER_ROWS` (rows per tier call;
+  (`STRATA_PARK`, RAM + disk store), keep-cache through short batches (`STRATA_KEEP_CACHE`), the DSpark window kept with the snapshot
+  (`STRATA_DSPARK_SNAP`: regenerate +9..+19 % decode), `STRATA_SERVE_LOOKUP_GREEDY` (a greedy cap on upstream's
+  prompt lookup `STRATA_SERVE_LOOKUP`: 0 = greedy stays exact), `STRATA_PB_CAP=0` (Xolotl's 24 GB-card prompt-batch cap off), `STRATA_TIER_ROWS` (rows per tier call;
   8 = the pre-76d16570 split, output-identical), GPU 1's static tier on 16-row calls, the FILEG cap per 8 rows of a call,
   the shim's special-`</think>` fix (an answer written straight after a quoted line stayed in the reasoning), the second-drive blob mirror, served
   configs and the bench kit (mab776/pf). Report: [docs/mab776/V41-REPORT.md](../docs/mab776/V41-REPORT.md); the x1018
@@ -48,10 +52,12 @@ Two ggml trees (gitignored, llama.cpp at `third_party/ggml/VERSION.txt` 3cf03257
 - `third_party/llama.cpp` = V4.1's: tools/v41/ggml/{upstream-fixes, mmq-deterministic, rank-argsort, kv-fp4,
   dsv41-fake-quant, dsv41-fuse, mab776-cpy-rows, mab776-li-wmma-fp4, mab776-li-mma, mab776-mmvf-f16-batch,
   mab776-topk-radix-select, mab776-batch-invariant}.patch (`patch -p1`);
-- `third_party/llama.cpp-ds4` = V4's: tools/ds4/patches/*.patch (the build script applies what is missing).
+- `third_party/llama.cpp-ds4` = V4's: tools/ds4/patches/{lightning-indexer-*, zz-dsv4-hc-gates, zzz-dsv4-hc-fused} + the four it
+  shares with V4.1 from tools/v41/ggml (top-k radix select, mmvf F16 batch, rank-argsort, upstream-fixes), in the order
+  `mab776-build-ds4.sh` lists.
 
 ```sh
-ENGINE=ds41 BUILD_DIR=build-s1019 ./mab776-build.sh        # V4.1 -> build-s1019/ds41_generate (CUDA 13 container)
+ENGINE=ds41 BUILD_DIR=build-dd ./mab776-build.sh           # V4.1 -> build-dd/ds41_generate (CUDA 13 container)
 ENGINE=ds4 ./mab776-build.sh                               # V4   -> build-ds4-cu13/ds4_serve (+ ds4_generate)
 ```
 `mab776-build-ds4.sh` mounts the V4 ggml tree at the in-container path the V4 binary was always built with.

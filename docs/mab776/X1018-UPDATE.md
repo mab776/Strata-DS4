@@ -1,3 +1,41 @@
+# Dedup 10-19 (Marc's rule: our diff vs upstream only shrinks) - DONE, V4.1 deployed 2026-10-19 18:52 (stack 78)
+`mab776-main` = 59593488 + 6 commits (e7dc02ff .. fd536a89, one item each, bisectable) + this doc. Stack 78 runs tree
+fd536a89, engine build-dd md5 3c1373edb6c8 (tag `mab776-main-d1019`); run.prev = the afternoon's 84cd7fec + shim d7a276c0
+(tag `mab776-main-s1019` = 59593488, the same code). Stack 74 (V4) not redeployed: its build recipe changed, its binary's
+behaviour did not. Test strategy (Marc, 18:05: "be a bit more yolo"): each item tested only on what it can change,
+one arm each; ONE deep gate on the combined build at the end. The working branch `wip/dedup-1019` is superseded.
+
+**Diff vs xolotl/main** (code only: without bench/, docs/, *.md and the mab776/ test kit): **71 files +17,277 / -901 ->
+66 files +16,230 / -823** (-5 files, -1,047 added lines, -78 lines of upstream's code changed).
+
+| item | verdict | lines (net, per commit; total -969) | evidence (throwaway `ds41-pf`, served config, arena 80) |
+|---|---|---|---|
+| prompt lookup: our STRATA_LOOKUP vs upstream STRATA_SERVE_LOOKUP | **adopted upstream** (+ our knob STRATA_SERVE_LOOKUP_GREEDY: greedy requests keep no lookup = provably exact) | -38 net (+49 / -87) | same design (n-gram 3 + 1, agree, back-off, cap 14); a knob making upstream's stop at the latest match like ours changed nothing (f2 121 vs 121) - not kept |
+| D3 PCIe-site copies: our STRATA_D3_OVERLAP vs upstream STRATA_D3_DMA_STREAM + STRATA_DMA_OVERLAP | **adopted upstream** (served: both 1) | -31 net (+48 / -79) | copy edits f1 / f2 / f3 (tok/s, 4-8 runs each): ours 112 / 136 / 116, upstream's 108 / 144 / 127, NO overlap at all 95 / 121 / 103 (the first dedup arm ran without either: what looked like a lookup loss); turns, bench equal |
+| unused experiments STRATA_PASS_MULTI, STRATA_CHUNK_PRED, STRATA_GPU1_DYN (+ stat, + the unapplied rows16-UNPROVEN patch) | **removed** | -260 net (-73 and -187) | built; one-shot md5 unchanged |
+| V4 ggml patches | **4 duplicate files removed**: V4's tree takes rank-argsort / upstream-fixes (byte copies of upstream's) and top-k / mmvf from tools/v41/ggml; `GGML_TOPK_RADIX=1` in deepseek-strata/ds4-server.json | -575 net | a fresh tree applies all 8 = the old one but a comment + the top-k default (the env); built, one request OK (48.5 tok/s, drafts 115/158); the fresh tree is third_party/llama.cpp-ds4 now |
+| DSpark window with the snapshot: our STRATA_DSPARK_SNAP vs upstream's repeated-prompt re-seed (STRATA_SERVE_DSPARK is the DSpark path we already use; _EVICT does another job) | **kept ours** - regenerate decode 150 / 158 tok/s (13.3 / 12.7 s) vs upstream's re-seed alone 126 / 145 (15.9 / 13.8 s); ours also keeps a continuation from the snapshot and a parked conversation warm | 0 | edits, parking switches, 8.7k equal |
+| finished test knobs / diagnostics: STRATA_TAIL_PV, STRATA_TAIL_CHUNK, STRATA_PV_PROF, STRATA_ROUTE_COUNT, STRATA_GPU1_BIAS, STRATA_GPU1_NOCHUNK | **removed** (STRATA_SEED_GIB kept: it pins the VRAM expert set, the tool for comparing runs when a change shifts residency; the one-line tuning values of served features kept) | -65 net | md5 unchanged |
+| parking: our STRATA_PARK vs upstream STRATA_SERVE_PARK | **kept ours** - upstream keeps ONE parked conversation in RAM; 3 conversations: B2 / C2 re-read 20k tokens = 14.0 / 14.6 s vs ours 4.4 / 4.0 s; ours persists to disk | 0 | |
+| keep-cache: our STRATA_KEEP_CACHE vs upstream STRATA_SERVE_KEEP_CACHE | **kept ours** - upstream's needs --no-vram-lru, then copy edit f3 61 vs 120 tok/s, 8.7k prefill -5 % | 0 | |
+| STRATA_SERVE_ROLLBACK1 | **kept ours, not A/B'd** (Marc: dropped) - upstream has no knob that does its job, so there is nothing to adopt | 0 | |
+| prompt cache (STRATA_PROMPT_CACHE_*) | **kept ours, not A/B'd** (Marc: dropped) - upstream's nearest are SERVE_KEEP_CACHE / SERVE_PARK, and both lost to ours above | 0 | |
+| STRATA_PB_CAP | kept (a one-line knob turning upstream's 24 GB-card cap off) | 0 | |
+
+**Exactness** (one-shot greedy md5, 1,536 tokens, arena 82.5): the final build = **4bcc9c9e77b1** (= the previous engine)
+without the stream, deb5da21073c with it (deterministic; the same at DSpark depth 1 and 5). Exact routing (route bias 0):
+stream on / off / depth 1 = **389fbc4c967a** = the previous engine's - the arithmetic is unchanged; the stream only moves
+which experts sit in VRAM, and the fast routing follows that (as the arena 82.5 -> 80 change did). So the served
+greedy text differs from the afternoon's by residency, not by code.
+
+**Final gate** (the combined build on the throwaway, a copy of the deployed snapshot, 18:25-18:52): prefill 8.7k 716 tok/s
+(12.2 s), 123k 1,956 tok/s (62.9 s; band 1,995-2,016, one run); decode 60.2 / 50.8 tok/s; turns +300 4.04-4.13 s, +1,500
+6.42-6.44 s; edits f1 / f2 / f3 118 / 146 / 136 tok/s; images (chart, screenshot) right; needles **8/8 fresh** (2 x
+(480k + 3 x 246k), haystack models/strata-data/src-020 - src-01431 is empty now); margin min **4.46 GiB** (peak 99.54 of
+104, encoder loaded), OOM none, 0 errors in the log; tools 6/6, 6/6, 6/6, 5/6 (the known `after-result` quirk: an extra
+unasked write_file call or a Unicode "−3"; the same in the previous build's gate log). Deployed + live start check
+("READY") 18:52-18:55, then stopped (mode page OFF as before).
+
 # Sync 10-19: Xolotl 87157b2e -> per-request routing + image input on V4.1 (stack 78)
 Marc's request (relayed, 2026-10-19 morning). Branch layout since this morning: `mab776-main` = upstream + ours (GitHub
 default, the stacks build from it), `main` = an untouched mirror of Xolotl `main`.
