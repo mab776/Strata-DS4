@@ -1837,7 +1837,11 @@ int main(int argc, char ** argv) {
             // state columns + graph are ~0.48 MiB a column, and the card is shared with whatever else the desktop
             // runs.  This is what lets a big --prompt-batch stay OPT-IN: the engine takes what is actually free.
             pb_cap = PB;
-            if (!by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
+            // mab776 STRATA_PB_CAP=0: no cap - the calibration below is a 24 GB card's; on the 48 GB card the served
+            // --prompt-batch 32768 fits in the ~11 GiB a prompt sees (every gate since 10-15), and the cap cut it to
+            // ~6.1K columns (123k prefill 62 -> 69 s).  feed() still halves a batch that does not fit.
+            static const bool pb_cap_on = !(std::getenv("STRATA_PB_CAP") && std::getenv("STRATA_PB_CAP")[0] == '0');
+            if (pb_cap_on && !by_step && dh >= 2 && PB > 1 && !mc.cpu_only) {
                 size_t frb = 0, totb = 0;
                 ggml_backend_dev_memory(ggml_backend_get_device(be), &frb, &totb);
                 // The layer-major batch's own VRAM, CALIBRATED on four traced points (STRATA_VRAM_TRACE=1, s13
