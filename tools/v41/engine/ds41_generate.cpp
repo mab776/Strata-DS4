@@ -1069,12 +1069,6 @@ int main(int argc, char ** argv) {
     std::vector<float> cw((size_t) NP * top_k), crouted((size_t) NP * n_embd), clog;
     const bool routed_host = std::getenv("STRATA_ROUTED_HOST") != nullptr;
     std::vector<float> brouted;                    // the layer-major path's routed sums (n_embd * B)
-    // mab776 STRATA_ROUTE_COUNT=<file> (measurement): every routed (layer, expert) of the layer-major prompt batches is
-    // counted and written at the end of a one-shot run as a rank file (int32 pairs, most routed first, then the
-    // never-routed in index order) - a text's own ranking, for --rank (e.g. --ppl --bias-prompt with a domain's set)
-    const char * route_count_path = std::getenv("STRATA_ROUTE_COUNT");
-    std::vector<int64_t> route_cnt;
-    if (route_count_path) route_cnt.assign((size_t) (TG.n_layers * TG.n_experts), 0);
     if (PB > 0) brouted.resize((size_t) n_embd * (size_t) PB);
     // a single run_chunk call streams layer l's experts once for its n tokens; the card's chunk buffers (dominated by
     // c_parts = n * top_k * n_embd * 4) must fit ~1 GiB, so a larger batch is run in pieces (each streams once again)
@@ -1265,11 +1259,6 @@ int main(int argc, char ** argv) {
                         const double ts = Ds41Dense::prof_on() ? now_ms() : 0;
                         dense.sync();
                         if (ts > 0) Ds41Dense::prof().sync += now_ms() - ts;
-                    }
-                    if (!route_cnt.empty()) {   // STRATA_ROUTE_COUNT: this layer's routes for the batch rows it computed
-                        const int32_t * bi = dense.batch_ids();
-                        for (int64_t j = (int64_t) d0 * top_k; j < (int64_t) B * top_k; ++j)
-                            if (bi[j] >= 0 && bi[j] < TG.n_experts) ++route_cnt[(size_t) (l * TG.n_experts + bi[j])];
                     }
                     const double t1 = now_ms();
                     fd_dense += t1 - t0;
@@ -2124,11 +2113,6 @@ int main(int argc, char ** argv) {
             const int lk_cap = temp > 0 ? lk_max : lk_max_g;
             int lk_cool = 0, lk_back = 1;
             long lk_pass = 0, lk_dr = 0, lk_acc = 0;
-            // mab776 STRATA_PV_PROF=1: this request's verify passes split (pass_v's dense / tier / taps / logits laps, the
-            // DSpark draft, the rest of the loop), per pass
-            static const bool pv_prof = std::getenv("STRATA_PV_PROF") && std::getenv("STRATA_PV_PROF")[0] == '1';
-            double pv0[4] = { pv_ms[0], pv_ms[1], pv_ms[2], pv_ms[3] }, pv_ver = 0, pv_drf = 0;
-            const double pv_t0 = now_ms();
             if (sp_t >= 0 && !nonfinite) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
@@ -2191,9 +2175,7 @@ int main(int argc, char ** argv) {
                     vt.push_back(t);
                     for (int i = 0; i < nd; ++i) vt.push_back(dr[i]);
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
-                    const double pv_a = pv_prof ? now_ms() : 0;
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
-                    if (pv_prof) pv_ver += now_ms() - pv_a;
                     if (rows_nonfinite(vlog.data() + (size_t) r0 * nv, nv, nd + 1)) { nonfinite = true; finish = "nonfinite"; break; }
                     int acc = 0, tn = -1;
                     for (; acc < nd; ++acc) {
@@ -2209,11 +2191,9 @@ int main(int argc, char ** argv) {
                     }
                     int spos[kVerify + 1];
                     for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
-                    const double pv_b = pv_prof ? now_ms() : 0;
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
                         ferr = "DSpark step: " + dsp->last_error(); finish = "error"; break;
                     }
-                    if (pv_prof) pv_drf += now_ms() - pv_b;
                     hist.push_back(t);
                     bool more = true;
                     for (int i = 0; i < acc && more; ++i) { hist.push_back(dr[i]); more = emit(dr[i]); }
@@ -2227,13 +2207,6 @@ int main(int argc, char ** argv) {
                 dsp_next = P + 1;   // the ring holds every position <= P (the last emitted token is not fed)
                 if (std::strcmp(finish, "error") == 0) dsp_next = -1;
                 sv_pass += rq_pass; sv_acc += rq_acc;
-                if (pv_prof && rq_pass > 0) {
-                    const double np = (double) rq_pass, all = now_ms() - pv_t0;
-                    std::fprintf(stderr, "serve: pass split (%ld passes): verify %.2f ms = dense %.2f + tier %.2f + taps %.2f + "
-                                 "logits %.2f; draft %.2f; rest %.2f ms per pass\n", rq_pass, pv_ver / np,
-                                 (pv_ms[0] - pv0[0]) / np, (pv_ms[1] - pv0[1]) / np, (pv_ms[2] - pv0[2]) / np,
-                                 (pv_ms[3] - pv0[3]) / np, pv_drf / np, (all - pv_ver - pv_drf) / np);
-                }
             }
 #endif
             while (sp_t < 0 && !nonfinite && (gen < max_new || max_new <= 0)) {
@@ -2332,30 +2305,11 @@ int main(int argc, char ** argv) {
     if (spec && a.temp > 0) std::fprintf(stderr, "note: STRATA_DSPARK decodes greedily (temp ignored)\n");
     // the DSpark window needs per-position main_hidden, which the layer-major prompt does not produce: the last
     // min(128, L-1) prompt tokens run through pass_v (chunks of <= 16) after the VRAM cache opens
-    // mab776 STRATA_TAIL_PV=1 (test knob, no drafter): the same tail through pass_v, so a drafter-less run's prompt
-    // matches a DSpark run's bit for bit (and, with GGML_BATCH_INVARIANT, its whole token stream)
-    const bool tail_pv = !spec && dm_tail == 0 && defer_vram && std::getenv("STRATA_TAIL_PV") && std::getenv("STRATA_TAIL_PV")[0] == '1';
-    const int sp_tail = spec || tail_pv ? std::min<int>(128, (int) prompt.size() - 1) : 0;
+    const int sp_tail = spec ? std::min<int>(128, (int) prompt.size() - 1) : 0;
     const bool ok = feed(prompt.data(), (int) prompt.size() - dm_tail - sp_tail, 0, [&](int done) {
         if (!a.quiet) std::fprintf(stderr, "\rprompt %d/%zu", done, prompt.size());
     }, a.ppl || !a.dump_logits.empty() ? &all : nullptr);
     if (!ok) { std::fprintf(stderr, "\nds41_generate: prefill: %s\n", ferr.c_str()); return 1; }
-    if (!route_cnt.empty()) {   // STRATA_ROUTE_COUNT: the prompt's own ranking
-        std::vector<int64_t> order(route_cnt.size());
-        for (size_t i = 0; i < order.size(); ++i) order[i] = (int64_t) i;
-        std::stable_sort(order.begin(), order.end(), [&](int64_t x, int64_t y) { return route_cnt[(size_t) x] > route_cnt[(size_t) y]; });
-        std::vector<int32_t> out;
-        int64_t routed = 0;
-        for (int64_t i : order) {
-            out.push_back((int32_t) (i / TG.n_experts));
-            out.push_back((int32_t) (i % TG.n_experts));
-            routed += route_cnt[(size_t) i] > 0;
-        }
-        std::ofstream f(route_count_path, std::ios::binary);
-        f.write((const char *) out.data(), (std::streamsize) (out.size() * 4));
-        std::fprintf(stderr, "route count: %lld of %zu experts routed by the prompt -> %s\n", (long long) routed, route_cnt.size(),
-                     route_count_path);
-    }
     if (dm_tail > 0 && defer_vram && !open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
     for (int i = (int) prompt.size() - dm_tail; i < (int) prompt.size(); ++i)
         if (!step(prompt[(size_t) i], i) || !dense.logits(0, 1, last_logits.data())) {
@@ -2371,11 +2325,8 @@ int main(int argc, char ** argv) {
         bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
         apply_bias();
         std::vector<int> spos;
-        // mab776 STRATA_TAIL_CHUNK=c (test knob, default 16): the seed's verify passes of c rows - an exactness probe
-        // for wide passes (16 vs 1 rows: identical tokens when every 16-row pass computes each row as a 1-row one)
-        static const int tail_c = std::getenv("STRATA_TAIL_CHUNK") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_TAIL_CHUNK")))) : 16;
-        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += tail_c) {
-            const int m = std::min<int>(tail_c, (int) prompt.size() - i0);
+        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
+            const int m = std::min<int>(16, (int) prompt.size() - i0);
             if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: DSpark seed: %s\n", ferr.c_str()); return 1; }
             spos.resize((size_t) m);
             for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;
@@ -2393,20 +2344,8 @@ int main(int argc, char ** argv) {
         apply_bias();
     }
 #endif
-    if (tail_pv) {
-        if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
-        bias_now = false;   // prompt routing, as the DSpark seed's tail
-        apply_bias();
-        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
-            const int m = std::min<int>(16, (int) prompt.size() - i0);
-            if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: tail pass: %s\n", ferr.c_str()); return 1; }
-            if (i0 + m == (int) prompt.size()) std::copy(vlog.end() - nv, vlog.end(), last_logits.begin());
-        }
-        bias_now = true;
-        apply_bias();
-    }
     const double prompt_ms = now_ms() - tp0;
-    if (defer_vram && dm_tail == 0 && !spec && !tail_pv) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
+    if (defer_vram && dm_tail == 0 && !spec) {   // the prompt is done: its buffers go back, the VRAM expert cache opens into the free space
         if (!open_cache()) { std::fprintf(stderr, "ds41_generate: deferred seed: %s\n", err.c_str()); return 1; }
         std::fprintf(stderr, "\nVRAM after the prompt: %.2f GiB free -> %.2f GiB of expert slots: %lld experts in VRAM (%.1f s)",
                      seed_free, seed_gib, (long long) tier.resident(), seed_s);

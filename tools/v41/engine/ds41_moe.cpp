@@ -4721,10 +4721,7 @@ void pc_setup(Ds41MoeImpl& im, int n, int64_t layer) {
 void g1_chunk_share(Ds41MoeImpl& im, int64_t layer, int n, const int32_t* ids, const float* x_host, const float* x_dev) {
     Gpu1& g = *im.g1;
     g.c_n1 = 0;
-    // STRATA_GPU1_NOCHUNK=1 (diagnostic): GPU 0 runs GPU 1's prompt experts from the file tier, every buffer kept -
-    // the same memory layout as the share, for a bit-exact A/B of GPU 1's prompt rows
-    static const bool nochunk = std::getenv("STRATA_GPU1_NOCHUNK") && std::getenv("STRATA_GPU1_NOCHUNK")[0] == '1';
-    if (nochunk || !g.m_ctx || !g.c_x || n > g.c_tok || (!x_host && !x_dev)) return;
+    if (!g.m_ctx || !g.c_x || n > g.c_tok || (!x_host && !x_dev)) return;
     namespace mmq = strata::prefill::mmq;
     Gpu& gp = *im.gpu;
     const int64_t H = im.g.n_embd, K = im.g.top_k, NX = im.g.n_experts, NE = (int64_t) n * K;
@@ -6726,9 +6723,8 @@ bool Ds41MoeTier::in_arena(int64_t layer, int64_t expert) const {
 
 bool Ds41MoeTier::resident(int64_t layer, int64_t expert) const {
 #if defined(DS4_MOE_CUDA)
-    // mab776 STRATA_GPU1: GPU 1's static tier is resident too (STRATA_GPU1_BIAS=0: GPU 0's slots only)
-    static const bool g1_bias = !(std::getenv("STRATA_GPU1_BIAS") && std::getenv("STRATA_GPU1_BIAS")[0] == '0');
-    if (im_ && g1_bias && g1_has(*im_, layer, expert)) return true;
+    // mab776 STRATA_GPU1: GPU 1's static tier is resident too
+    if (im_ && g1_has(*im_, layer, expert)) return true;
     if (im_ && im_->gpu && im_->gpu->cache) return im_->gpu->cache->slot_of(layer, expert) >= 0;
 #endif
     (void) layer;
