@@ -1,35 +1,36 @@
-# Dedup 10-19 (Marc's rule: our diff vs upstream only shrinks) - PAUSED 2026-10-19 ~18:00, resume tonight
-**State**: WIP branch `dedup-1019` (local, also pushed as `wip/dedup-1019` on mab776/Strata-DS4; NOT in mab776-main,
-nothing deployed - stacks 74/78 untouched, mode page OFF, GPUs empty). Code diff vs xolotl/main (without bench/docs):
-mab776-main 133 files +19,107 / -901 -> dedup-1019 128 files +18,132 / -827 so far.
+# Dedup 10-19 (Marc's rule: our diff vs upstream only shrinks) - PARKED 2026-10-19 ~17:30 (Marc: bigger than expected)
+**State**: WIP on branch `dedup-1019` = `wip/dedup-1019` on mab776/Strata-DS4 (NOT in mab776-main). Nothing deployed:
+stack 78 runs the afternoon snapshot again (84cd7fec + shim d7a276c0, engine 783d89c170fe) and stack 74 its 3f8c6cfb;
+both stacks stopped, mode page OFF, GPUs empty. (The dedup build was on stack 78 16:57-17:30 for its live gate - it
+passed - then rolled back for the park: run / run.prev swapped back, configs restored from .bak-20261019-dedup.)
+WIP build dirs deleted (rebuild: `git checkout dedup-1019 && ENGINE=ds41 BUILD_DIR=build-dd ./mab776-build.sh`, engine
+md5 22ef76afee55); kit configs kept in models/strata-ds41/test-dd/run/cfg-*.json.
 
-**Done (A/B on the throwaway kit `ds41-pf`, served config at arena 80, two baseline runs = the noise band):**
-| pair | verdict | evidence |
+**Diff vs xolotl/main** (code only: without bench/, docs/, *.md and the mab776/ test kit): mab776-main 71 files
++17,277 / -901 -> dedup-1019 66 files +16,299 / -827.
+
+| pair / item | verdict | evidence (throwaway `ds41-pf`, served config, arena 80) |
 |---|---|---|
-| lookup: our STRATA_LOOKUP vs upstream STRATA_SERVE_LOOKUP | **adopted upstream** (commit 3eba3514; + one knob STRATA_SERVE_LOOKUP_GREEDY so greedy keeps it off) | same design (n-gram 3, agree, back-off, cap 14); serve A/B of the build was interrupted (see below) |
-| D3 PCIe-site copies: our STRATA_D3_OVERLAP vs upstream STRATA_D3_DMA_STREAM (+ STRATA_DMA_OVERLAP) | **adopted upstream** (eade8212) | turns +300 4.02 / 4.08 s vs ours 3.94-4.18, +1,500 6.40 / 6.44 vs 6.35-6.55; bench + edits within the band. One-shot md5: upstream's stream gives another text (deb5da21073c, deterministic, the same at DSpark depth 1 and 5 = still draft-independent; it shifts residency like an arena change); our overlap and no stream both = 4bcc9c9e77b1 |
-| parking: our STRATA_PARK vs upstream STRATA_SERVE_PARK | **kept ours** (why: upstream keeps ONE parked conversation in RAM; 3 conversations A/B/C: B2 + C2 re-read 20k tokens = 14.0 / 14.6 s vs ours 4.4 / 4.0 s; ours also persists to disk across restarts) | A2 3.76 vs 3.66 s (one park: equal) |
-| keep-cache: our STRATA_KEEP_CACHE vs upstream STRATA_SERVE_KEEP_CACHE | **kept ours** (why: upstream's refuses with the VRAM LRU on - needs --no-vram-lru, and then the copy edit f3 decoded 61 vs 120 tok/s, 8.7k prefill -5 %; turns equal) | |
-| unused experiments | **removed**: STRATA_PASS_MULTI, STRATA_CHUNK_PRED (93dec2fe); STRATA_GPU1_DYN + the unapplied rows16 patch (d07fbe45, **WIP: not built yet**) | the one-shot md5 of the build with 3eba3514..eade8212 = 4bcc9c9e77b1 without the stream |
-| V4 ggml patches | **4 duplicate files removed** (d600efde): V4's tree now applies rank-argsort / upstream-fixes (byte copies of upstream's) and top-k / mmvf (copies of ours) from tools/v41/ggml; a fresh tree = the old one but a comment + the top-k default -> `GGML_TOPK_RADIX=1` added to deepseek-strata/ds4-server.json (backup .bak-20261019-dedup) | V4 not rebuilt / probed yet |
+| prompt lookup: our STRATA_LOOKUP vs upstream STRATA_SERVE_LOOKUP (+ our STRATA_SERVE_LOOKUP_GREEDY) | **upstream's is equal** - adopt if resumed | same design (n-gram 3 + 1, agree, back-off, cap 14); a knob making upstream's stop at the latest match like ours changed nothing (copy edit f2 121 vs 121 tok/s) |
+| D3 PCIe-site copies: our STRATA_D3_OVERLAP vs upstream STRATA_D3_DMA_STREAM + STRATA_DMA_OVERLAP | **upstream's is equal or better** - adopt if resumed | copy edits f1 / f2 / f3 (tok/s, 4-8 runs each): live (our lookup + our overlap) 112 / 136 / 116; dedup + upstream's stream 108 / 144 / 127; dedup with NO overlap at all 95 / 121 / 103. So the ~121 seen first was the missing overlap, not the lookup |
+| parking: our STRATA_PARK vs upstream STRATA_SERVE_PARK | **keep ours** - upstream keeps ONE parked conversation; 3 conversations: B2 / C2 re-read 20k tokens = 14.0 / 14.6 s vs ours 4.4 / 4.0 s; ours also persists to disk | |
+| keep-cache: our STRATA_KEEP_CACHE vs upstream STRATA_SERVE_KEEP_CACHE | **keep ours** - upstream's needs --no-vram-lru, then copy edit f3 61 vs 120 tok/s, 8.7k prefill -5 % | |
+| unused experiments | removed on the branch: STRATA_PASS_MULTI, STRATA_CHUNK_PRED, STRATA_GPU1_DYN (+ stat), the unapplied rows16-UNPROVEN patch | built, md5 below |
+| V4 ggml patches | 4 duplicate files removed on the branch (V4 takes them from tools/v41/ggml) | fresh V4 tree = the live one but a comment + the top-k radix default (-> `GGML_TOPK_RADIX=1` in ds4-server.json, reverted for the park); built, env reaches the engine; not probed further |
 
-**Interrupted**: the serve A/B of the dedup build (arms `dd-dedup`, `dd-dedup2`: upstream lookup + DMA stream) - killed
-during dd-dedup's 8.7k bench; results so far in the scratch kit only (base / base2 / park / keep / d3).
+**Exactness** (one-shot greedy md5, 1,536 tokens, arena 82.5): dedup build = **4bcc9c9e77b1** (= the live engine) without
+the stream; with upstream's stream deb5da21073c (deterministic, the same at DSpark depth 1 and 5). Exact routing: stream
+on / off / depth 1 = **389fbc4c967a** = the live engine's - the stream only moves VRAM residency, which the fast routing follows.
 
-**Left**: (1) finish GPU1_DYN: drop the `g1_fills` stat (moe.hpp, its sum in moe.cpp, the print in ds41_generate), build,
-one-shot md5 (expect 4bcc9c9e77b1 without the stream); (2) the dedup build's serve A/B (edits for lookup!) vs the base
-band; (3) V4: rebuild the V4 ggml tree fresh from the new patch list + ds4_serve, probe (speed) + tools; (4) the rest of
-the list - DSPARK_SNAP vs upstream's DSpark carry-over, SERVE_ROLLBACK1, prompt cache, PB_CAP (keep: tiny knob), any of
-our patches upstream fixes its own way; (5) the diff-size report (before -> after, per feature) and the usual gates
-before any deploy. **Parked by Marc: option A (bf16 encoder fix) - don't start.**
+**Live gate of the dedup build (stack 78, 16:57-17:18, before the park)**: prefill 8.7k 666 tok/s (13.1 s), 123k 1,999
+tok/s (61.5 s); decode 52.4 / 51.4; turns 4.21 / 6.39-6.51 s; images OK; needles 4/4 fresh (480k + 3 x 246k; haystack
+models/strata-data/src-020 - src-01431 is empty now); margin 4.23 GiB; tools 6/6 in 6 of 9 runs, 5/6 in 3 (`after-result`:
+an extra unasked write_file call or a Unicode "−3" - the same failures are in the previous build's gate log: a probe quirk).
 
-**Next command** (rebuild the WIP, then the md5 gate):
-```
-cd ~/Documents/portainer/strata-ds4 && git checkout dedup-1019 && ENGINE=ds41 BUILD_DIR=build-dd BUILD_TARGETS=ds41_generate ./mab776-build.sh && \
-mkdir -p ../strata-ds41/build-dd && cp build-dd/ds41_generate ../strata-ds41/build-dd/ && cd ../strata-ds41 && \
-bash mab776/pf/verify_ab.sh build-dd "dd_md5:GGML_BATCH_INVARIANT=4,STRATA_TIER_ROWS=8,STRATA_GPU1_RESERVE_GIB=0.745,STRATA_D3_OVERLAP=0"
-```
-(kit: the throwaway arm runner + configs live in the session scratchpad and models/strata-ds41/test-dd/run/cfg-*.json)
+**If resumed**: the branch is deploy-ready as gated (config = cfg-dedup: STRATA_SERVE_LOOKUP=14,
+STRATA_SERVE_LOOKUP_GREEDY=0, STRATA_D3_DMA_STREAM=1, STRATA_DMA_OVERLAP=1, no STRATA_LOOKUP / STRATA_D3_OVERLAP);
+squash the two WIP commits first. Not started: DSPARK_SNAP vs upstream's DSpark carry-over, SERVE_ROLLBACK1, prompt
+cache, PB_CAP. **Parked by Marc: option A (bf16 encoder fix).**
 
 # Sync 10-19: Xolotl 87157b2e -> per-request routing + image input on V4.1 (stack 78)
 Marc's request (relayed, 2026-10-19 morning). Branch layout since this morning: `mab776-main` = upstream + ours (GitHub
