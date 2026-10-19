@@ -2062,14 +2062,15 @@ int main(int argc, char ** argv) {
             // ---- DSpark speculative sampling (as the one-shot loop: P = last fed position, t = the token for P+1,
             // sp_ids = drafts for P+2..; each verify row's distribution is sample_p's, spec_accept keeps it exact)
             long rq_pass = 0, rq_acc = 0;
-            // mab776 STRATA_LOOKUP=L (0 = off, <= 7; the V4 fork's --lookup): prompt-lookup drafts for sampled requests,
+            // mab776 STRATA_LOOKUP=L (0 = off, <= 14 since x1018 - xolotl measured 14 > 6 on edits; a pass then has up to 16
+            // rows: 1 + 14 + the refeed, as the prompt tail's passes; the V4 fork's --lookup): prompt-lookup drafts for sampled requests,
             // STRATA_LOOKUP_GREEDY=L for temperature 0 (default 0, as --lookup-greedy), STRATA_LOOKUP_NGRAM=G (3),
             // STRATA_LOOKUP_AGREE (1: a copy goes ahead only when it starts with DSpark's first draft).  A copied block is
             // verified in the pass instead of DSpark's chain; spec_accept treats every draft as a deterministic proposal,
             // so the output distribution is unchanged (greedy: the same tokens).  A lookup pass with less than half right
             // sits the lookup out 1, 2, 4 .. 64 passes.
-            static const int lk_env = std::getenv("STRATA_LOOKUP") ? std::max(0, std::min(7, std::atoi(std::getenv("STRATA_LOOKUP")))) : 0;
-            static const int lk_env_g = std::getenv("STRATA_LOOKUP_GREEDY") ? std::max(0, std::min(7, std::atoi(std::getenv("STRATA_LOOKUP_GREEDY")))) : 0;
+            static const int lk_env = std::getenv("STRATA_LOOKUP") ? std::max(0, std::min(14, std::atoi(std::getenv("STRATA_LOOKUP")))) : 0;
+            static const int lk_env_g = std::getenv("STRATA_LOOKUP_GREEDY") ? std::max(0, std::min(14, std::atoi(std::getenv("STRATA_LOOKUP_GREEDY")))) : 0;
             static const int lk_ngram = std::getenv("STRATA_LOOKUP_NGRAM") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_LOOKUP_NGRAM")))) : 3;
             static const bool lk_agree = !(std::getenv("STRATA_LOOKUP_AGREE") && std::getenv("STRATA_LOOKUP_AGREE")[0] == '0');
             const int LK = temp > 0 ? lk_env : lk_env_g;
@@ -2112,7 +2113,7 @@ int main(int argc, char ** argv) {
                     }
                     // mab776 STRATA_LOOKUP: the context's last G tokens occurred before -> this pass verifies the (2..LK) tokens
                     // that followed them instead of DSpark's k drafts
-                    int lk_n = 0, lk_ids[8];
+                    int lk_n = 0, lk_ids[16];
                     if (LK > 0) {
                         if (lk_skip > 0) --lk_skip;
                         else {
@@ -2125,7 +2126,7 @@ int main(int argc, char ** argv) {
                     }
                     const bool lk_pass = lk_n > 0;
                     const int nd = lk_pass ? lk_n : k;
-                    int dr[8];
+                    int dr[16];
                     for (int i = 0; i < nd; ++i) dr[i] = lk_pass ? lk_ids[i] : sp_ids[i];
                     const bool refeed = dirty && ((P + 1) & 1);
                     vt.clear();
@@ -2149,7 +2150,7 @@ int main(int argc, char ** argv) {
                         if (2 * acc < nd) lk_skip = 1 << std::min(lk_fail++, 6);
                         else lk_fail = 0;
                     }
-                    int spos[9];
+                    int spos[17];
                     for (int i = 0; i <= acc; ++i) spos[i] = P + 1 + i;
                     const double pv_b = pv_prof ? now_ms() : 0;
                     if (!dsp->step(vh.data() + (size_t) r0 * 3 * n_embd, spos, acc + 1, tn, sp_ids, sp_conf)) {
@@ -2312,8 +2313,11 @@ int main(int argc, char ** argv) {
         bias_now = false;   // the tail is PROMPT: it routes like the rest of the prompt (no decode biases), as plain decode
         apply_bias();
         std::vector<int> spos;
-        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += 16) {
-            const int m = std::min<int>(16, (int) prompt.size() - i0);
+        // mab776 STRATA_TAIL_CHUNK=c (test knob, default 16): the seed's verify passes of c rows - an exactness probe
+        // for wide passes (16 vs 1 rows: identical tokens when every 16-row pass computes each row as a 1-row one)
+        static const int tail_c = std::getenv("STRATA_TAIL_CHUNK") ? std::max(1, std::min(16, std::atoi(std::getenv("STRATA_TAIL_CHUNK")))) : 16;
+        for (int i0 = (int) prompt.size() - sp_tail; i0 < (int) prompt.size(); i0 += tail_c) {
+            const int m = std::min<int>(tail_c, (int) prompt.size() - i0);
             if (!pass_v(prompt.data() + i0, m, i0)) { std::fprintf(stderr, "ds41_generate: DSpark seed: %s\n", ferr.c_str()); return 1; }
             spos.resize((size_t) m);
             for (int t = 0; t < m; ++t) spos[(size_t) t] = i0 + t;

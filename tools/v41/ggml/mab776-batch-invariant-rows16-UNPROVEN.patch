@@ -1,0 +1,62 @@
+mab776 (2026-10-18, NOT applied): GGML_BATCH_INVARIANT_ROWS=16 - 9..16-row 2D matmuls as <= 8-column blocks + the flash-attention
+C-split rule up to 16 query rows. One-shot probe (prompt tail in 16-row passes) gives a stable stream, but the reference
+(tail in <= 8-row passes) is itself not run-to-run deterministic, so exactness is unproven. Apply after mab776-batch-invariant.patch.
+
+--- a/ggml/src/ggml-cuda/mab776-binv.cuh
++++ b/ggml/src/ggml-cuda/mab776-binv.cuh
+@@ -8,3 +8,12 @@
+     static const int c = [] { const char * e = getenv("GGML_BATCH_INVARIANT"); return e ? atoi(e) : 0; }();
+     return c;
+ }
++
++// mab776 GGML_BATCH_INVARIANT_ROWS=16 (with GGML_BATCH_INVARIANT; default 8): calls of 9..16 rows are invariant too - a
++// 2D matmul runs as column blocks of <= 8 (each on the <= 8-row kernels above), flash attention keeps its C-split rule
++// up to 16 query rows (prompt-lookup verify passes of up to 16 rows)
++static inline int ggml_cuda_batch_invariant_rows() {
++    static const int r = [] { const char * e = getenv("GGML_BATCH_INVARIANT_ROWS"); const int v = e ? atoi(e) : 8; return v >= 16 ? 16 : 8; }();
++    return ggml_cuda_batch_invariant() > 0 ? r : 0;
++}
++
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1197,7 +1197,7 @@
+             // mab776 GGML_BATCH_INVARIANT=C: C blocks per output tile, so each tile's KV range splits at the same
+             // points whatever the number of tiles (the kernel's ranges are blockIdx.x * ntiles_KV * ntiles_dst / gridDim.x);
+             // decode-sized calls only (<= 8 query rows): a prompt batch keeps the occupancy-sized split
+-            if (ggml_cuda_batch_invariant() > 0 && Q->ne[1]*Q->ne[3] <= 8) {
++            if (ggml_cuda_batch_invariant() > 0 && Q->ne[1]*Q->ne[3] <= ggml_cuda_batch_invariant_rows()) {
+                 nblocks_stream_k = ntiles_dst * std::min(ggml_cuda_batch_invariant(), ntiles_KV);
+             }
+ 
+@@ -1234,7 +1234,7 @@
+         }
+ 
+         // mab776 GGML_BATCH_INVARIANT=C: a fixed number of KV splits, not one fitted to the number of tiles (decode-sized calls)
+-        if (ggml_cuda_batch_invariant() > 0 && Q->ne[1]*Q->ne[3] <= 8) {
++        if (ggml_cuda_batch_invariant() > 0 && Q->ne[1]*Q->ne[3] <= ggml_cuda_batch_invariant_rows()) {
+             parallel_blocks = std::min(ggml_cuda_batch_invariant(), ntiles_KV);
+         }
+ 
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1849,6 +1849,20 @@
+         return;
+     }
+ 
++    // mab776 GGML_BATCH_INVARIANT_ROWS=16: a 9..16-row 2D product as column blocks of <= 8, each on the <= 8-row
++    // invariant path (vector kernels: a column's arithmetic does not depend on the block it is in)
++    if (ggml_cuda_batch_invariant_rows() == 16 && ne11 > MMVF_MAX_BATCH_SIZE && ne11 <= 2*MMVF_MAX_BATCH_SIZE &&
++            ne2 == 1 && ne3 == 1 && ne12 == 1 && ne13 == 1) {
++        for (int64_t c0 = 0; c0 < ne11; c0 += MMVF_MAX_BATCH_SIZE) {
++            ggml_tensor s1 = *src1, d = *dst;
++            s1.ne[1] = d.ne[1] = std::min<int64_t>(MMVF_MAX_BATCH_SIZE, ne11 - c0);
++            s1.data = (char *) src1->data + c0*src1->nb[1];
++            d.data  = (char *) dst->data  + c0*dst->nb[1];
++            ggml_cuda_mul_mat(ctx, src0, &s1, &d);
++        }
++        return;
++    }
++
+     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
+     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+ 
