@@ -1,3 +1,31 @@
+# MORNING SUMMARY (2026-10-19, overnight unattended)
+**Shipped**
+- **Stack 78 (V4.1)** = x1018 (our branch merged onto upstream Xolotl) + **lookup drafts up to 14 for sampled requests**:
+  tree 026c42f7, ds41_generate 488550b66d99. Copy-heavy edits 117-144 tok/s (was 98-122 at 7, +12..+29 %); greedy
+  one-shot md5 unchanged; prefill 8.7k 699 tok/s (12.5 s) / 123k 2,028 tok/s (60.6 s); turns 3.84 / 6.08 s; tools 6/6;
+  needles 4/4 (x1018 gate) + 1 (lookup gate); margin >= 4.28 GiB under 104. Greedy lookup stays OFF (not 7): a 9-row
+  pass is past the 8 rows batch invariance covers. Rollback: stop 78, swap `models/strata-ds41/run` <-> `run.prev`
+  (= b59ac13e, x1018 without lookup 14; the 74faff41 snapshot before it is gone - rebuild from tag mab776-v41-pre-x1018).
+- **Stack 74 (V4)** = x1018 (tree 3f8c6cfb, ds4_serve 8becae81e296): the "-12 % at 123k" was 256-token sampling noise -
+  a greedy probe from one restored state gives the live speed (K=2 pass 34-37 ms at 8k/127k) and the same text;
+  tools 6/6, needles 3/3 at 246k, RAM equal. Rollback: swap `models/strata-ds4/run` <-> `run.prev` (= 2ee91ae8).
+- **One branch `main`** on mab776/Strata-DS4 (Xolotl + our V4 + our V4.1 work; builds both engines; README.mab776.md,
+  also at .github/README.md). Both binaries from main are output-identical to the live ones (V4.1 one-shot md5 + the
+  tokenizer ids; V4 greedy probe) - the stacks were not redeployed.
+
+**Not shipped**: V4 lookup 14 (its native MMVQ kernels take <= 8 columns: the engine aborts; needs a split - and V4
+greedy can't be proven exact anyway); the adaptive arena on V4.1 (no gain on turns); lookup 14 for GREEDY V4.1
+requests (exactness unproven: a <= 8-row prompt-tail pass is not run-to-run deterministic - an open race to find).
+
+**For Marc**: GitHub's default branch is still `mab776-main` (it points at main's commit); set the default to `main`
+(Settings -> General -> Default branch) and then delete `mab776-main` - no gh / token on the box to do it from here.
+
+**Branches / tags on mab776/Strata-DS4**: branches `main` (cd93ebca+) and `mab776-main` (= main, the GitHub default
+until switched). Tags: `upstream-main-1009` (924516a0), `mab776-main-pre-x1018` (733ce42a), `mab776-v41-pre-x1018`
+(74faff41), `mab776-main-final` = `mab776-main-x1018-final` (3f8c6cfb), `mab776-v41-final` = `mab776-v41-x1018-final`
+(026c42f7). Local: `strata-ds4/` on `main` (builds both: `ENGINE=ds4|ds41 ./mab776-build.sh`), `strata-ds41/` detached
+at main (keeps the blob mirror + test kit); `xolotl-v4/` and `xolotl-v41/` removed. Mode page OFF, GPUs empty.
+
 # x1018: our V4 + V4.1 branches on upstream Xolotl (2026-10-18)
 
 Upstream Indras-Mirror/Strata-DS4 and Strata-DSV4.1 now both redirect to **Indras-Mirror/Xolotl** (the V4 and V4.1
@@ -196,3 +224,23 @@ same text. Deployed: `deepseek-strata/snapshot.sh xolotl-v4 build-x1018` (ds4_se
 | tools | 6/6 | 6/6 |
 | needles 246k | 3/3 (232,634 tokens in ~214 s) | 3/3 |
 | memory | 79.0 GiB peak after the 246k needles (cap 96); 77.4 vs 77.5 GiB after the 123k bench in the smoke tests | 77.5 |
+
+
+## Step 5 - ONE branch `main` (2026-10-19 01:00-01:50)
+`main` = mab776-main-x1018 (V4) merged with mab776-v41-x1018 (V4.1), both already on Xolotl f7c561b7 (c89b8d06) + three
+V4.1-on-main fixes found by the smoke tests (the shim's tokenizer subclass takes `from_dir`'s arguments, its
+`effort_kwargs` / `budget_effort` take the frontend's family-table argument) + the README (cd93ebca). Overlaps:
+mab776-build.sh (both sides) -> `mab776-build-ds4.sh` + `mab776-build-ds41.sh` + a dispatcher; one comment in
+expert_cache.hpp; each engine's ggml patch set stays its own tree (`third_party/llama.cpp` = V4.1, `third_party/llama.cpp-ds4`
+= V4, mounted at the old in-container path so the V4 build is unchanged); V4.1's snapshot.sh now also copies
+`tools/llama_unicode_classes.py` (main's tokenizer imports it). Checks of the binaries built from main:
+
+| | V4.1 (ds41_generate 41a2579162ba) | V4 (ds4_serve 4304948a07ca) |
+|---|---|---|
+| exactness | one-shot md5 4bcc9c9e77b1 (depth 5 + one-row passes) / e84e4be9c62a (invariance off) = live; tokenizer ids identical on 5 texts (12,242 tokens) | greedy probe 8k: e9e07103a2 / 92e8658963 = live (one start gave another text - V4's known restart flip; the repeat matched) |
+| speed | 8.7k 736 tok/s (11.9 s), turns 3.73 / 5.95 s (live 3.84 / 6.08), edit 127.3 tok/s | K=2 pass 35-37.5 ms at 8k / 127k (= live), prefill 950 / 1,100 tok/s |
+| serve | pong, effort, Anthropic /v1/messages, tools 6/6 + 5/6, the 4 model ids | tools 6/6 |
+
+md5s differ from the live binaries only because each now compiles the other engine's shared kernels (dead code for it).
+Tags + branch cleanup + snapshot.sh defaults (both -> strata-ds4/; V4.1 build-x1018), AGENTS.md (backup
+.bak-20261019-main), the mab776-portainer skill (backup .bak-20261019-main) and the memory notes updated.
