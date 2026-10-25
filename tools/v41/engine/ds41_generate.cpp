@@ -1686,6 +1686,7 @@ int main(int argc, char ** argv) {
             } else {
                 // ---- the sequential chunk path (unchanged): one pass of up to NP tokens through every layer
                 const int m = std::min(NP, n - c0);
+                static const bool eng_ahead = std::getenv("STRATA_ENGRAM_AHEAD") && std::getenv("STRATA_ENGRAM_AHEAD")[0] == '1';
                 double t0 = now_ms();
                 if (!pipe.dense(0).begin(ids + c0, m, pos0 + c0)) { ferr = pipe.dense(0).last_error(); return false; }
                 if (eng_ahead && c0 + m < n) {   // mab776 STRATA_ENGRAM_AHEAD: as the batch path
@@ -2713,30 +2714,36 @@ int main(int argc, char ** argv) {
                 std::fprintf(stderr, "serve: keep-cache: not applicable (deferred VRAM %d, cache open %d)\n", (int) defer_vram,
                              (int) cache_open);
             if (!by_step && defer_vram && cache_open && dh >= 2) {
-                static const int keep_max = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
-                if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max && !mc.cpu_only) {
-                    const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
-                                        a.vram_margin_gib * 1073741824.0;
-                    std::string kerr;
-                    int64_t g = 0; bool shrink_ok = true;
-                    for (int st = 0; st < pipe.n_stages(); ++st) {
-                        std::string sk;
-                        const int64_t gs = pipe.tier(st).shrink_cache_for((int64_t) need, sk);
-                        if (gs < 0) { shrink_ok = false; kerr = sk.empty() ? kerr : sk; g = -1; break; }
-                        g += gs;
+                const double tk0 = now_ms();
+                std::string kerr;
+                if (keep_max > 0 && dh <= keep_max && Ds41MoeTier::keep_cache_on() && tier.shrink_cache(keep_free, kerr)) {
+                    kept = true;
+                    tier.set_keep_batch(true);   // mab776 STRATA_KEEP_CACHE: the batch keeps the cache, run_chunk copies resident experts
+                } else {
+                    if (keep_max > 0 && dh <= keep_max) std::fprintf(stderr, "keep-cache: shrink refused (%s) - released\n", kerr.c_str());
+                    static const int keep_max_x = std::getenv("STRATA_SERVE_KEEP_MAX") ? std::atoi(std::getenv("STRATA_SERVE_KEEP_MAX")) : 4096;
+                    if (Ds41MoeTier::keep_cache_mode() && dh <= keep_max_x && !mc.cpu_only) {   // xolotl STRATA_SERVE_KEEP_CACHE
+                        const double need = (4.3 * 1073741824.0 + 0.95 * 1048576.0 * (double) std::min(dh, PB)) +
+                                            a.vram_margin_gib * 1073741824.0;
+                        int64_t g = 0; bool shrink_ok = true;
+                        for (int st = 0; st < pipe.n_stages(); ++st) {
+                            std::string sk;
+                            const int64_t gs = pipe.tier(st).shrink_cache_for((int64_t) need, sk);
+                            if (gs < 0) { shrink_ok = false; kerr = sk.empty() ? kerr : sk; g = -1; break; }
+                            g += gs;
+                        }
+                        if (shrink_ok) {
+                            kept_x = true;
+                            int64_t stay = 0; for (int st = 0; st < pipe.n_stages(); ++st) stay += pipe.tier(st).resident();
+                            std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
+                                         dh, (long long) g, (long long) stay);
+                        } else if (!kerr.empty()) {
+                            std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
+                        }
                     }
-                    if (shrink_ok && g >= 0) {
-                        kept = true;
-                        int64_t stay = 0; for (int st = 0; st < pipe.n_stages(); ++st) stay += pipe.tier(st).resident();
-                        std::fprintf(stderr, "serve: cache kept for a %d-token batch (%lld tail slots out, %lld experts stay)\n",
-                                     dh, (long long) g, (long long) stay);
-                    } else if (!kerr.empty()) {
-                        std::fprintf(stderr, "serve: keep-cache: %s - releasing the cache\n", kerr.c_str());
-                    }
-                }
-                if (!kept) {
-                    for (int st = 0; st < pipe.n_stages(); ++st) pipe.tier(st).release_cache();
-                    cache_open = false;
+                    if (!kept_x) {
+                        for (int st = 0; st < pipe.n_stages(); ++st) pipe.tier(st).release_cache();
+                        cache_open = false;
 #if defined(DS41_HAVE_DSPARK)
                         // STRATA_SERVE_DSPARK_EVICT=N (s6, opt-in until measured; 0 = off): a batch of >= N new tokens also
                         // frees DSpark's ~2.9 GB of weights for its duration - the prompt batch is sized from free VRAM
@@ -3399,6 +3406,7 @@ int main(int argc, char ** argv) {
         }
         // mab776 STRATA_PARK: the live conversation is parked too when the engine ends (the server sends QUIT on
         // docker stop), so a restart continues it instead of reading it again
+        static constexpr uint64_t kDspMagic = 0x4b50534431345344ull;   // a parked blob's DSpark trailer ("DS41DSPK")
         if (park.on && snap_len >= park.min_tokens && (size_t) snap_len <= hist.size() && dense.snapshot_pos() == snap_len) {
             const double tq0 = now_ms();
             std::vector<uint8_t> blob;

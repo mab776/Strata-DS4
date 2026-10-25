@@ -8,10 +8,10 @@
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
-#include "ggml-backend-impl.h"   // ggml_backend_event::context (a cudaEvent_t on CUDA; mab776 STRATA_ASYNC_FINISH)
 #ifdef STRATA_ENABLE_CUDA
 #include <cuda_runtime.h>
 #endif
+#include "ggml-backend-impl.h"   // ggml_backend_event::context (a cudaEvent_t on CUDA; mab776 STRATA_ASYNC_FINISH)
 #ifdef DS41_HAVE_CUDA
 #include "ggml-cuda.h"
 #endif   // ggml_cgraph::uid (graph reuse)
@@ -62,7 +62,6 @@ struct Allo {
     bool failed = false;   // the last alloc failed: the gallocr holds a plan without a buffer (see alloc)
     std::map<const ggml_cgraph *, uint64_t> graph_epoch;
     std::set<const void *> compute_bufs;
-    bool failed = false;   // mab776: the last alloc failed (see alloc)
     ~Allo() { if (a) ggml_gallocr_free(a); }
     bool skips(const ggml_cgraph * g, bool reuse) const {   // mab776: alloc() would return at once (no planning)
         auto it = graph_epoch.find(g);
@@ -754,30 +753,40 @@ static double g_dprof[8] = {};   // build, alloc, compute, engram, readback, fin
 static double dprof_now() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 static int g_dprof_slot = -1;    // which of build/alloc/compute buckets compute() charges: set by the span callers
 
-
 bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv, bool async) {
     Allo & a = cached ? allo_dec : allo_pass;   // pv (STRATA_PV_GRAPHS): a kept n > 1 graph, allo_pass with reuse
-    // mab776 STRATA_DENSE_PROF: the allocator's share (a buffer that changes size = a cudaFree, which waits for the
-    // device) vs the graph launch
-    const bool pr = Ds41Dense::prof_on() && !cached;
-    const size_t sz0 = pr && a.a ? ggml_gallocr_get_buffer_size(a.a, 0) : 0;
-    const auto tp0 = std::chrono::steady_clock::now();
+    // DS41_GRAPH_OPS=1 (diagnostic): the op mix of the first 200 distinct one-token graphs (count per op; matmul weight MiB)
+    static const bool gops = std::getenv("DS41_GRAPH_OPS") != nullptr;
+    static std::set<const ggml_cgraph *> gops_seen;
+    if (gops && cached && gops_seen.size() < 200 && gops_seen.insert(gf).second) {
+        std::map<std::string, int> cnt;
+        double wmib = 0;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            std::string k = ggml_op_desc(t);
+            if (t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID) {
+                wmib += ggml_nbytes(t->src[0]) / 1048576.0;
+                k += std::string("(") + ggml_type_name(t->src[0]->type) + ")";
+            }
+            ++cnt[k];
+        }
+        std::string s;
+        for (const auto & kv : cnt) s += " " + kv.first + "x" + std::to_string(kv.second);
+        std::fprintf(stderr, "graph ops: %d nodes, %.1f MiB matmul weights:%s\n", ggml_graph_n_nodes(gf), wmib, s.c_str());
+    }
     const bool reuse = (cached || pv) && env_on("DS41_GRAPH_REUSE", true);
     if (async_pending && !a.skips(gf, reuse)) drain();   // mab776: a real allocation may free a buffer still in use
+    const double tq0 = g_dprof_on ? dprof_now() : 0;
     bool ok_alloc = a.alloc(gf, reuse);
-    if (pr) {
-        Ds41Dense::Prof & dp = Ds41Dense::prof();
-        dp.alloc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp0).count();
-        if (a.a && ggml_gallocr_get_buffer_size(a.a, 0) != sz0) ++dp.reallocs;
+    const double tq1 = g_dprof_on ? dprof_now() : 0;
+    if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
+        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
+        ok_alloc = a.alloc(gf, false);
     }
-    while (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more (each call frees one region)
-        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - the tier gave VRAM back, retrying\n");
-        ok_alloc = a.alloc(gf, reuse);   // (mab776: reuse = a new uid for the re-planned graph - ggml-cuda would replay the
-                                         // CUDA graph it captured for the old uid, with the old buffer's addresses)
-    }
+    if (Ds41Dense::prof_on() && !cached && a.a && !a.skips(gf, reuse)) ++Ds41Dense::prof().reallocs;   // mab776 STRATA_DENSE_PROF
     alloc_failed = !ok_alloc;
     if (!ok_alloc) { err = "graph allocation failed"; return false; }
-    const auto tl0 = std::chrono::steady_clock::now();
+    const double tl0 = g_dprof_on ? dprof_now() : 0;
     if (async) {   // mab776 STRATA_ASYNC_FINISH: queued only; the next synchronous graph (or drain) waits for it
         if (ggml_backend_graph_compute_async(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
         async_pending = true;
@@ -785,7 +794,7 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv, bool async
         if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { err = "graph compute failed"; return false; }
         async_pending = false;   // graph_compute synchronized the stream
     }
-    if (pr) Ds41Dense::prof().launch += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tl0).count();
+    if (Ds41Dense::prof_on()) Ds41Dense::prof().launch += dprof_now() - tl0;
     return true;
 }
 
@@ -817,9 +826,6 @@ static ggml_tensor * fake_quant(ggml_context * gc, ggml_tensor * x, Ds41Quant mo
 #endif
 }
 
-static bool kall16_on() {
-    static const bool on = [] { const char * e = std::getenv("STRATA_KALL16"); return e && e[0] == '1'; }();
-    return on;
 // A batch pass's attention core on the slabs (Impl::slab): every row's window K/V goes into its slot's ring region and
 // every query's SWA rows are gathered back in ONE op each; the compressor runs over every row (its state rows and
 // compressed / indexer rows written by slab row); the indexer ranks per slot (its own rows and visible count), and the
@@ -967,6 +973,11 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
     ggml_tensor * o = ggml_flash_attn_ext(gc, q4, k4, k4, m4, 1.0f / std::sqrt((float) DH), 0.0f, 0.0f);
     ggml_flash_attn_ext_add_sinks(o, im.BL(il, "attn_sinks.weight"));
     return ggml_reshape_3d(gc, o, DH, NH, n);
+}
+
+static bool kall16_on() {
+    static const bool on = [] { const char * e = std::getenv("STRATA_KALL16"); return e && e[0] == '1'; }();
+    return on;
 }
 
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
@@ -1688,6 +1699,9 @@ bool Ds41Dense::set_columns(int nc) {
 void Ds41Dense::Impl::reset_graphs() {
     Impl & im = *this;
     im.graphs.clear();
+    for (const auto & kv : im.mgraphs) im.allo_dec.graph_epoch.erase(kv.second);
+    im.mgraphs.clear();
+    if (im.gctx_m) { ggml_free(im.gctx_m); im.gctx_m = nullptr; }
     im.pv_clear();   // mab776 STRATA_PV_GRAPHS
     im.logits_out.clear();
     im.predict_out.clear();
@@ -1992,26 +2006,6 @@ bool Ds41Dense::init(const std::string & path, const Ds41DenseConfig & cfg, std:
             if (X.st_sc) { std::vector<float> v((size_t) (im.DH * 2), -1.0e30f); ggml_backend_tensor_set(X.st_sc, v.data(), 0, v.size() * 4); }
     im.stash_slot();   // slots[0] = slot 0's tensors too (slot_layer / slot_bytes read every slot the same way)
     if (im.rknob) set_route_select(env_rank("STRATA_RB_PROTECT"), env_rank("STRATA_RB_POOL"));   // all-zero knobs would protect everything
-    // inputs
-    ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
-    im.ictx = ggml_init(ipp);
-    auto I = [&](ggml_type t, int64_t a, int64_t b2 = 1) { return b2 == 1 ? ggml_new_tensor_1d(im.ictx, t, a) : ggml_new_tensor_2d(im.ictx, t, a, b2); };
-    im.neg_ramp = I(GGML_TYPE_F32, im.cmax[1] + 1);
-    im.blk_ramp = I(GGML_TYPE_F32, im.cmax[1] / im.CBS + 2);
-    if (kall16_on() && !im.cpu) {   // zeroed with ibuf below: rows past a pass's keys must stay finite (they are masked)
-        im.kall_m = (im.SWA + im.ITOP + 255) / 256 * 256;
-        im.kall16 = ggml_new_tensor_3d(im.ictx, GGML_TYPE_F16, im.DH, im.kall_m, im.S);
-    }
-    im.ibuf = ggml_backend_alloc_ctx_tensors(im.ictx, im.backend);
-    if (!im.ibuf) { err = "cannot allocate the inputs"; return false; }
-    ggml_backend_buffer_clear(im.ibuf, 0);
-    {
-        std::vector<float> v((size_t) im.neg_ramp->ne[0]);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = -(float) i;
-        ggml_backend_tensor_set(im.neg_ramp, v.data(), 0, v.size() * 4);
-        v.assign((size_t) im.blk_ramp->ne[0], 0);
-        for (size_t i = 0; i < v.size(); ++i) v[i] = (float) i;
-        ggml_backend_tensor_set(im.blk_ramp, v.data(), 0, v.size() * 4);
     // inputs (skipped on head_only: only the pass columns hold x / pre for the logits)
     if (!cfg.head_only) {
         ggml_init_params ipp = { ggml_tensor_overhead() * 64, nullptr, true };
@@ -2323,17 +2317,17 @@ bool Ds41Dense::begin(const int * tids, int n, int pos0) {
         auto it = im.graphs.find({ -1, 0, 0, 1 });
         if (it == im.graphs.end()) it = im.graphs.emplace(Impl::GKey { -1, 0, 0, 1 }, build_init(im, im.gctx, 1)).first;
         gf = it->second;
-    } else if (pv) {
-        gf = im.pv_graph(Impl::GKey { -1, 0, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_init(im, c, n); }).gf;
     } else if (mcached) {
         gf = pass_graph(im, Impl::GKey { -1, 0, 0, n }, [&](ggml_context * c) { return build_init(im, c, n); });
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { -1, 0, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_init(im, c, n); }).gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 256 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_init(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached, pv);
+    const bool ok = im.compute(gf, cached || mcached, pv);
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -2535,9 +2529,9 @@ bool Ds41Dense::begin_batch(const int * tids, int B, int pos0) {
 // PASS-LOCAL row maps (the pass's own rows / states sit at the end of the [ring | pass rows] they index, so they are
 // recomputed from the sub-batch's own position - upload_inputs laid them out for the whole batch, correct only at
 // col0 = 0).  Shared by attn_router_span and attn_router_span_kv.
+static bool upload_span_async(Ds41Dense::Impl & im, int col0, int n, size_t si);   // mab776 STRATA_SPAN_ASYNC (below)
 // A span is a whole sub-batch (col0 % S == 0) or, when a sub-batch's graph did not fit, a narrower piece of one
 // (attn_router_span): a piece at an unaligned column gets the pass_cap of its own end position.
-static bool upload_span_async(Ds41Dense::Impl & im, int col0, int n, size_t si);   // mab776 STRATA_SPAN_ASYNC (below)
 static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
     if (col0 < 0 || n < 1 || im.S < 1 || (int64_t) col0 + n > im.batch) { im.err = "bad span"; return false; }
     if (col0 % im.S == 0) {
@@ -2588,6 +2582,32 @@ static bool upload_span(Ds41Dense::Impl & im, int col0, int n) {
         std::vector<int32_t> ss((size_t) k);
         for (int64_t j = 0; j < k; ++j) ss[(size_t) j] = (int32_t) ((pbase + n - k + j) % 2);
         ggml_backend_tensor_set(im.i_sslot, ss.data(), 0, ss.size() * 4);
+    }
+    return true;
+}
+
+// attn_router_span / attn_router_span_kv run their span as pieces of at most span_max columns (the whole span until a
+// graph does not fit).  A piece whose GRAPH ALLOCATION fails - nothing has run, the state is untouched - is retried as
+// halves down to kMinSpan columns, and span_max keeps the width that fitted for the rest of the prompt, so a tight
+// card (a long context's graph, another process taking VRAM mid-prompt) makes the prompt a little slower instead of
+// failing it.  The pieces walk the columns in order, as the sub-batches do, so every position-indexed state (window
+// ring, compressor state, compressed rows, candidate blocks) advances exactly as before; the per-query arithmetic is
+// the same, but the dense matmuls see fewer columns, so a split prompt is not bit-identical to an unsplit one (it only
+// happens where the unsplit one would have failed).
+static constexpr int kMinSpan = 16;
+static bool span_kv_one(Ds41Dense::Impl & im, int il, int col0, int n);
+static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n);
+static bool run_spans(Ds41Dense::Impl & im, int il, int col0, int n, const std::function<bool(int, int)> & one) {
+    int64_t w = im.span_max > 0 ? std::min<int64_t>(im.span_max, n) : n;
+    for (int c = col0; c < col0 + n; ) {
+        const int m = (int) std::min<int64_t>(w, (int64_t) col0 + n - c);
+        im.alloc_failed = false;
+        if (one(c, m)) { c += m; continue; }
+        if (!im.alloc_failed || m <= kMinSpan) return false;
+        w = std::max(kMinSpan, m / 2);
+        im.span_max = w;
+        std::fprintf(stderr, "ds41_dense: layer %d: the graph of a %d-column span did not fit - %lld-column spans for the rest "
+                     "of this prompt\n", il, m, (long long) w);
     }
     return true;
 }
@@ -2644,32 +2664,6 @@ bool Ds41Dense::prof_on() {
 }
 Ds41Dense::Prof & Ds41Dense::prof() { static Prof p; return p; }
 
-// attn_router_span / attn_router_span_kv run their span as pieces of at most span_max columns (the whole span until a
-// graph does not fit).  A piece whose GRAPH ALLOCATION fails - nothing has run, the state is untouched - is retried as
-// halves down to kMinSpan columns, and span_max keeps the width that fitted for the rest of the prompt, so a tight
-// card (a long context's graph, another process taking VRAM mid-prompt) makes the prompt a little slower instead of
-// failing it.  The pieces walk the columns in order, as the sub-batches do, so every position-indexed state (window
-// ring, compressor state, compressed rows, candidate blocks) advances exactly as before; the per-query arithmetic is
-// the same, but the dense matmuls see fewer columns, so a split prompt is not bit-identical to an unsplit one (it only
-// happens where the unsplit one would have failed).
-static constexpr int kMinSpan = 16;
-static bool span_kv_one(Ds41Dense::Impl & im, int il, int col0, int n);
-static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n);
-static bool run_spans(Ds41Dense::Impl & im, int il, int col0, int n, const std::function<bool(int, int)> & one) {
-    int64_t w = im.span_max > 0 ? std::min<int64_t>(im.span_max, n) : n;
-    for (int c = col0; c < col0 + n; ) {
-        const int m = (int) std::min<int64_t>(w, (int64_t) col0 + n - c);
-        im.alloc_failed = false;
-        if (one(c, m)) { c += m; continue; }
-        if (!im.alloc_failed || m <= kMinSpan) return false;
-        w = std::max(kMinSpan, m / 2);
-        im.span_max = w;
-        std::fprintf(stderr, "ds41_dense: layer %d: the graph of a %d-column span did not fit - %lld-column spans for the rest "
-                     "of this prompt\n", il, m, (long long) w);
-    }
-    return true;
-}
-
 bool Ds41Dense::attn_router_span_kv(int il, int col0, int n) {
     Impl & im = *p_;
     return run_spans(im, il, col0, n, [&](int c, int m) { return span_kv_one(im, il, c, m); });
@@ -2712,22 +2706,25 @@ static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n) {
     double tp = g_dprof_on ? dprof_now() : 0;
     auto lap = [&](int i) { if (g_dprof_on) { const double t = dprof_now(); g_dprof[i] += t - tp; tp = t; } };
     if (!upload_span(im, col0, n)) return false;
-    lap(prof().upload);
+    if (g_dprof_on && dprof_now() - tp > 50) std::fprintf(stderr, "dense prof: slow upload_span layer %d col0 %d n %d: %.0f ms\n", il, col0, n, dprof_now() - tp);
+    lap(6);
+    if (Ds41Dense::prof_on()) ++Ds41Dense::prof().spans;   // mab776 STRATA_DENSE_PROF
     if (im.ly[(size_t) il].eslot >= 0 && !engram_ready(im)) return false;   // wait the pass's Engram reads here
-    lap(prof().engram);
+    lap(3);
     im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
     ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
     ggml_context * gc = ggml_init(p);
     ggml_cgraph * gf = build_attn(im, gc, il, n, col0);
-    lap(prof().build);
+    lap(0);
+    g_dprof_slot = 0;
     const bool ok = im.compute(gf, false);
-    lap(prof().compute);
-    if (pr) ++prof().spans;
+    g_dprof_slot = -1;
+    if (g_dprof_on) { tp = dprof_now(); g_dprof[7] += 1; }
     ggml_free(gc);
     if (!ok) return false;
     // the sub-batch's ids / wts / fn land at its own batch columns (token-major: token col0+t at t * NU / t * D)
     // mab776 STRATA_FN_DEV=1: the tier reads fn on the card (batch_fn_dev) - no 4 x n_embd bytes a column to the host
-    if (!(fn_dev_on() && !im.cpu))
+    if (!(Ds41Dense::fn_dev_on() && !im.cpu))
         ggml_backend_tensor_get_async(im.backend, im.o_fn, im.host_fn.data() + (size_t) col0 * im.D, (size_t) col0 * im.D * 4, (size_t) n * im.D * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_ids, im.host_ids.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
     ggml_backend_tensor_get_async(im.backend, im.o_wts, im.host_wts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
@@ -2736,7 +2733,8 @@ static bool span_attn_one(Ds41Dense::Impl & im, int il, int col0, int n) {
         ggml_backend_tensor_get_async(im.backend, im.o_xwts, im.host_xwts.data() + (size_t) col0 * im.NU, (size_t) col0 * im.NU * 4, (size_t) n * im.NU * 4);
         ggml_backend_synchronize(im.backend);
         meter_add(im, col0, n);
-    } else if (!(span_async_on() && !im.cpu)) ggml_backend_synchronize(im.backend);   // async: the caller's sync() before the tier
+    } else if (!(Ds41Dense::span_async_on() && !im.cpu)) ggml_backend_synchronize(im.backend);   // mab776 STRATA_SPAN_ASYNC: the caller's sync() before the tier
+    lap(4);
     return true;
 }
 
@@ -2796,8 +2794,9 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
     const int64_t cap = r ? im.pass_cap[r] : 0;
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1;
-    const bool mcached = !im.rows_mode && pass_graphs_on(n);
+    // a batch pass's graph reads its rows' slots: cached by the pass's layout (rows_sig), or built per pass
+    const bool cached = (n == 1 && !im.rows_mode) || (im.rows_mode && im.rows_sig != 0);
+    const bool mcached = im.rows_mode && im.rows_sig == 0 && pass_graphs_on(n);
     const bool pv = !cached && pv_graphs_on(n);   // mab776 STRATA_PV_GRAPHS
     if (cached) {
         const Impl::GKey key = im.rows_mode ? Impl::GKey { il, 8, im.rows_sig, n, -1 } : Impl::GKey { il, 1, cap, 1, im.cur_slot };
@@ -2807,17 +2806,17 @@ bool Ds41Dense::attn_router(int il, int * ids, float * wts, const float ** fn_ho
             it = im.graphs.emplace(key, build_attn(im, im.gctx, il, n)).first;
         }
         gf = it->second;
-    } else if (pv) {
-        gf = im.pv_graph(Impl::GKey { il, 1, cap, n }, [&](ggml_context * c, ggml_tensor **) { return build_attn(im, c, il, n); }).gf;
     } else if (mcached) {
         gf = pass_graph(im, Impl::GKey { il, 1, cap, n, im.cur_slot }, [&](ggml_context * c) { return build_attn(im, c, il, n); });
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { il, 1, cap, n }, [&](ggml_context * c, ggml_tensor **) { return build_attn(im, c, il, n); }).gf;
     } else {
         im.pf_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false));
         ggml_init_params p = { im.pf_meta.size(), im.pf_meta.data(), true };
         gc = ggml_init(p);
         gf = build_attn(im, gc, il, n);
     }
-    const bool ok = im.compute(gf, cached, pv);
+    const bool ok = im.compute(gf, cached || mcached, pv);
     if (gc) ggml_free(gc);
     if (!ok) return false;
     // one sync for the three readbacks (was one per tensor_get: 3 x 40 stream syncs per decode token)
@@ -2896,7 +2895,7 @@ bool Ds41Dense::finish(int il, const float * routed_sum, bool async) {
     if (routed_sum) { im.drain(); ggml_backend_tensor_set(im.routed, routed_sum, 0, (size_t) (im.D * n) * 4); }
     ggml_cgraph * gf = nullptr;
     ggml_context * gc = nullptr;
-    const bool cached = n == 1;
+    const bool cached = n == 1 || (im.rows_mode && im.rows_sig != 0);   // (a batch pass: by its width)
     const bool pv = !cached && pv_graphs_on(n);   // mab776 STRATA_PV_GRAPHS
     std::vector<uint8_t> meta;
     const bool mcached = !im.rows_mode && pass_graphs_on(n);
@@ -2908,17 +2907,17 @@ bool Ds41Dense::finish(int il, const float * routed_sum, bool async) {
             it = im.graphs.emplace(key, build_finish(im, im.gctx, n)).first;
         }
         gf = it->second;
-    } else if (pv) {
-        gf = im.pv_graph(Impl::GKey { -1, 2, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_finish(im, c, n); }).gf;
     } else if (mcached) {
         gf = pass_graph(im, Impl::GKey { -1, 2, 0, n }, [&](ggml_context * c) { return build_finish(im, c, n); });
+    } else if (pv) {
+        gf = im.pv_graph(Impl::GKey { -1, 2, 0, n }, [&](ggml_context * c, ggml_tensor **) { return build_finish(im, c, n); }).gf;
     } else {
         meta.resize(ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false));
         ggml_init_params p = { meta.size(), meta.data(), true };
         gc = ggml_init(p);
         gf = build_finish(im, gc, n);
     }
-    const bool ok = im.compute(gf, cached, pv, async);   // (the kernels are queued with their arguments: the graph may go)
+    const bool ok = im.compute(gf, cached || mcached, pv, async);   // (the kernels are queued with their arguments: the graph may go)
     if (gc) ggml_free(gc);
     return ok;
 }
@@ -3068,6 +3067,24 @@ bool Ds41Dense::restore() {
 
 int Ds41Dense::snapshot_pos() const { return p_->snap_pos; }
 
+std::vector<Ds41Dense::StateRegion> Ds41Dense::state_regions(int64_t positions) const {
+    const Impl & im = *p_;
+    std::vector<StateRegion> out;
+    if (positions < 1) return out;
+    for (const auto & L : im.ly) {
+        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
+            if (t) out.push_back({ t, 0, ggml_nbytes(t) });
+        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
+            if (!t) continue;
+            const int64_t rows = t->ne[1];
+            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
+            out.push_back({ t, 0, (size_t) n * t->nb[1] });
+            out.push_back({ t, (size_t) (rows - 1) * t->nb[1], t->nb[1] });   // the spare row (open compressor groups write it)
+        }
+    }
+    return out;
+}
+
 // mab776 STRATA_PARK: layer order; per layer raw_snap, [st_kv_snap, st_sc_snap], [comp rows, idxk rows]. A ratio-r kv
 // source holds n / r closed rows for n positions (an open ratio-2 group lives in st_kv / st_sc; its spare row is
 // write-only scratch - attention reads closed rows only).
@@ -3128,22 +3145,6 @@ void Ds41Dense::park_history(const int * ids, int n) {
     Impl & im = *p_;
     if (!im.engram.enabled()) return;
     for (int p = 0; p < n; ++p) im.engram.set_token(p, ids[p]);
-std::vector<Ds41Dense::StateRegion> Ds41Dense::state_regions(int64_t positions) const {
-    const Impl & im = *p_;
-    std::vector<StateRegion> out;
-    if (positions < 1) return out;
-    for (const auto & L : im.ly) {
-        for (ggml_tensor * t : { L.raw_snap, L.st_kv_snap, L.st_sc_snap })
-            if (t) out.push_back({ t, 0, ggml_nbytes(t) });
-        for (ggml_tensor * t : { L.comp, L.idxk }) {   // row r holds a position >= r (ratio 1 or 2): rows [0, n] cover n positions
-            if (!t) continue;
-            const int64_t rows = t->ne[1];
-            const int64_t n = std::min<int64_t>(rows - 1, positions + 1);
-            out.push_back({ t, 0, (size_t) n * t->nb[1] });
-            out.push_back({ t, (size_t) (rows - 1) * t->nb[1], t->nb[1] });   // the spare row (open compressor groups write it)
-        }
-    }
-    return out;
 }
 
 void Ds41Dense::rearm(int pos) { p_->snap_pos = pos; }
