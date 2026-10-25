@@ -1492,7 +1492,10 @@ if(STRATA_NATIVE_EXPERTS)
       # xolotl: the fork and GLM both added q2_k/q3_k/mxfp4 here for the SAME reason (MiMo/DS4 GSQ-RCO experts;
       # without them the dispatch cases in moe_mmq.cu fail to link).  Kept as the fork's two appends.
       list(APPEND _strata_mmq_cuda_types q4_k q5_k q5_1)
-      list(APPEND _strata_mmq_cuda_types q2_k q3_k mxfp4)   # fork: DS4 Q2_K / MiMo Q3_K, MXFP4 experts
+      # MXFP4 is not in this list: it is built in src/prefill/mmq_nvfp4_w4a8.cu (int8 activations, as NVFP4), since
+      # on sm_120a mmq.cuh compiles it as FP4 x FP4 and the prompt path feeds it Q8_1 rows (NaN logits), and on plain
+      # sm_120 ptxas refuses that instance ("mma with block scale not supported")
+      list(APPEND _strata_mmq_cuda_types q2_k q3_k)   # fork: DS4 Q2_K / MiMo Q3_K
       if(STRATA_Q6K_EXPERTS OR STRATA_HIP_GFX906)   # UD-Q6_K_XL gate/up (docs/UNSLOTH_Q6.md),
         list(APPEND _strata_mmq_cuda_types q6_k)    #   and gfx906: moe_mmq.cu calls it under __HIPCC__
       endif()
@@ -1663,6 +1666,11 @@ if(STRATA_NATIVE_EXPERTS)
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    # moe_mmq.cu includes the generated strata/prefill/mmq_types.inc - the CUDA branch generates it, HIP did not
+    # (issue #34): the same generator over this branch's type list, into generated/ as the CUDA branch does
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/mmq_types.cmake)
+    strata_gen_mmq_types(${CMAKE_CURRENT_BINARY_DIR}/generated/strata/prefill/mmq_types.inc "${_strata_mmq_types}")
+    target_include_directories(strata_mmq PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
@@ -1739,7 +1747,9 @@ if(STRATA_NATIVE_EXPERTS)
       # q4_0/q4_0 and q4_0/q4_1: a plain llama-quantize Q4_0 file (bartowski's Qwen3.8-Flash-Next-Q4_0: gate/up Q4_0,
       # down Q4_0 on 42 layers and Q4_1 on 6)
       # q6_K/q8_0: Unsloth UD-Q6_K_XL gate/up Q6_K with Q8_0 down (docs/UNSLOTH_Q6.md). Layer 2 is q8_0/q8_0, already listed.
-      set(_strata_parity_pairs q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
+      # mxfp4/mxfp4: Qwen3.8-Flash-Next-MXFP4 (every projection MXFP4)
+      set(_strata_parity_pairs q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1
+          mxfp4/mxfp4)
       if(STRATA_Q6K_EXPERTS)
         list(APPEND _strata_parity_pairs q6_K/q8_0)
       else()   # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run

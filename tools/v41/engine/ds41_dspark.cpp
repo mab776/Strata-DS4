@@ -1,5 +1,6 @@
 // tools/v41/engine/ds41_dspark.cpp - see ds41_dspark.hpp.  Line references are to DeepSeek's inference/model.py
 // (DSparkBlock / DSparkAttention / forward_embed / forward_head ~1021-1160, Block ~907-995, MoE / Gate ~792-905).
+#include "ds41_embd.hpp"
 #include "ds41_dspark.hpp"
 
 #include "ds41_geometry.hpp"
@@ -7,7 +8,12 @@
 
 #include "ggml-alloc.h"
 
+#ifdef STRATA_ENABLE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -35,7 +41,8 @@ struct Ds41DSpark::Impl {
     ggml_context * wctx = nullptr;
     ggml_backend_buffer_t wbuf = nullptr;
     std::map<std::string, ggml_tensor *> w;
-    const uint8_t * embd = nullptr;    // trunk token_embd F16 rows on the mmap
+    const uint8_t * embd = nullptr;    // trunk token_embd rows on the mmap (embd_type: F16 ours, Q5_K ISTA's)
+    int embd_type = GGML_TYPE_F16;
     size_t wbytes = 0;
     // state: per block window ring [DH, WIN]; inputs
     ggml_context * sctx = nullptr;
@@ -61,7 +68,9 @@ struct Ds41DSpark::Impl {
     std::pair<int, bool> last_key { -1, false };   ///< the graph ga was last planned for
     double ms = 0;
 
+    std::thread stash_th;              ///< STRATA_DSPARK_STASH: the first load's copy to the host (joined before wbuf goes)
     ~Impl() {
+        if (stash_th.joinable()) stash_th.join();
         if (const char * cf = std::getenv("STRATA_DSPARK_COUNT"); cf && !counts.empty()) {
             if (FILE * f = std::fopen(cf, "w")) {
                 for (auto & r : counts) { for (size_t i = 0; i < r.size(); ++i) std::fprintf(f, "%s%lld", i ? " " : "", (long long) r[i]); std::fputc('\n', f); }
@@ -102,7 +111,8 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     const TensorInfo * out = main->find("output.weight", &si);
     const TensorInfo * te = main->find("token_embd.weight");
     if (!out || !te) { e = "the trunk GGUF lacks output.weight / token_embd.weight"; return false; }
-    if (te->type != GGML_TYPE_F16) { e = "token_embd must be F16"; return false; }
+    if (!strata::v41::ds41_embd_type_ok((int) te->type)) { e = "token_embd type has no row reader"; return false; }
+    embd_type = (int) te->type;
     if (!cfg.shared_head) src.push_back({ main.get(), out });
     // STRATA_DSPARK_EXP_TYPE=<ggml type name> (q4_K, q3_K, q2_K, iq4_xs, ...): the routed experts
     // (mtp.*.ffn.experts.w1/w2/w3, MXFP4 in the sidecar) are requantized ON LOAD (dequantize -> quantize, CPU threads).
@@ -167,7 +177,60 @@ bool Ds41DSpark::Impl::load(std::string & e) {
     }
     wbuf = ggml_backend_alloc_ctx_tensors_from_buft(wctx, ggml_backend_get_default_buffer_type(be));
     if (!wbuf) { e = "cannot allocate the DSpark weights on the backend"; return false; }
-    for (auto & s : src) {
+    // STRATA_DSPARK_STASH=1 (llm-server): STRATA_SERVE_DSPARK_EVICT frees the drafter for every long prompt and the
+    // next open_cache() loads it again - re-reading the 5.7 GB sidecar and converting (3.9 s with the prefault, 8.4 s
+    // without).  The loaded buffer is kept in host memory (~2.9 GB) once; a re-created drafter with the same sources
+    // and settings copies it back.  Same bytes as a load.
+    struct Stash { std::string key; std::vector<uint8_t> bytes; };
+    static Stash stash;
+    const bool use_stash = std::getenv("STRATA_DSPARK_STASH") && std::getenv("STRATA_DSPARK_STASH")[0] == '1';
+    const uint8_t * wbase = (const uint8_t *) ggml_backend_buffer_get_base(wbuf);
+    const size_t wsize = ggml_backend_buffer_get_size(wbuf);
+    std::string skey;
+    if (use_stash) {
+        skey = side->shard(0).path() + "|" + main->shard(0).path() + "|" + std::to_string(wsize);
+        for (const char * k : { "STRATA_DSPARK_KEEP", "STRATA_DSPARK_EXP_TYPE", "STRATA_DSPARK_OWN_HEAD" })
+            skey += std::string("|") + (std::getenv(k) ? std::getenv(k) : "");
+    }
+    bool restored = false;
+    if (use_stash && stash.key == skey && stash.bytes.size() == wsize) {
+        for (auto & s : src) {
+            ggml_tensor * t = w[s.second->name];
+            const size_t off = (size_t) ((const uint8_t *) t->data - wbase);
+            ggml_backend_tensor_set(t, stash.bytes.data() + off, 0, ggml_nbytes(t));
+            wbytes += ggml_nbytes(t);
+        }
+        restored = true;
+    }
+    // STRATA_DSPARK_PREFAULT=1 (llm-server): the loop below reads every source through the mmap, one page fault at a
+    // time.  With the sidecar out of the page cache (a 72 GiB arena; STRATA_SERVE_DSPARK_EVICT re-creates DSpark for
+    // every long prompt) that is ~0.35 GB/s from ZFS: 8.4 s a prompt vs 1.9 s cached.  Touch the pages on 16 threads
+    // first, 64 MiB at a time, so the faults overlap.
+    if (const char * pf = std::getenv("STRATA_DSPARK_PREFAULT"); !restored && pf && pf[0] == '1') {
+        std::vector<std::pair<const uint8_t *, size_t>> spans;
+        for (auto & s : src) {
+            size_t sh = 0;
+            s.first->find(s.second->name, &sh);
+            const auto * d = (const uint8_t *) s.first->shard(sh).tensor_data(*s.second);
+            size_t n = (size_t) ggml_type_size((ggml_type) s.second->type);
+            int64_t el = 1;
+            for (auto x : s.second->shape) el *= (int64_t) x;
+            n = (size_t) (el / ggml_blck_size((ggml_type) s.second->type)) * n;
+            for (size_t o = 0; o < n; o += (size_t) 64 << 20) spans.emplace_back(d + o, std::min(n - o, (size_t) 64 << 20));
+        }
+        std::atomic<size_t> next { 0 };
+        std::atomic<uint64_t> sink { 0 };
+        std::vector<std::thread> th;
+        for (int i = 0; i < 16; ++i)
+            th.emplace_back([&]() {
+                uint64_t acc = 0;
+                for (size_t k; (k = next.fetch_add(1)) < spans.size();)
+                    for (size_t o = 0; o < spans[k].second; o += 4096) acc += spans[k].first[o];
+                sink.fetch_add(acc);
+            });
+        for (auto & x : th) x.join();
+    }
+    for (auto & s : (restored ? decltype(src) {} : src)) {
         const GgufModel & m = *s.first;
         size_t sh = 0;
         m.find(s.second->name, &sh);
@@ -214,9 +277,33 @@ bool Ds41DSpark::Impl::load(std::string & e) {
         }
         wbytes += ggml_nbytes(t);
     }
+    if (use_stash && !restored) {
+        // the first load: keep its bytes for the next re-creation.  On a thread: the 2.9 GB copy into fresh host pages
+        // took 3.7 s on the first prompt's critical path.  A re-creation only follows this drafter's destruction, which
+        // joins the thread, so the stash is complete whenever it is read.
+        std::vector<std::pair<ggml_tensor *, size_t>> ts;
+        for (auto & s : src) {
+            ggml_tensor * t = w[s.second->name];
+            ts.emplace_back(t, (size_t) ((const uint8_t *) t->data - wbase));
+        }
+        stash.key.clear();
+        stash_th = std::thread([ts = std::move(ts), skey, wsize]() {
+            std::vector<uint8_t> b(wsize);
+            for (const auto & x : ts) ggml_backend_tensor_get(x.first, b.data() + x.second, 0, ggml_nbytes(x.first));
+            stash.bytes = std::move(b);
+            stash.key = skey;
+        });
+    }
     if (cfg.shared_head) {
         const ggml_tensor * h = cfg.shared_head;
         if (h->ne[0] != (int64_t) out->shape[0] || h->ne[1] != (int64_t) out->shape[1]) { e = "shared_head: shape differs from output.weight"; return false; }
+        if (!h->buffer) { e = "shared_head: weight has no device buffer"; return false; }
+        const ggml_backend_buffer_type_t head_buft = ggml_backend_buffer_get_type(h->buffer);
+        const ggml_backend_buffer_type_t dspark_buft = ggml_backend_get_default_buffer_type(be);
+        if (head_buft != dspark_buft) {
+            e = "shared_head is not on the DSpark backend (use ds41_head_dense's backend for layer-split)";
+            return false;
+        }
         w["output.weight"] = cfg.shared_head;
     }
     size_t se = 0;
@@ -456,6 +543,9 @@ Ds41DSpark::Impl::G & Ds41DSpark::Impl::graph(int k, bool draft) {
 bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int * ids, float * conf) {
     Impl & im = *p_;
     if (k < 1 || k > im.KM) { im.err = "DSpark step: k out of range"; return false; }
+#ifdef STRATA_ENABLE_CUDA
+    if (im.cfg.cuda_device >= 0) cudaSetDevice(im.cfg.cuda_device);
+#endif
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> mp(pos, pos + k), ms((size_t) k);
     for (int i = 0; i < k; ++i) { ms[(size_t) i] = pos[i] % (int) WIN; im.filled[(size_t) ms[(size_t) i]] = pos[i]; }
@@ -467,11 +557,11 @@ bool Ds41DSpark::step(const float * mh, const int * pos, int k, int bonus, int *
     const bool draft = bonus >= 0;
     if (draft) {
         const int p = pos[k - 1];
-        // embeddings of [bonus, noise x4] (trunk token_embd, F16 rows)
+        // embeddings of [bonus, noise x4] (trunk token_embd rows, ds41_embd_row: F16 or a quant type)
         std::vector<float> emb((size_t) (im.D * im.BS));
         for (int64_t t = 0; t < im.BS; ++t) {
             const int id = t == 0 ? bonus : im.cfg.noise_id;
-            ggml_fp16_to_fp32_row((const ggml_fp16_t *) (im.embd + (size_t) id * (size_t) im.D * 2), emb.data() + (size_t) (t * im.D), im.D);
+            strata::v41::ds41_embd_row(im.embd, im.embd_type, im.D, id, emb.data() + (size_t) (t * im.D));
         }
         std::vector<int32_t> bp((size_t) im.BS);
         for (int64_t t = 0; t < im.BS; ++t) bp[(size_t) t] = p + 1 + (int) t;

@@ -42,6 +42,7 @@ struct Ds41DenseConfig {
     /// Directories holding the HF shards with the Engram tables (model.safetensors.index.json in the first).
     /// Empty = no Engram (its add is skipped: a debugging mode, the model is then not the model).
     std::vector<std::string> engram_dirs;
+    std::string engram_hot;             ///< hot-set pack (ds41_engram_hot pack); "" = STRATA_ENGRAM_HOT / none
     int     engram_threads = 32;        ///< parallel row reads (the disk's queue depth; cold peaks at 32-64)
     /// KV caches (window ring, compressed rows, indexer keys) element type: GGML_TYPE_F32 / BF16, or -1 = auto: BF16
     /// with act_quant (every cached value is then an FP8/FP4 grid point times a power-of-two / E4M3 scale: <= 7
@@ -57,6 +58,21 @@ struct Ds41DenseConfig {
     /// them back after it (the prompt_batch columns are ~2.6 GiB at 8192 - expert slots while decoding).
     bool    elastic_cols = false;
     bool    vision = false;            ///< opt-in image embeddings, VL routing and Engram masking
+
+    /// Batch slots (--batch-slots N): conversation states held at once, each of the full ctx_max - its window rings,
+    /// ratio-2 compressor states, compressed KV + indexer keys, snapshot, park and Engram history.  Slot 0 is the one
+    /// a single-slot engine has always had (n_slots = 1 = the engine as before, byte for byte).  Every single-sequence
+    /// call works on the BOUND slot (bind_slot); begin_rows() runs rows of several slots in one pass.
+    int     n_slots = 1;
+    int64_t layer_lo = 0;   ///< layer split: first layer this instance runs (inclusive)
+    int64_t layer_hi = -1;  ///< exclusive end; -1 = all layers in the file
+    /// Tail stage with layer_hi == n_layer: skip output_norm / output.weight (they live on head_device).
+    bool omit_output_head = false;
+    /// Logits-only instance: output_norm + output.weight and a minimal x/pre state (no transformer layers).
+    bool head_only = false;
+    int cuda_device = -1;   ///< CUDA ordinal (for peer copies); -1 = unknown
+    /// Layers below layer_lo whose KV / indexer state is copied from the previous pipeline stage at handoff.
+    std::vector<int64_t> shadow_layers;
 };
 
 class Ds41Dense {
@@ -85,6 +101,33 @@ public:
     /// Start a pass: tokens tids[0..n) at positions pos0.., n <= max_pass.  Embeddings + Engram rows (the hash
     /// needs the 3 tokens before pos0: the history is kept by position, so a re-decoded position overwrites it).
     bool begin(const int * tids, int n, int pos0);
+
+    // ---- batch slots (see Ds41DenseConfig::n_slots and docs/BATCHING.md)
+    int n_slots() const;
+    /// The bound slot: begin / begin_batch / spans / snapshot / restore / park / unpark / rearm / state_regions /
+    /// pool_regions / set_engram_history all act on its state.  0 at init.
+    int slot() const;
+    /// Bind slot s (0 <= s < n_slots).  O(1): pointers only, no device work; the decode graphs of every slot stay
+    /// cached (keyed by slot).  Call between passes, never inside one.
+    bool bind_slot(int s);
+    /// Exchange two slots' whole state (device tensors, snapshot, park, Engram history) - O(1), no copy: a
+    /// conversation moves to another slot id.  The bound slot id stays bound (it now holds the other state).
+    bool swap_slots(int a, int b);
+    /// Device bytes one slot's state takes (rings + snapshot rings + compressor states + compressed KV + indexer keys).
+    size_t slot_bytes() const;
+    /// One row of a batch pass: token `tid` at position `pos` of slot `slot`'s conversation.
+    struct Row { int slot = 0; int pos = 0; int tid = 0; };
+    /// The most rows a batch pass takes (= Ds41MoeTier::kMaxMulti: one tier call per layer).
+    static constexpr int kMaxRows = 16;
+    /// Start a batch pass over rows of several slots: rows are grouped by slot (a slot's rows contiguous, at
+    /// consecutive ascending positions; one slot per group), n <= kMaxRows and n <= the state columns.  A slot may
+    /// carry one row (a decode step) or several (a piece of its prompt, or a verify).  Text only (no image rows).
+    /// Then attn_router / predict_multi / finish / logits / read_state run as for a pass of n tokens: row i is pass
+    /// column i.  Every slot's own window ring / compressor state / compressed rows / Engram history advance exactly
+    /// as a solo pass of its rows would advance them; the numbers differ from a solo pass only by the row-batched
+    /// matmuls (the same model, not the same bits).  The bound slot does not change.
+    bool begin_rows(const Row * rows, int n);
+
     /// Layer-major prompt batch (cfg.prompt_batch > 0): the whole batch's inputs are prepared once - embeddings,
     /// positions, window / compressed / indexer index maps, Engram rows and the initial x/pre state - into the state
     /// tensors' columns 0..B-1; then attn_router_span / finish_span walk layer il's sub-batches in order.  B <=
@@ -142,6 +185,13 @@ public:
     /// Called when a graph's buffer cannot be allocated; return true if it freed device memory (the allocation is
     /// then retried, and the hook called again while it fails).  E.g. the expert tier's prestage region.
     void set_oom_hook(std::function<bool()> hook);
+    /// The pass-graph buffer (bytes) the widest span graph of a layer-major batch needs when its sub-batch of n columns
+    /// ends at position pos_end: every layer kind's attention graph planned by a throwaway allocator (nothing is
+    /// allocated), memoized on the visible compressed rows.  It grows with the context (the indexer's rows x queries).
+    size_t span_graph_bytes(int pos_end, int n);
+    /// Forget a narrowed span width: after a sub-batch's graph did not fit, attn_router_span keeps running narrower
+    /// spans for the rest of the prompt; release_pass() or this resets it (the serve loop calls it per prompt).
+    void reset_span_width();
     /// Selection-only routing bias for layer il (n_expert floats): added to the top-k score, not to the mixing weights.
     /// Soft pruning (-penalty on cold experts) / cache-aware routing (+bonus on VRAM-resident ones).  Default 0.
     void set_route_bias(int il, const float * bias);
@@ -186,6 +236,9 @@ public:
     /// snapshot_pos()).  Positions past a rewind point are overwritten when decoded again (rows past a query's
     /// visible count are never attended).
     bool snapshot(int pos);
+    /// VRAM held by this half, by owner (weights on the device, KV state, columns, inputs, both graph allocators):
+    /// one line for STRATA_VRAM_TRACE.
+    std::string vram_ledger() const;
     bool restore();
     int snapshot_pos() const;
     /// mab776 STRATA_PARK (conversation parking): the state of a conversation at its snapshot point `n` as one blob -
@@ -196,6 +249,33 @@ public:
     bool park_save(int n, std::vector<uint8_t> & out);
     bool park_load(int n, const uint8_t * in, size_t bytes);
     void park_history(const int * ids, int n);
+    /// Layer split: only run and retain KV for layers in [layer_lo, layer_hi).  head/logits require layer_hi == n_layer().
+    void set_layer_range(int64_t layer_lo, int64_t layer_hi);
+    int64_t layer_lo() const;
+    int64_t layer_hi() const;
+    bool owns_head() const;
+    /// Current pass width / start position (set by begin / begin_batch / begin_*_continued).
+    int pass_size() const;
+    int pass_pos0() const;
+    /// After a pipeline handoff: mirror the source pass layout so logits() row checks match (head-only and trunk).
+    bool set_pass_layout(int n, int pos0);
+    /// PCIe handoff between pipeline stages: per-column x_state [D,HC] then pre_state [HC], column-major (n columns).
+    size_t handoff_bytes_per_column() const;
+    bool export_handoff(int col0, int n, float * dst) const;
+    bool import_handoff(int col0, int n, const float * src);
+    /// Copy handoff columns from `src`: CUDA peer when available, else explicit pinned-host staging on `cuda_stream`.
+    bool import_handoff_from(const Ds41Dense & src, int src_cuda_device, int dst_cuda_device, int col0, int n, void * cuda_stream,
+                             std::vector<float> & pinned_host);
+    /// Copy persistent / per-column layer state for a dependency layer from `src` (pipeline handoff).
+    bool import_layer_cache_from(const Ds41Dense & src, int64_t global_layer, int col0, int n);
+    bool import_cand_from(const Ds41Dense & src, int col0, int n);
+    /// begin() without the embedding init graph; state columns must already hold the handoff (import_handoff).
+    bool begin_continued(const int * tids, int n, int pos0);
+    /// Layer-major batch after import_handoff: same span_cap / batch fields as begin_batch, no init graph.
+    bool begin_batch_continued(const int * tids, int B, int pos0);
+    /// Full dense+KV image for conversation parking (positions [0, positions)).
+    bool capture_conversation(int64_t positions, std::vector<uint8_t> & out) const;
+    bool restore_conversation(const std::vector<uint8_t> & in);
     /// Serve: keep a conversation through an UNRELATED request.  An unrelated request writes its own positions from 0, so
     /// it overwrites the start of every position-indexed cache (compressed KV, indexer keys) and the snapshot rings.
     /// park(n) copies the snapshot rings + the first n positions' rows of those caches (and their spare rows) to host
@@ -205,6 +285,31 @@ public:
     bool unpark();
     void drop_park();
     bool parked() const;
+    /// A conversation's reusable device state at its snapshot, as regions of the device tensors: the snapshot rings
+    /// (window K/V, ratio-2 compressor state) + rows [0, positions] of every compressed-KV / indexer-key cache and their
+    /// spare rows - exactly what park() copies.  A conversation pool saves them right after snapshot(); writing them
+    /// back and rearm(pos) + restore() resumes that conversation at pos.
+    struct StateRegion { ggml_tensor * t; size_t off, bytes; };
+    std::vector<StateRegion> state_regions(int64_t positions) const;
+    /// The snapshot tensors now hold position `pos`'s state (a pool wrote them): restore() resumes there.
+    void rearm(int pos);
+    /// Engram history: the n-gram hash of a pass's first positions reads the tokens before it from the history, which
+    /// is kept BY POSITION - another request that wrote those positions since leaves its own tokens there.  Rewrite
+    /// [pos0, pos0 + n) with tids (DEAD where dead[i] != 0: an image position).  A no-op without Engram.
+    void set_engram_history(int64_t pos0, int n, const int * tids, const uint8_t * dead);
+    /// Conversation pool (ds41_conv_pool, ds41_conv_pool_dense.hpp): where a conversation's device state at a turn
+    /// boundary lives.  `streams`: the position-indexed caches (compressed KV + indexer keys of every kv source layer;
+    /// row r holds positions [r * ratio, (r + 1) * ratio), `rows` = cmax, the spare row excluded).  `regions`: the window
+    /// rings and the ratio-2 compressor states - the *_snap copies (snap = true: what snapshot() / park() keep) or the
+    /// live ones.  Pointers into the state buffer (device memory on CUDA); the sizes never change after init.
+    struct PoolRegion {
+        std::string name;
+        void * data = nullptr;
+        size_t row_bytes = 0, bytes = 0;
+        int64_t rows = 0;
+        int ratio = 0;
+    };
+    void pool_regions(bool snap, std::vector<PoolRegion> & streams, std::vector<PoolRegion> & regions) const;
     /// Debug / gate taps: the hc state after the last finish (n * hc * n_embd floats, token-major) and the pre mix.
     bool read_state(std::vector<float> & x, std::vector<float> & pre);
     /// The hc state of state columns [c0, c0 + n) (token-major, n * hc * n_embd floats) - a layer-major batch's columns

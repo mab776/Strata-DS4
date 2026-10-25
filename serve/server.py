@@ -360,6 +360,12 @@ class EngineStuck(RuntimeError):
     reporting its GPU and RAM as given back."""
 
 
+class VisionUnavailable(RuntimeError):
+    """The image encoder did not start (it exited, answered something other than READY, or said nothing in time) for a
+    request with a picture: a 503 that says why, instead of an exception that ends the handler and drops the client's
+    connection without an answer.  The next picture tries to start it again; text requests are not affected."""
+
+
 class GpuBusy(RuntimeError):
     """The model is unloaded and the GPU has less free VRAM than min_free_vram_mib: something else (a game, another
     model server) is using it, so the engine is not started into the little that is left.  `retry_after`: seconds
@@ -1258,7 +1264,7 @@ class StrataEngine:
             if isinstance(lk, int) and not isinstance(lk, bool) and 0 <= lk <= 7:
                 keys += f" lookup={lk}"
             # the DeepSeek-V4.1 engine's decode biases for this request (0 and 0 = exact routing); other engines ignore them
-            for k in ("route_bias", "route_bias_file"):
+            for k in ("route_bias", "route_bias_file", "route_bias_remote"):
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 8.0:
                     keys += f" {k}={float(v)!r}"
@@ -2278,11 +2284,23 @@ def network_path(path: str) -> bool:
     return p.startswith("\\\\") or p.startswith("\\??\\")
 
 
-def vision_start_error(line: str, log=None) -> str:
+def log_size(log) -> int | None:
+    """The size of the stderr file `log` (an open file or None) now: where this encoder start's own lines begin."""
+    try:
+        name = getattr(log, "name", None)
+        return os.path.getsize(name) if name else None
+    except (OSError, TypeError):
+        return None
+
+
+def vision_start_error(line: str, log=None, since: int | None = None) -> str:
     """The message when the image encoder answered something other than READY.  #1445: a card in the Exclusive_Process
     compute mode (or one another process holds) refuses the encoder's CUDA context with "busy or unavailable"; that
     cause is named instead of leaving the user the first line of a traceback.  `log` is the encoder's stderr file, whose
-    tail is searched too (the CUDA error is printed there)."""
+    tail is searched too (the CUDA error is printed there); `since`: the file's size when this encoder was started, so a
+    shared log's older lines (the engine's, an earlier start's) are not taken for this start's cause.
+    A GPU out of memory is named too: ggml aborts on the failed cudaMalloc, and its backtrace helper (gdb) writes
+    "[New LWP ...]" to the encoder's stdout, which used to be the whole message."""
     text = line.strip()
     tail = ""
     try:
@@ -2290,7 +2308,7 @@ def vision_start_error(line: str, log=None) -> str:
         if name:
             with open(name, "rb") as f:
                 f.seek(0, 2)
-                f.seek(max(0, f.tell() - 16384))
+                f.seek(max(0, f.tell() - 16384, since or 0))
                 tail = f.read().decode("utf-8", "replace")
     except (OSError, ValueError):
         pass
@@ -2300,7 +2318,32 @@ def vision_start_error(line: str, log=None) -> str:
                 "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
                 "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
                 "First line from the encoder: " + (text or "(none)"))
+    oom = next((s.strip() for s in (text + "\n" + tail).splitlines() if "out of memory" in s.lower()), None)
+    if oom is not None:
+        return ("the vision encoder did not start: the GPU ran out of memory while it loaded (" + oom[:200] + "). "
+                "The engine's expert cache holds the card's free VRAM: let the cache make room for the encoder "
+                "(\"vram_elastic\": true in the config, with a \"lazy\" or \"elastic\" vision section), raise "
+                "--vram-reserve-mib, or run the encoder on the CPU (\"gpu\": false in the vision section). "
+                "First line from the encoder: " + (text or "(none)"))
     return "the vision encoder did not start: " + text
+
+
+def on_demand_vision(cfg: dict, vcfg: dict) -> dict:
+    """The vision section `vcfg` with an on-demand mode the config cannot run turned off (the encoder then starts with
+    the model, before the engine sizes its expert cache around it).  Both modes start the encoder after the engine has
+    filled the card's free VRAM with experts, so on the GPU both need the elastic cache that makes room first:
+    upstream's "elastic" (Service._vision_up), and the local "lazy" (Service.start_lazy_vision), whose encoder found the
+    card full without it - its cudaMalloc failed and the first picture's request got no answer."""
+    elastic_cache = cfg.get("vram_elastic") is True or "--vram-elastic" in (cfg.get("args") or [])
+    if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
+        print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+              "encoder its VRAM): the encoder starts with the model instead", flush=True)
+        vcfg = {**vcfg, "elastic": False}
+    if vcfg.get("lazy") and vcfg.get("gpu") and not elastic_cache:
+        print('[strata] the vision section\'s "lazy" (on the GPU) needs "vram_elastic": true (the expert cache makes '
+              "room for the encoder before it starts): the encoder starts with the model instead", flush=True)
+        vcfg = {**vcfg, "lazy": False}
+    return vcfg
 
 
 class Vision:
@@ -2364,6 +2407,7 @@ class Vision:
 
     def _start(self):
         args, log, env = self.spawn
+        since = log_size(log)                           # this start's own lines in a shared log begin here
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
@@ -2373,7 +2417,7 @@ class Vision:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
         except RuntimeError as e:                       # silent for VISION_READY_S: it was ended, and it is not left half-started
             self.proc, self.stopped = None, True
-            raise RuntimeError(str(e)) from None
+            raise VisionUnavailable(str(e)) from None
         if not line.startswith("READY"):
             proc, self.proc = self.proc, None
             self.stopped = True
@@ -2382,7 +2426,7 @@ class Vision:
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
-            raise RuntimeError(vision_start_error(line, self.spawn[1]))
+            raise VisionUnavailable(vision_start_error(line, self.spawn[1], since))
         self.stopped = False
 
     def _readline(self, timeout: float, what: str) -> str:
@@ -3660,10 +3704,18 @@ class Service:
         v = self.vision
         if v is None or not getattr(v, "lazy_vision", False):
             return
-        elastic = hasattr(self.engine, "vram") and bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic", True))
+        def elastic() -> bool:
+            # asked when the encoder starts, not here: the engine's INFO (vram_elastic=0|1) is only there once it is
+            # loaded, and an engine that turned --vram-elastic off (a layer split, the helper caches) says 0
+            info = getattr(self.engine, "info", {}) or {}
+            return hasattr(self.engine, "vram") and bool(info.get("vram_elastic", True))
 
         def make_room():
-            if not elastic or not self.loaded():
+            if not self.loaded():
+                return
+            if not elastic():
+                print("[strata] lazy vision: the engine's expert cache cannot shrink (it runs without --vram-elastic); "
+                      "the encoder starts in the VRAM that is free now", flush=True)
                 return
             try:
                 out = self.engine.vram(reserve_mib)
@@ -3687,7 +3739,7 @@ class Service:
                     if not v.alive() or time.time() - v.last_used < idle_s:
                         continue
                     v.unload()
-                    out = self.engine.vram(self.vram_reserve) if elastic and self.loaded() else {}
+                    out = self.engine.vram(self.vram_reserve) if elastic() and self.loaded() else {}
                     print(f"[strata] lazy vision: encoder stopped after {idle_s:.0f} s idle; expert cache grown back "
                           f"({out.get('expert_slots')} slots)", flush=True)
                 except Exception as e:                  # the thread keeps running
@@ -5805,6 +5857,10 @@ def make_handler(svc: Service):
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}},
                            headers={"Retry-After": int(ra)} if ra else None)
+            except VisionUnavailable as e:                   # a picture's encoder did not start: a 503, no 400
+                print(f"[strata] 503: {e}", flush=True)
+                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
+                           else {"error": {"type": "server_error", "message": str(e)}})
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
                 # says so, with the traceback in the log, instead of a dropped connection - unless the answer began
@@ -6207,7 +6263,7 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             except ModelBusy as e:
                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
-            except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
+            except (GpuBusy, EngineStarting, EngineStuck, EngineDied, VisionUnavailable) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
             def check(text, finish):
@@ -6736,6 +6792,43 @@ def clean_shared_defaults(d) -> dict:
     return out
 
 
+def split_joined_args(cfg: dict) -> None:
+    """#2267: an engine option written as ONE element of the config's "args" - "--ple-io mmap" or "--ple-io=mmap" - reaches
+    the engine as a single argument ("unknown argument: --ple-io mmap"; the usual form is two elements, "--ple-io",
+    "mmap").  Recommend, never force: such an element is split into the flag and its value, and said at startup.  Only an
+    element that starts with a flag name (--letters-digits-dashes) followed by a space or "=" is touched, and never one
+    that sits in the value place of the flag before it."""
+    args = cfg.get("args")
+    if not isinstance(args, list):
+        return
+    out, changed = [], []
+    for a in args:
+        m = re.match(r"^(--[A-Za-z0-9][A-Za-z0-9-]*)(?:\s+|=)(\S.*)$", a) if isinstance(a, str) else None
+        prev = out[-1] if out else None
+        in_value_place = isinstance(prev, str) and re.match(r"^--[A-Za-z0-9][A-Za-z0-9-]*$", prev) is not None
+        if m is None or in_value_place:
+            out.append(a)
+            continue
+        out += [m.group(1), m.group(2).strip()]
+        changed.append(a)
+    if changed:
+        cfg["args"] = out
+        print("[strata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: split into the "
+              'flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
+
+
+def read_config(path) -> dict:
+    """The run config's JSON.  A mistake in it (a missing comma between two args, a trailing comma) is said with its
+    place in the file instead of a traceback (#2267: editing "args" by hand is where it happens)."""
+    text = Path(path).read_text(encoding="utf-8-sig")   # Notepad adds a BOM
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the commas "
+                         'between the entries of "args" (each option and each value is its own quoted entry, e.g. '
+                         '"--ple-io", "mmap",) and that no entry is followed by a comma at the end of a list.') from None
+
+
 def lift_reasoning_effort_arg(cfg: dict) -> None:
     """#1641: "--reasoning-effort high" in a config's "args" is meant for the thinking level, which is not an engine
     option (the engine stopped at the unknown flag).  It is the config's "reasoning_effort" (none, low, medium or high:
@@ -7001,7 +7094,8 @@ def main() -> int:
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
                          "[{\"gpus\": [0, 1]}, {\"gpus\": [2, 3]}])")
     a = ap.parse_args()
-    cfg = json.loads(Path(a.config).read_text(encoding="utf-8-sig")) if a.config else {}   # Notepad adds a BOM
+    cfg = read_config(a.config) if a.config else {}
+    split_joined_args(cfg)
     lift_reasoning_effort_arg(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
@@ -7016,8 +7110,12 @@ def main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
+    if not (tpath / "vocab.json").exists() and (tpath / "tokenizer" / "vocab.json").exists():
+        tpath = tpath / "tokenizer"    # the HF repos ship the files in tokenizer/ (Xolotl #14): point there, not one up
+        print(f"tokenizer: using {tpath}", file=sys.stderr)
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
-        ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
+        ap.error(f"the model's tokenizer is missing: {tpath} must directly hold vocab.json, merges.txt and "
+                 f"token_type.json (point the config's \"tokenizer\" at the folder that has them); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         # mab776: the pre-tokenizer + special ids the dir's tokenizer.json names (DeepSeek-V4: joyai-llm). Built as
@@ -7048,10 +7146,7 @@ def main() -> int:
             vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
-            if vcfg.get("elastic") is True and cfg.get("vram_elastic") is not True:
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
-                vcfg["elastic"] = False
+            vcfg = on_demand_vision(cfg, vcfg)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
         print("model unloaded; the first request loads it ..." if lazy else

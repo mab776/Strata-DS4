@@ -244,10 +244,13 @@ private:
     /// there is no twin fd or the bounce is too small (the caller then falls back to the buffered `read`).
     bool read_direct(uint64_t off, size_t n, uint8_t* dst, uint8_t* scratch, size_t scratch_bytes, int fd = -1) const;
     bool open_mirror(const char* path, std::string& err);
+    /// read_staged (whole blobs): does this mirrored blob come from the mirror?  mshare_ per mille, by a fixed hash.
+    bool mirror_pick(int64_t layer, int64_t expert) const;
     int mfd_ = -1;                        ///< the mirror (O_DIRECT), -1 = none
     std::vector<uint64_t> moff_;          ///< per (layer, expert): the blob's offset in the mirror, ~0 = not mirrored
     int64_t mirrored_ = 0;
     int mshare_ = 280;                    ///< per mille of a mirrored blob's parts read from the mirror
+    int mpshare_ = 280;                   ///< the same for read_part (decode misses) only
     /// read_part's aligned bounces (one per concurrent part, kept for the next call)
     uint8_t* take_bounce() const;
     void give_bounce(uint8_t* p) const;
@@ -257,6 +260,16 @@ private:
     std::string path_;
     int fd_ = -1;
     int dfd_ = -1;               ///< O_DIRECT twin of fd_ (-1 where the filesystem refused it)
+    /// A split GGUF (`-0000k-of-0000N`, ISTA-DASLab's 4 shards): every offset below carries its shard in the top bits
+    /// (off >> kShardShift; 0 = the first file, so a single-file GGUF's offsets are the plain file offsets) and
+    /// sfd_ / sdfd_ hold each shard's fds (fd_ / dfd_ = shard 0's).  A blob's three spans each lie in one tensor, so in
+    /// one shard; a span's sub-range (read_part) keeps its tag.
+    static constexpr int kShardShift = 44;
+    std::vector<int> sfd_, sdfd_;
+    bool direct_ok_ = false;     ///< every shard has its O_DIRECT twin
+    int sfd(uint64_t off) const { return sfd_[(size_t) (off >> kShardShift)]; }
+    int sdfd(uint64_t off) const { return sdfd_[(size_t) (off >> kShardShift)]; }
+    static uint64_t sloc(uint64_t off) { return off & ((1ull << kShardShift) - 1); }
     size_t scratch_ = 0;         ///< the aligned bounce one read_direct span needs
     Ds41MoeGeom g_;
     size_t max_ = 0;
@@ -321,6 +334,7 @@ struct Ds41MoeConfig {
     /// 52.9 s file wait is what this moves off the critical path.
     bool chunk_prefetch = true;
     double chunk_prefetch_gib = 0.0;
+    int cuda_device = 0;   ///< CUDA ordinal for this tier (layer split)
     /// REAP saliency (calibration only): every prompt chunk reads its experts' outputs back and accumulates, per
     /// (layer, expert), sum of routing weight x ||expert output||_2 and the token count (saliency_sum / saliency_count).
     bool saliency = false;
@@ -341,6 +355,12 @@ struct Ds41MoeConfig {
     /// mab776: GPU 1's static expert tier on this CUDA device (-1 = off; the engine sets it from --peer-device N or
     /// STRATA_GPU1=N).  See Gpu1 in ds41_moe.cpp.
     int gpu1_device = -1;
+    /// A second CUDA device (its index in this process) that holds a static set of experts and computes them itself:
+    /// the ranking right after the VRAM cache's head, up to `remote_gib` (0 = its free memory less
+    /// `remote_reserve_gib`), kept out of the arena.  -1 = off.
+    int remote_device = -1;
+    double remote_gib = 0.0;
+    double remote_reserve_gib = 1.5;
     uint64_t seed = 20261005;     ///< the synthetic arm's generator (unused by the tier itself)
 
     static constexpr int kPredW = 16;   ///< ranked predictions the caller passes to `prefetch`
@@ -371,6 +391,10 @@ struct Ds41MoeStats {
 
     void add(const Ds41MoeStats& o);
     int64_t lookups() const { return hits + cpu + pcie + skipped + gpu1; }
+    int64_t remote = 0;             ///< computed by the STRATA_DS41_REMOTE helper's GPU
+
+    void add(const Ds41MoeStats& o);
+    int64_t lookups() const { return hits + cpu + pcie + skipped + remote; }
 };
 
 /// The tier's private state, defined in ds4_moe.cpp.  It carries the CUDA members in a CUDA build and none in a
@@ -475,8 +499,15 @@ public:
     bool in_gpu1(int64_t layer, int64_t expert) const;
     int64_t gpu1_experts() const;
     double gpu1_gib() const;
-    /// Whether `expert` of `layer` is in the host arena (false in CPU-only mode and for the file tier).
+    /// Whether `expert` of `layer` is in the host arena or on the remote card - anywhere but the file tier (false in
+    /// CPU-only mode and for the file tier).
     bool in_arena(int64_t layer, int64_t expert) const;
+    /// Ds41MoeConfig::remote_device: whether the remote card holds `expert` of `layer`, and how many it holds.
+    bool in_remote(int64_t layer, int64_t expert) const;
+    int64_t remote_experts() const;
+    double remote_gib() const;
+    /// Whether the STRATA_DS41_REMOTE helper holds `expert` of `layer` (false without one).
+    bool remote_holds(int64_t layer, int64_t expert) const;
     /// `nt` (1..4) tokens of one layer at once - draft verification: `ids`/`w` are nt*top_k (token-major), `x` and
     /// `out` nt*n_embd.  Each distinct expert is read/fetched once and applied to every token that routed to it.
     bool run_multi(int64_t layer, int nt, const int32_t* ids, const float* w, const float* x, float* out);
@@ -497,6 +528,8 @@ public:
     void trace_mark(const float* v, int n);
     /// cudaProfilerStart / Stop (nsys --capture-range=cudaProfilerApi); a no-op without CUDA.
     static void profiler(bool on);
+    /// cudaDeviceSynchronize (STRATA_DEC_PROF=2: each stage's time includes its GPU work); a no-op without CUDA.
+    static void device_sync();
     /// A prompt chunk: `n` tokens (any count) of one layer, `ids`/`w` n*top_k token-major, `x`/`out` n*n_embd.  GPU
     /// tier: every expert on the card - resident from its slot, the rest streamed once per chunk (MiMo prefill;
     /// MIMO_CHUNK_STAGE_MIB sizes the two streaming halves, default 1024).  CPU tier: token by token.

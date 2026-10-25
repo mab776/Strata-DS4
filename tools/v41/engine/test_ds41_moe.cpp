@@ -11,6 +11,8 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -70,12 +72,15 @@ double rel(const std::vector<float> & a, const std::vector<float> & b) {
 }  // namespace
 
 int main(int argc, char ** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq]\n"); return 2; }
+    if (argc < 2) { std::fprintf(stderr, "usage: test_ds41_moe <file.gguf> [--layers 0,1] [--tokens 8] [--gpu] [--chunk N] [--chunk-mmq] [--multi N] [--remote N [--remote-gib G]]\n"); return 2; }
     std::string path = argv[1];
     int nchunk = 0;   // --chunk N: also N tokens at once through run_chunk (the prompt path), each row vs the reference
     std::vector<int> layers = { 0 };
     int ntok = 8;
     bool gpu = false, chunk_mmq = false;
+    int remote = -1, nmulti = 0;   // --remote N [--remote-gib G]: a second card holds experts after the VRAM head;
+    double remote_gib = 2.0;       // --multi N: N tokens at once through run_multi (the serve / verify path)
+    bool noref = false;            // --no-ref: the chunk pass is only timed (3 runs), not checked
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--layers" && i + 1 < argc) {
@@ -87,6 +92,10 @@ int main(int argc, char ** argv) {
         else if (a == "--gpu") gpu = true;
         else if (a == "--chunk" && i + 1 < argc) nchunk = std::atoi(argv[++i]);
         else if (a == "--chunk-mmq") chunk_mmq = true;   // the prompt path's MMQ (PTQ1_0 via its Q2_0 transcode)
+        else if (a == "--remote" && i + 1 < argc) remote = std::atoi(argv[++i]);
+        else if (a == "--remote-gib" && i + 1 < argc) remote_gib = std::atof(argv[++i]);
+        else if (a == "--multi" && i + 1 < argc) nmulti = std::atoi(argv[++i]);
+        else if (a == "--no-ref") noref = true;
     }
     Ds41FileBlobs src(path);
     std::string err;
@@ -104,13 +113,17 @@ int main(int argc, char ** argv) {
     cfg.arena_gib = 4.0;
     cfg.max_arena_gib = 4.0;
     cfg.pcie_frac = 0.5;
+    cfg.tier_batch_pcie = 0.5;   // run_multi too: half the arena misses go to the CPU pool
     cfg.pf_b = 0;
+    cfg.remote_device = remote;
+    cfg.remote_gib = remote_gib;
     if (!tier.init(g, &src, cfg, err)) { std::fprintf(stderr, "tier init: %s\n", err.c_str()); return 1; }
     if (gpu) {
         std::vector<std::pair<int32_t, int32_t>> ranked;
         for (int l : layers) for (int e = 0; e < g.n_experts; ++e) ranked.emplace_back(l, e);
         if (!tier.seed_from_ranked(ranked, err)) { std::fprintf(stderr, "seed: %s\n", err.c_str()); return 1; }
-        std::printf("tier %s: %lld resident, %lld arena\n", tier.mode(), (long long) tier.resident(), (long long) tier.arena_experts());
+        std::printf("tier %s: %lld resident, %lld remote, %lld arena\n", tier.mode(), (long long) tier.resident(),
+                    (long long) tier.remote_experts(), (long long) tier.arena_experts());
     }
     std::mt19937_64 rng(7);
     std::normal_distribution<float> nd(0.0f, 1.0f);
@@ -155,6 +168,40 @@ int main(int argc, char ** argv) {
             std::printf("  rel %.3e\n", r);
         }
     }
+    // ---- serve / verify path: N tokens per layer through run_multi (random picks over all experts)
+    for (int l : (nmulti > 0 ? layers : std::vector<int>{})) {
+        const int nm = std::min(nmulti, Ds41MoeTier::kMaxMulti);
+        std::vector<float> X((size_t) nm * D), W((size_t) nm * K), OUT((size_t) nm * D);
+        std::vector<int32_t> IDS((size_t) nm * K);
+        for (int rep = 0; rep < 8; ++rep) {
+            for (auto & v : X) v = nd(rng) * 0.3f;
+            for (int t = 0; t < nm; ++t)
+                for (int64_t k = 0; k < K; ++k) {
+                    int32_t e;
+                    do { e = (int32_t) (rng() % (uint64_t) g.n_experts); }
+                    while (std::find(IDS.begin() + (size_t) t * K, IDS.begin() + (size_t) t * K + k, e) != IDS.begin() + (size_t) t * K + k);
+                    IDS[(size_t) t * K + k] = e;
+                    W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
+                }
+            if (!tier.run_multi(l, nm, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_multi failed\n"); return 1; }
+            int nrem = 0;
+            for (int32_t e : IDS) nrem += tier.in_remote(l, e);
+            double mw = 0;
+            for (int t = 0; t < nm; ++t) {
+                std::vector<float> got(OUT.begin() + (size_t) t * D, OUT.begin() + (size_t) (t + 1) * D), want((size_t) D, 0.0f), one((size_t) D);
+                for (int64_t k = 0; k < K; ++k) {
+                    const int32_t e = IDS[(size_t) t * K + k];
+                    src.read(l, e, blob.data());
+                    ref_expert(g, g.cls(l, e), blob.data(), X.data() + (size_t) t * D, one.data());
+                    for (int64_t i = 0; i < D; ++i) want[(size_t) i] += W[(size_t) t * K + k] * one[(size_t) i];
+                }
+                mw = std::max(mw, rel(got, want));
+            }
+            worst = std::max(worst, mw);
+            fails += !(mw < 3e-2);
+            std::printf("%s L%d multi %d tokens (%d remote entries): worst rel %.3e\n", mw < 3e-2 ? "ok  " : "FAIL", l, nm, nrem, mw);
+        }
+    }
     // ---- prompt path: N tokens per layer through run_chunk (random picks over all experts: every class, mixed)
     for (int l : (nchunk > 0 ? layers : std::vector<int>{})) {
         std::vector<float> X((size_t) nchunk * D), W((size_t) nchunk * K), OUT((size_t) nchunk * D);
@@ -168,6 +215,17 @@ int main(int argc, char ** argv) {
                 IDS[(size_t) t * K + k] = e;
                 W[(size_t) t * K + k] = 0.1f + 0.4f * (float) (rng() % 1000) / 1000.0f;
             }
+        if (noref) {
+            for (int rep = 0; rep < 3; ++rep) {
+                const auto c0 = std::chrono::steady_clock::now();
+                if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count();
+                int nrem = 0;
+                for (int32_t e : IDS) nrem += tier.in_remote(l, e);
+                std::printf("time L%d chunk %d tokens (%d remote entries): %.1f ms\n", l, nchunk, nrem, ms);
+            }
+            continue;
+        }
         if (!tier.run_chunk(l, nchunk, IDS.data(), W.data(), X.data(), OUT.data())) { std::fprintf(stderr, "run_chunk failed\n"); return 1; }
         // mab776: TEST_CHUNK_TWICE=1 - the same chunk again (with STRATA_PROMPT_CACHE_GIB the file-tier experts now
         // come from the prompt cache): every output byte must match the first call
