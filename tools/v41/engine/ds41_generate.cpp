@@ -975,7 +975,8 @@ int main(int argc, char ** argv) {
                                : (bias_now && a.route_bias != 0.0f && !mc.cpu_only && resident_now(l, e)) ? a.route_bias
                                : (bias_now && a.route_bias_remote != 0.0f && tier.in_remote(l, e)) ? a.route_bias_remote
                                : (bias_now && a.route_bias_file != 0.0f && !resident_now(l, e) &&
-                                  !ds41_tier_for(pipe, (int) l).in_arena(l, e)) ? -a.route_bias_file : 0.0f;
+                                  !ds41_tier_for(pipe, (int) l).in_arena(l, e) &&
+                                  !ds41_tier_for(pipe, (int) l).in_gpu1(l, e)) ? -a.route_bias_file : 0.0f;   // (mab776: GPU 1 is not the file tier)
             for (int st = 0; st < pipe.n_stages(); ++st) {
                 if (l < pipe.layer_lo(st) || l >= pipe.layer_hi(st)) continue;
                 pipe.dense(st).set_route_bias((int) l, rb.data());
@@ -1289,7 +1290,7 @@ int main(int argc, char ** argv) {
                 // xolotl 76d16570 (with a route bias on, the call size shapes the VRAM LRU set and so the output)
                 static const int kMM = std::getenv("STRATA_TIER_ROWS") ? std::max(1, std::min(Ds41MoeTier::kMaxMulti,
                                            std::atoi(std::getenv("STRATA_TIER_ROWS")))) : Ds41MoeTier::kMaxMulti;
-                void * const sev = async_fin && m <= kMM ? dense.sum_event() : nullptr;
+                void * const sev = async_fin && m <= kMM ? d.sum_event() : nullptr;
                 if (sev) tr.set_done_event(sev);
                 for (int off = 0; off < m; off += kMM) {
                     const int chunk = std::min(kMM, m - off);
@@ -1298,7 +1299,7 @@ int main(int argc, char ** argv) {
                         ferr = "tier.run_multi_to_dev failed"; return false;
                     }
                 }
-                fin_async = sev && tier.event_used();
+                fin_async = sev && tr.event_used();
             } else {
                 for (int t = 0; t < m; ++t) {
                     const bool ok = rdev ? tr.run_to_dev(l, mids.data() + (size_t) t * top_k, mw.data() + (size_t) t * top_k,
@@ -1350,7 +1351,7 @@ int main(int argc, char ** argv) {
     // bits would leave the DSpark stream's.  Same speed (one-shot: 21.0 ms a 1-row pass vs ~21.4 ms a step).
     static const bool one_as_verify = [] { const char * e = std::getenv("GGML_BATCH_INVARIANT"); return e && std::atoi(e) > 0; }();
     auto decode_one = [&](int tok, int pos, float * lg_out) -> bool {
-        if (!one_as_verify) return step(tok, pos) && dense.logits(0, 1, lg_out);
+        if (!one_as_verify) return step(tok, pos) && head_logits(0, 1, lg_out);
         if (!pass_v(&tok, 1, pos)) return false;
         std::copy(vlog.end() - nv, vlog.end(), lg_out);
         return true;
@@ -1624,10 +1625,17 @@ int main(int argc, char ** argv) {
                     // GPU: the tier writes the routed sums straight into the dense half's routed tensor (no 2 x n*D*4
                     // host round trip per layer); CPU / STRATA_ROUTED_HOST=1: through the host as before
                     float * rdev = routed_host ? nullptr : cur_dense->routed_dev();
+                    // mab776 STRATA_FN_DEV=1: the experts' input stays on the card (attn_router_span skipped its readback,
+                    // so batch_fn() is NOT filled).  The 10-24 merge dropped this branch while ds41_dense.cpp kept skipping
+                    // the readback: every layer-major batch (long prompts) fed the experts a stale host buffer = garbage.
+                    const float * fdev = rdev && Ds41Dense::fn_dev_on() ? cur_dense->batch_fn_dev() : nullptr;
                     if (l < 2) vram_log("pre-tier", l);
                     for (int s = d0; s < B; s += piece) {   // the experts for the dense rows (in pieces if the buffers cap)
                         const int pn = std::min(piece, B - s);
-                        const bool ok = rdev ? cur_tier->run_chunk_dev(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
+                        const bool ok = fdev ? cur_tier->run_chunk_dev_x(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
+                                                                        cur_dense->batch_wts() + (size_t) s * top_k,
+                                                                        fdev + (size_t) s * n_embd, rdev + (size_t) s * n_embd)
+                                      : rdev ? cur_tier->run_chunk_dev(l, pn, cur_dense->batch_ids() + (size_t) s * top_k,
                                                                   cur_dense->batch_wts() + (size_t) s * top_k,
                                                                   cur_dense->batch_fn() + (size_t) s * n_embd,
                                                                   rdev + (size_t) s * n_embd)
@@ -2986,7 +2994,7 @@ int main(int argc, char ** argv) {
                 else cache_open = true;
                 ph_open = now_ms() - to0;
             }
-            if (ok && dsp && sp_tail > 0) {   // the tail through pass_v (chunks of <= 16); routing as the passes
+            if (ok && dsp && sp_tail > 0 && !nonfinite) {   // the tail through pass_v (chunks of <= 16); routing as the passes
                 bias_now = pass_bias;
                 apply_bias();
                 const double tt0 = now_ms();
@@ -3034,7 +3042,10 @@ int main(int argc, char ** argv) {
                 if (ok) { bias_now = true; apply_bias(); }
                 ph_tail = now_ms() - tt0;
                 pp(delta);
-            } else if (ok && regen && dsp && snap_seed_n > 0 && admit < 0) {   // a repeated prompt: re-seed DSpark from the snapshot's rows
+            } else if (ok && dsp && dsp_regen && delta == 0 && !nonfinite) {   // mab776 STRATA_DSPARK_SNAP: a regenerate's first
+                sp_t = sample_p(last_logits.data(), nv, temp, tk, top_p, min_p, rng);   // token, and its drafts from the
+                if (!dsp->redraft(sp_t, sp_ids, sp_conf)) sp_t = -1;                   // restored window (else: plain decode)
+            } else if (ok && regen && dsp && snap_seed_n > 0 && admit < 0 && !nonfinite) {   // a repeated prompt: re-seed DSpark from the snapshot's rows
                 const double tt0 = now_ms();
                 dsp->reset();
                 std::vector<int> spos;
@@ -3179,7 +3190,7 @@ int main(int argc, char ** argv) {
             const int lk_cap = temp > 0 ? lk_max : lk_max_g;
             int lk_cool = 0, lk_back = 1;
             long lk_pass = 0, lk_dr = 0, lk_acc = 0;
-            if (sp_t >= 0) {
+            if (sp_t >= 0 && !nonfinite) {
                 int P = total - 1, t = sp_t, prev = ids.back();
                 bool dirty = false;
                 std::vector<int> vt;
@@ -3252,6 +3263,7 @@ int main(int argc, char ** argv) {
                     const int r0 = refeed ? 1 : 0, p0 = refeed ? P : P + 1;
                     const double tq0 = now_ms();
                     if (!pass_v(vt.data(), (int) vt.size(), p0)) { finish = "error"; break; }
+                    if (rows_nonfinite(vlog.data() + (size_t) r0 * nv, nv, nd + 1)) { nonfinite = true; finish = "nonfinite"; break; }   // mab776 STRATA_NAN_GUARD
                     const double tq1 = now_ms();
                     int acc = 0, tn = -1;
                     for (; acc < nd; ++acc) {
@@ -3289,7 +3301,7 @@ int main(int argc, char ** argv) {
             }
 #endif
             int last_tok = -1;   // (an admission's first token: its slot feeds it first)
-            while (sp_t < 0 && (gen < max_new || max_new <= 0)) {
+            while (sp_t < 0 && !nonfinite && (gen < max_new || max_new <= 0)) {
                 if (stop_pending()) { finish = "cancel"; break; }
                 const int tok = sample_p(lg.data(), nv, temp, tk, top_p, min_p, rng);
                 last_tok = tok;
@@ -3298,7 +3310,7 @@ int main(int argc, char ** argv) {
                 ++gen;
                 if (is_stop(tok)) { finish = "stop"; break; }
                 if ((max_new > 0 && gen >= max_new) || pos + 1 >= ctxv) break;
-                if (!step(tok, pos) || !head_logits(0, 1, lg.data())) { finish = "error"; break; }
+                if (!decode_one(tok, pos, lg.data())) { finish = "error"; break; }   // mab776: batch-invariant (one-row verify) when GGML_BATCH_INVARIANT
                 hist.push_back(tok);
                 ++pos;
                 if (rows_nonfinite(lg.data(), nv, 1)) { nonfinite = true; finish = "nonfinite"; break; }
@@ -3670,7 +3682,7 @@ int main(int argc, char ** argv) {
         std::fflush(stdout);
         if (std::find(a.stop.begin(), a.stop.end(), tok) != a.stop.end() || tok == (int) G.eos) { ++gen; break; }
         if (gen + 1 == a.n_predict) { ++gen; break; }
-        if (!step(tok, pos) || !head_logits(0, 1, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
+        if (!decode_one(tok, pos, lg.data())) { std::fprintf(stderr, "ds41_generate: decode: %s\n", ferr.c_str()); return 1; }
         ++pos;
     }
     const double dec_ms = now_ms() - td0;

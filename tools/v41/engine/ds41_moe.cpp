@@ -2937,15 +2937,16 @@ void Ds41MoeTier::set_cache_enabled(bool on) {
 bool Ds41MoeTier::seed_from_ranked(const std::vector<std::pair<int32_t, int32_t>>& ranked_all, std::string& err) {
     if (im_->cfg.cpu_only) return true;   // a CPU-only tier has neither a cache nor an arena to seed
     if (!remote_build(*im_, drop_excluded(*im_, ranked_all), err)) return false;   // STRATA_DS41_REMOTE
-    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_excluded(*im_, ranked_all);
+    const std::vector<std::pair<int32_t, int32_t>> ranked = drop_remote(*im_, drop_excluded(*im_, ranked_all));
 #if defined(DS4_MOE_CUDA)
-    plan_gpu1(*im_, ranked);   // mab776 STRATA_GPU1
-    if (!build_arena(arena_order_remote(*im_, arena_order(*im_, ranked)), err)) return false;
-    if (!seed_gpu1(*im_, err)) return false;
-#else
-    if (!build_arena(arena_order_remote(*im_, arena_order(*im_, ranked)), err)) return false;
+    plan_gpu1(*im_, ranked);   // mab776 STRATA_GPU1: before the arena (which leaves GPU 1's share out)
 #endif
-    return true;
+    if (!build_arena(arena_order_remote(*im_, arena_order(*im_, ranked)), err)) return false;
+#if defined(DS4_MOE_CUDA)
+    if (!seed_gpu1(*im_, err)) return false;
+#endif
+    // (the 10-24 merge repair ended this function here with `return true;` - copied from build_arena_ranked - so the
+    //  VRAM expert cache below was never seeded: "VRAM ready seed -> 0 experts in VRAM" on every boot)
 #if !defined(DS4_MOE_CUDA)
     (void) ranked;
     err = "the VRAM cache needs the CUDA tier (compiled without DS4_MOE_CUDA)";
@@ -5167,7 +5168,8 @@ bool gpu_run_n_ex(Ds41MoeImpl& im, int64_t layer, int nt, const int32_t* ids, co
                 std::fprintf(stderr, "ds41_moe: STRATA_FILE_DEFER=%d: %lld layer calls, %lld experts deferred, %lld dropped\n",
                              defer_r, (long long) im.fdef_layers, (long long) im.fdef_experts, (long long) im.fdef_dropped);
         }
-        ck(cudaStreamSynchronize(gp.s), "sum sync");
+        // (upstream's unconditional "sum sync" here was kept by the 10-24 merge next to our event hand-off below, which
+        //  syncs itself when there is no event - so every decode layer waited on the card again (M11's async, -13 %))
         if (xprof) cudaEventRecord(xev[3], gp.s);
         if (dev_ev) {   // the caller's finish waits on it on the card; its next readback covers this call's buffers
             ck(cudaEventRecord(dev_ev, gp.s), "sum event");

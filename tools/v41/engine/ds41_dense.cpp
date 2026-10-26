@@ -779,8 +779,9 @@ bool Ds41Dense::Impl::compute(ggml_cgraph * gf, bool cached, bool pv, bool async
     const double tq0 = g_dprof_on ? dprof_now() : 0;
     bool ok_alloc = a.alloc(gf, reuse);
     const double tq1 = g_dprof_on ? dprof_now() : 0;
-    if (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more
-        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - freed the tier's prestage region, retrying\n");
+    while (!ok_alloc && oom_hook && oom_hook()) {   // something gave VRAM back: once more (mab776: each call frees ONE region -
+        // the prestage, then the prompt cache - so retry while the hook still finds something)
+        std::fprintf(stderr, "ds41_dense: graph buffer did not fit - the tier gave VRAM back, retrying\n");
         ok_alloc = a.alloc(gf, false);
     }
     if (Ds41Dense::prof_on() && !cached && a.a && !a.skips(gf, reuse)) ++Ds41Dense::prof().reallocs;   // mab776 STRATA_DENSE_PROF
@@ -2615,6 +2616,8 @@ static bool run_spans(Ds41Dense::Impl & im, int il, int col0, int n, const std::
 // mab776 STRATA_SPAN_ASYNC: upload_span's four index arrays, written into sub-batch si's region of a pinned buffer and
 // copied on the backend's stream (ordered after the previous sub-batch's graph; no host wait).  Same values.
 static bool upload_span_async(Ds41Dense::Impl & im, int col0, int n, size_t si) {
+    im.span_memo_pos0 = -1;   // mab776: this writes the four index tensors too - upstream's memo (upload_span) must not
+                              // skip a later synchronous upload of another span's indices as "already there"
     const size_t region = (size_t) (im.SWA * im.S + 2 * im.S + im.RAW + 2) * 4;
     const size_t nreg = im.span_cap.size();
     if (!im.span_pin || im.span_region != region || ggml_backend_buffer_get_size(im.span_pin) < region * nreg) {
