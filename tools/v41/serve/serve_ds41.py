@@ -349,8 +349,9 @@ F.call_end = ds41_call_end
 F.parse_tool_call = ds41_parse_tool_call
 # frontend.forced_call writes the forced-call (tool_choice) prefix in Qwen's `<function=NAME>` shape; V4.1's
 # DSML puts the name in the call OPENER itself, so a forced call has to be written in that shape here.
-def ds41_forced_call(tool_choice, tools):
-    """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides)."""
+def ds41_forced_call(tool_choice, tools, template=None):
+    """tool_choice -> the DSML text that opens the call the reply must make (None: the model decides).
+    `template` = the server's chat template, passed since the 10-24 Xolotl sync (unused: the DSML shape is fixed)."""
     kind, name = F.tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
