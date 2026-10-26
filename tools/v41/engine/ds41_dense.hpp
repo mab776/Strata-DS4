@@ -241,14 +241,6 @@ public:
     std::string vram_ledger() const;
     bool restore();
     int snapshot_pos() const;
-    /// mab776 STRATA_PARK (conversation parking): the state of a conversation at its snapshot point `n` as one blob -
-    /// the snapshot tensors (window rings, ratio-2 compressor state) + the closed compressed-KV and indexer-key rows of
-    /// positions [0, n) of every kv source (position-indexed: the next conversation overwrites them).  park_load writes
-    /// a blob back (snapshot tensors + rows; restore() then makes it live) and park_history the Engram's token history.
-    size_t park_bytes(int n) const;
-    bool park_save(int n, std::vector<uint8_t> & out);
-    bool park_load(int n, const uint8_t * in, size_t bytes);
-    void park_history(const int * ids, int n);
     /// Layer split: only run and retain KV for layers in [layer_lo, layer_hi).  head/logits require layer_hi == n_layer().
     void set_layer_range(int64_t layer_lo, int64_t layer_hi);
     int64_t layer_lo() const;

@@ -567,44 +567,6 @@ def _run_ds41(self, ids, thinking, tools, max_new, sampling, cancel, **kw):   # 
 S.Service._note = _note_ds41
 S.Service.run = _run_ds41
 
-# mab776 STRATA_PARK: /health carries the engine's conversation-parking counts (STRATA_PARK_DIR/status.json, written by
-# ds41_generate after every change) as "park"
-def _park_dir():
-    d = os.environ.get("STRATA_PARK_DIR")
-    if d:
-        return d
-    for i, v in enumerate(sys.argv[:-1]):
-        if v == "--config":
-            try:
-                return (json.load(open(sys.argv[i + 1])).get("env") or {}).get("STRATA_PARK_DIR")
-            except Exception:
-                return None
-    return None
-
-
-_make_handler = S.make_handler
-
-
-def _make_handler_ds41(svc):
-    H = _make_handler(svc)
-    _json = H._json
-
-    def _json_park(self, code, obj, headers=None):
-        if isinstance(obj, dict) and obj.get("service") == "strata" and "max_context" in obj and "loaded" in obj:
-            d = _park_dir()
-            if d:
-                try:
-                    obj = dict(obj, park=json.load(open(os.path.join(d, "status.json"))))
-                except Exception:
-                    pass
-        return _json(self, code, obj, headers)
-
-    H._json = _json_park
-    return H
-
-
-S.make_handler = _make_handler_ds41
-
 def _cache_slots_value(slots):
     """Engine flag value for --conversation-cache-slots; None = omit (engine default)."""
     if slots is None:

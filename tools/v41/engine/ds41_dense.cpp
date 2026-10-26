@@ -281,10 +281,6 @@ struct Ds41Dense::Impl {
     ggml_tensor * i_lastblk = nullptr;    // F32 [NC]   (nvis - 1) / block size: the pinned candidate block (ratio 1)
     ggml_tensor * i_eng[2] = {};          // F32 [EC * ED, NC]  Engram rows
     ggml_tensor * neg_ramp = nullptr;     // F32 [cmax1]  -i     (constant)
-    // mab776 STRATA_KALL16=1: the attention's per-query keys assembled in place as F16 [DH, kall_m, S] (window rows, then
-    // the top-k compressed rows; the pad rows stay zero) - instead of concat + pad + cast of the F32 gathers
-    ggml_tensor * kall16 = nullptr;
-    int64_t kall_m = 0;
     ggml_tensor * blk_ramp = nullptr;     // F32 [cmax1 / CBS + 1]  i (constant)
     ggml_tensor * zpad16 = nullptr;       // F16 [DH, 1] zeros: the flash-attn key padding (STRATA_ATTN_F16_GATHER)
     ggml_tensor * zidx = nullptr;         // I32 [kZidx] zeros: gathers that zero row once per pad slot
@@ -976,10 +972,6 @@ static ggml_tensor * attn_core_slab(Ds41Dense::Impl & im, ggml_context * gc, con
     return ggml_reshape_3d(gc, o, DH, NH, n);
 }
 
-static bool kall16_on() {
-    static const bool on = [] { const char * e = std::getenv("STRATA_KALL16"); return e && e[0] == '1'; }();
-    return on;
-}
 
 static ggml_cgraph * build_attn(Ds41Dense::Impl & im, ggml_context * gc, int il, int64_t n, int64_t col0 = 0) {
     using L_t = Ds41Dense::Impl::Layer;
@@ -3086,68 +3078,6 @@ std::vector<Ds41Dense::StateRegion> Ds41Dense::state_regions(int64_t positions) 
         }
     }
     return out;
-}
-
-// mab776 STRATA_PARK: layer order; per layer raw_snap, [st_kv_snap, st_sc_snap], [comp rows, idxk rows]. A ratio-r kv
-// source holds n / r closed rows for n positions (an open ratio-2 group lives in st_kv / st_sc; its spare row is
-// write-only scratch - attention reads closed rows only).
-size_t Ds41Dense::park_bytes(int n) const {
-    const Impl & im = *p_;
-    size_t b = 0;
-    for (const auto & L : im.ly) {
-        b += ggml_nbytes(L.raw_snap);
-        if (L.st_kv_snap) b += ggml_nbytes(L.st_kv_snap) + ggml_nbytes(L.st_sc_snap);
-        if (L.comp) {
-            const size_t rows = (size_t) (n / L.ratio);
-            b += rows * L.comp->nb[1] + rows * L.idxk->nb[1];
-        }
-    }
-    return b;
-}
-
-bool Ds41Dense::park_save(int n, std::vector<uint8_t> & out) {
-    Impl & im = *p_;
-    if (n < 1 || im.snap_pos != n) { im.err = "park: no snapshot at that position"; return false; }
-    ggml_backend_synchronize(im.backend);
-    out.resize(park_bytes(n));
-    size_t at = 0;
-    auto get = [&](const ggml_tensor * t, size_t bytes) { if (bytes) ggml_backend_tensor_get(t, out.data() + at, 0, bytes); at += bytes; };
-    for (auto & L : im.ly) {
-        get(L.raw_snap, ggml_nbytes(L.raw_snap));
-        if (L.st_kv_snap) { get(L.st_kv_snap, ggml_nbytes(L.st_kv_snap)); get(L.st_sc_snap, ggml_nbytes(L.st_sc_snap)); }
-        if (L.comp) {
-            const size_t rows = (size_t) (n / L.ratio);
-            get(L.comp, rows * L.comp->nb[1]);
-            get(L.idxk, rows * L.idxk->nb[1]);
-        }
-    }
-    return at == out.size();
-}
-
-bool Ds41Dense::park_load(int n, const uint8_t * in, size_t bytes) {
-    Impl & im = *p_;
-    if (n < 1 || n > im.cfg.ctx_max || bytes != park_bytes(n)) { im.err = "park: blob size mismatch"; return false; }
-    ggml_backend_synchronize(im.backend);
-    size_t at = 0;
-    auto set = [&](ggml_tensor * t, size_t b) { if (b) ggml_backend_tensor_set(t, in + at, 0, b); at += b; };
-    for (auto & L : im.ly) {
-        set(L.raw_snap, ggml_nbytes(L.raw_snap));
-        if (L.st_kv_snap) { set(L.st_kv_snap, ggml_nbytes(L.st_kv_snap)); set(L.st_sc_snap, ggml_nbytes(L.st_sc_snap)); }
-        if (L.comp) {
-            const size_t rows = (size_t) (n / L.ratio);
-            set(L.comp, rows * L.comp->nb[1]);
-            set(L.idxk, rows * L.idxk->nb[1]);
-        }
-    }
-    ggml_backend_synchronize(im.backend);
-    im.snap_pos = n;
-    return at == bytes;
-}
-
-void Ds41Dense::park_history(const int * ids, int n) {
-    Impl & im = *p_;
-    if (!im.engram.enabled()) return;
-    for (int p = 0; p < n; ++p) im.engram.set_token(p, ids[p]);
 }
 
 void Ds41Dense::rearm(int pos) { p_->snap_pos = pos; }
