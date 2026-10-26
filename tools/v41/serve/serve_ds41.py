@@ -639,9 +639,15 @@ def expand_ds41_config_cache(cfg: dict) -> None:
 _engine_args = S.engine_args
 
 
-def engine_args_ds41(cfg: dict) -> list[str]:
+def engine_args_ds41(cfg: dict, passthrough: bool = False) -> list[str]:
+    """The server's own engine_args with our cache flattening first.  The 0.2.x server calls it as
+    `engine_args(cfg, ds)` (the #1080 budget warning and the engine start), so the second argument is part of the
+    hook's signature since the 10-24 merge: our part only edits cfg, everything after it is the server's, and
+    `passthrough` (the DeepSeek "args go to the engine as they are" mode) goes through untouched.  Taking one
+    argument only was why the merged snapshot died at once: TypeError: engine_args_ds41() takes 1 positional
+    argument but 2 were given (stack 78, the ISTA swap attempt, 2026-10-25 21:20)."""
     expand_ds41_config_cache(cfg)
-    return _engine_args(cfg)
+    return _engine_args(cfg, passthrough)
 
 
 S.engine_args = engine_args_ds41
