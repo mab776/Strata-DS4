@@ -212,7 +212,15 @@ _GGML_NAMES = {F32: "F32", F16: "F16", Q8_0: "Q8_0", BF16: "BF16"}
 _ST_TYPES = {"F32": (F32, 4), "F16": (F16, 2), "BF16": (BF16, 2)}
 
 
-def _pread(fd, nbytes, off, name):
+def _pread_all(fd, nbytes, off, name):
+    """Read exactly `nbytes`, looping (one pread can come back short on a cold 163 GB file).
+
+    mab776 10-25: this was a SECOND `def _pread` in the same module - the 3-argument one above, which
+    `SidecarWeights.get` calls.  Python keeps the last definition, so every sidecar read landed here with three
+    arguments and the vision encoder died at boot with `TypeError: _pread() missing 1 required positional
+    argument: 'name'`; that is why the merged engine could not start the blessed GSQ config (it has --vision).
+    The file came in from the 10-24 Xolotl sync byte for byte, so the collision is upstream's - renaming this one
+    and its two callers is the whole fix, and it leaves the sidecar reader's behaviour untouched."""
     raw = bytearray()
     while len(raw) < nbytes:
         b = os.pread(fd, nbytes - len(raw), off + len(raw))
@@ -267,7 +275,7 @@ class SafetensorsWeights:
 
     def get(self, name):
         fd, off, nb, ty, shape, _ = self.tensors[name]
-        return dequantize(_pread(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
+        return dequantize(_pread_all(fd, nb, off, name), ty).reshape(shape).astype(np.float32)
 
     def torch(self, name, tp, dtype):
         return tp.from_numpy(np.ascontiguousarray(self.get(name))).to(dtype)
@@ -344,7 +352,7 @@ class MmprojWeights:
 
     def _one(self, n):
         shape, ty, off = self.src[n]
-        return dequantize(_pread(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
+        return dequantize(_pread_all(self.fd, ggml_nbytes(shape, ty), self.data_start + off, n), ty).reshape(shape[::-1])
 
     def get(self, name):
         parts = [self._one(n) for n in self.map[name]]
