@@ -12,7 +12,8 @@
   "2026-10-18 x1018: the tree is mab776-v41-x1018 = our branch merged onto upstream Xolotl (V4 + V4.1 + Strata in one repo); the shim runs the tree's own 0.1.44 server (snapshot.sh copies serve/). STRATA_PB_CAP=0 = no VRAM-aware prompt-batch cap (calibrated for a 24 GB card; it cut our 32768 batch to ~6.1K, 123k prefill -10 %); STRATA_ARENA_REBAL=0 = the static arena (Xolotl's adaptive one changes the output; Marc decides). ram-128gb/v41/X1018-UPDATE.md.",
   "2026-10-19 (Marc): STRATA_LOOKUP=14 = prompt-lookup copies of up to 14 tokens for SAMPLED requests (was 7; edits +12..+29 % decode, exact speculative sampling = the same distribution). Greedy requests keep no lookup (STRATA_LOOKUP_GREEDY unset = 0, as before): a greedy lookup pass of 7 + the pass token + a refeed is 9 rows, past the 8 GGML_BATCH_INVARIANT covers - greedy stays provably exact.",
   "2026-10-19 sync (Marc): Xolotl 87157b2e merged (per-request routing, vision input, 16-row tier calls). --vision + the \"vision\" section = image input: DeepSeek's reference ViT (models/strata-ds41/vision-ref, MIT) on the CPU in f32 from a venv on the models drive (vision-venv: torch CPU, numpy, pillow), weights from V41-MTP-Vision.gguf; ~2.2 GiB RSS, resident (loaded at start, before the engine: its 4.1 GiB load peak never meets the engine's). Arena 82.5 -> 80.0: with the encoder loaded the margin was 3.06 GiB at 82.5 (throwaway, 246k needles) and 3.54 at 81.0 on the live stack after the full gate (bench + turns + tools + 480k + 3 x 246k: the steady footprint creeps to ~100.5 GiB; rule >= 4), and the encoder's RAM had come out of the file cache inside the 104 GiB cap (+300 agent turn 3.7 -> 5.5 s at 82.5, 4.0 s at 81.0). \"lazy\" (start with the first image, stop when idle) was tried: a cold encoder start costs ~90 s per image and its stop logs 'unsupported command' (the elastic VRAM call) - not used. Aliases ending in -exact = exact expert routing for that request (serve_ds41.py's ROUTE_SUFFIXES); the plain ids keep the 0.5 / 0.3 fast routing. STRATA_TIER_ROWS=8 = tier calls of <= 8 rows as before (upstream's 16-row calls change the greedy output here) and STRATA_GPU1_RESERVE_GIB=0.745 = GPU 1 keeps its 1,237 experts beside the bigger 16-row buffers: the one-shot greedy md5 equals the 10-19 00:00 engine's. ram-128gb/v41/X1018-UPDATE.md 'Sync 10-19'.",
-  "2026-10-19 evening dedup (Marc: our diff vs upstream only shrinks): STRATA_LOOKUP -> upstream's STRATA_SERVE_LOOKUP=14 (+ our STRATA_SERVE_LOOKUP_GREEDY=0: greedy keeps no lookup, as before); STRATA_D3_OVERLAP -> upstream's STRATA_D3_DMA_STREAM=1 + STRATA_DMA_OVERLAP=1 (copy edits f1/f2/f3 108/144/127 vs ours 112/136/116 tok/s; with no overlap at all 95/121/103). The stream shifts VRAM residency, so the fast-routing greedy text changes (deb5da21073c, deterministic, draft-independent) like an arena change; exact routing gives the previous engine's md5 (389fbc4c967a). STRATA_DSPARK_SNAP stays ours (regenerate 150 / 158 vs 126 / 145 tok/s with upstream's re-seed only). ram-128gb/v41/X1018-UPDATE.md 'Dedup 10-19'."
+  "2026-10-19 evening dedup (Marc: our diff vs upstream only shrinks): STRATA_LOOKUP -> upstream's STRATA_SERVE_LOOKUP=14 (+ our STRATA_SERVE_LOOKUP_GREEDY=0: greedy keeps no lookup, as before); STRATA_D3_OVERLAP -> upstream's STRATA_D3_DMA_STREAM=1 + STRATA_DMA_OVERLAP=1 (copy edits f1/f2/f3 108/144/127 vs ours 112/136/116 tok/s; with no overlap at all 95/121/103). The stream shifts VRAM residency, so the fast-routing greedy text changes (deb5da21073c, deterministic, draft-independent) like an arena change; exact routing gives the previous engine's md5 (389fbc4c967a). STRATA_DSPARK_SNAP stays ours (regenerate 150 / 158 vs 126 / 145 tok/s with upstream's re-seed only). ram-128gb/v41/X1018-UPDATE.md 'Dedup 10-19'.",
+  "2026-10-25 (OPEN #1 check, ISTA throwaway): --vision + the vision section REMOVED. Verified with tools/gguf_reader.py on all 4 ISTA shards: 40 exp_probs_b.bias, 0 exp_probs_b_vl.bias -> upstream 1a80dedb (#43) makes serve_ds41 exit 2 before the encoder starts ('refusing --vision ... this model runs text only: remove the config's vision section'); the engine would also die (ds41_dense.cpp:1864). Our live GSQ V41-GSQ.gguf has BOTH biases (40/40) = vision works there, so the ISTA set is a vision LOSS, not a swap. DSpark is unaffected: the sidecar comes from the wrapper's STRATA_SERVE_DSPARK=gsq/V41-MTP-Vision.gguf, not from the vision section."
  ],
  "exe": "/home/mab776/Documents/portainer/strata-ds4/mab776/ds41-engine-ista.sh",
  "args": [
@@ -38,7 +39,6 @@
   "80.0",
   "--prompt-batch",
   "32768",
-  "--vision",
   "--peer-device",
   "1"
  ],
@@ -116,14 +116,5 @@
   "deepseek-v4.1-flash-strata-gsq",
   "deepseek-v4-flash-exact",
   "deepseek-v4.1-flash-exact"
- ],
- "vision": {
-  "exe": "/app/tools/v41/vision/ds41_vision.py",
-  "python": "/media/mab776/nvme 2To/models/strata-ds41/vision-venv/bin/python",
-  "mmproj": "/media/mab776/nvme 2To/models/deepseek-v41/gsq/V41-MTP-Vision.gguf",
-  "model": "/media/mab776/nvme 2To/models/deepseek-v41/ista/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf",
-  "reference_dir": "/media/mab776/nvme 2To/models/strata-ds41/vision-ref/inference",
-  "threads": 16,
-  "gpu": false
- }
+ ]
 }
