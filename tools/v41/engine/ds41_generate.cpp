@@ -2526,7 +2526,11 @@ int main(int argc, char ** argv) {
             if (!by_step && defer_vram && cache_open && dh >= 2) {
                 const double tk0 = now_ms();
                 std::string kerr;
-                if (keep_max > 0 && dh <= keep_max && Ds41MoeTier::keep_cache_on() && tier.shrink_cache(keep_free, kerr)) {
+                // mab776 STRATA_KEEP_CACHE shrinks and regrows the FIRST stage's cache only (tier / dense below): on a
+                // multi-stage split the other stages would decode with a shrunk cache, so there it leaves the batch to
+                // upstream's STRATA_SERVE_KEEP_CACHE (per stage) or the plain release.
+                if (keep_max > 0 && dh <= keep_max && pipe.n_stages() == 1 && Ds41MoeTier::keep_cache_on() &&
+                    tier.shrink_cache(keep_free, kerr)) {
                     kept = true;
                     tier.set_keep_batch(true);   // mab776 STRATA_KEEP_CACHE: the batch keeps the cache, run_chunk copies resident experts
                 } else {
@@ -3141,6 +3145,8 @@ int main(int argc, char ** argv) {
                          gen, dec_ms / 1000.0, 1000.0 * std::max(0, gen - 1) / std::max(dec_ms, 1e-9), finish,
                          (long long) st.hits, (long long) st.cpu, (long long) st.pcie, (long long) st.file_tier);
             if (st.remote > 0) std::fprintf(stderr, ", %lld remote", (long long) st.remote);   // STRATA_DS41_REMOTE
+            if (st.gpu1 > 0)   // mab776 STRATA_GPU1 (dropped by upstream's rewrite of this line at the 10-24 sync)
+                std::fprintf(stderr, ", %lld gpu1 (wait %d ms)", (long long) st.gpu1, (int) st.g1_wait_ms);
             std::fprintf(stderr, "\n");
             if (vram_trace) {   // who holds the card while decoding (the expert slots are the rest)
                 size_t tf = 0, tt = 0;
